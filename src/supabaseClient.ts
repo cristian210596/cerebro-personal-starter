@@ -62,6 +62,56 @@ async function saveMemoriasSugeridas(itemId: string, clasificacion: Clasificacio
   }
 }
 
+export async function latestItemForChat(chatId: string) {
+  const { data, error } = await supabase
+    .from('items')
+    .select('*')
+    .eq('telegram_chat_id', chatId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function updateItemFields(itemId: string, fields: Record<string, any>) {
+  const allowed = [
+    'titulo',
+    'resumen',
+    'categoria_principal',
+    'subcategorias',
+    'tipo_item',
+    'estado',
+    'valoracion',
+    'importancia',
+    'accion_futura',
+    'tags',
+    'entidades_json',
+    'classifier_json'
+  ];
+
+  const patch: Record<string, any> = { updated_at: new Date().toISOString() };
+  for (const key of allowed) {
+    if (Object.prototype.hasOwnProperty.call(fields, key)) patch[key] = fields[key];
+  }
+
+  const { data, error } = await supabase
+    .from('items')
+    .update(patch)
+    .eq('id', itemId)
+    .select()
+    .single();
+
+  if (error) throw error;
+
+  if (Array.isArray(patch.entidades_json)) {
+    await upsertEntidadesAndLinks(itemId, patch.entidades_json);
+  }
+
+  return data;
+}
+
 export async function searchItems(query: string, limit = 10) {
   const safe = query.replaceAll('%', '').replaceAll(',', ' ');
   const { data, error } = await supabase

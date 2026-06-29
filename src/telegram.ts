@@ -1,8 +1,9 @@
 import type { ItemInsert } from './types.js';
 import { classifyText } from './classifier.js';
-import { latestItems, latestMemorias, pendingItems, saveItem, searchItems, supabase } from './supabaseClient.js';
-import { createNotionItemPage } from './notion.js';
+import { latestItemForChat, latestItems, latestMemorias, pendingItems, saveItem, searchItems, supabase, updateItemFields } from './supabaseClient.js';
+import { createNotionItemPage, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
+import { parseEditInstruction } from './editor.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -80,6 +81,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (text.startsWith('/memorias')) {
     const results = await latestMemorias(10);
     return sendMessage(chatId, formatMemorias(results));
+  }
+
+  if (isEditCommand(text)) {
+    return handleEditCommand(chatId, text);
   }
 
   await sendMessage(chatId, 'Procesando...');
@@ -187,6 +192,100 @@ function formatMemorias(memorias: any[]) {
     if (memoria.confianza) lines.push(`  Confianza: ${memoria.confianza}`);
     lines.push('');
   }
+  return lines.join('\n');
+}
+
+
+
+function isEditCommand(text: string) {
+  const lower = text.toLowerCase();
+  return lower.startsWith('/editar') || lower.startsWith('/corregir') || lower.startsWith('corregir último') || lower.startsWith('corregir ultimo');
+}
+
+async function handleEditCommand(chatId: number, text: string) {
+  const instruction = text
+    .replace(/^\/editar\s*/i, '')
+    .replace(/^\/corregir\s*/i, '')
+    .replace(/^corregir último\s*:?\s*/i, '')
+    .replace(/^corregir ultimo\s*:?\s*/i, '')
+    .trim();
+
+  if (!instruction) {
+    return sendMessage(chatId, 'Usá: corregir último: estado Pendiente, subcategoría Calibraciones');
+  }
+
+  const current = await latestItemForChat(String(chatId));
+  if (!current) return sendMessage(chatId, 'No encontré un item anterior para editar.');
+
+  await sendMessage(chatId, 'Editando último item...');
+
+  const edit = await parseEditInstruction(instruction, current);
+  const changes = edit.changes || {};
+  if (!Object.keys(changes).length) {
+    return sendMessage(chatId, `No apliqué cambios. ${edit.explanation || ''}`.trim());
+  }
+
+  const mergedClassifier = {
+    ...(current.classifier_json || {}),
+    ...mapChangesToClassifier(changes)
+  };
+
+  const updated = await updateItemFields(current.id, {
+    ...changes,
+    classifier_json: mergedClassifier
+  });
+
+  try {
+    if (updated.notion_page_id) {
+      await updateNotionItemPage(updated);
+    } else {
+      const notionPageId = await createNotionItemPage(updated);
+      if (notionPageId) {
+        await supabase.from('items').update({ notion_page_id: notionPageId }).eq('id', updated.id);
+      }
+    }
+  } catch (error) {
+    console.error('No se pudo actualizar Notion:', error);
+  }
+
+  return sendMessage(chatId, formatEdited(updated, Object.keys(changes), edit.explanation));
+}
+
+function mapChangesToClassifier(changes: Record<string, any>) {
+  const out: Record<string, any> = {};
+  for (const [key, value] of Object.entries(changes)) {
+    if (key === 'entidades_json') out.entidades = value;
+    else out[key] = value;
+  }
+  return out;
+}
+
+function formatEdited(item: any, changedKeys: string[], explanation: string) {
+  const labels: Record<string, string> = {
+    titulo: 'Título',
+    resumen: 'Resumen',
+    categoria_principal: 'Categoría',
+    subcategorias: 'Subcategorías',
+    tipo_item: 'Tipo',
+    estado: 'Estado',
+    valoracion: 'Valoración',
+    importancia: 'Importancia',
+    accion_futura: 'Acción futura',
+    tags: 'Tags',
+    entidades_json: 'Entidades'
+  };
+
+  const lines = [
+    'Editado.',
+    '',
+    `Item: ${item.titulo || 'Sin título'}`,
+    `Cambios: ${changedKeys.map(k => labels[k] || k).join(', ')}`
+  ];
+  if (explanation) lines.push(`Criterio: ${explanation}`);
+  lines.push('', `Categoría: ${item.categoria_principal || '-'}`);
+  lines.push(`Subcategorías: ${(item.subcategorias || []).join(', ') || '-'}`);
+  lines.push(`Estado: ${item.estado || '-'}`);
+  lines.push(`Tags: ${(item.tags || []).join(', ') || '-'}`);
   return lines.join('\n');
 }
 
