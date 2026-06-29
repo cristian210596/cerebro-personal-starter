@@ -83,6 +83,9 @@ Nota; Evento; Problema; Duda técnica; Decisión; Compra; Producto deseado; Rece
 `;
 
 export async function parseEditInstruction(instruction: string, currentItem: any): Promise<EditResult> {
+  const simple = tryParseSimpleEditInstruction(instruction);
+  if (simple) return simple;
+
   const itemContext = {
     id: currentItem.id,
     titulo: currentItem.titulo,
@@ -99,16 +102,33 @@ export async function parseEditInstruction(instruction: string, currentItem: any
     texto_original: currentItem.texto_original
   };
 
-  const response = await ai.models.generateContent({
-    model: config.geminiModel(),
-    contents: `${editPrompt}\n\nItem actual:\n${JSON.stringify(itemContext, null, 2)}\n\nInstrucción del usuario:\n${instruction}`,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: editSchema
-    }
-  });
+  let raw = '';
+  try {
+    const response = await ai.models.generateContent({
+      model: config.geminiModel(),
+      contents: `${editPrompt}
 
-  const raw = response.text;
+Item actual:
+${JSON.stringify(itemContext, null, 2)}
+
+Instrucción del usuario:
+${instruction}`,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: editSchema
+      }
+    });
+    raw = response.text || '';
+  } catch (error: any) {
+    if (String(error?.message || '').includes('429') || String(error?.status || '') === '429') {
+      return {
+        changes: {},
+        explanation: 'Gemini se quedó sin cuota temporalmente. Probá con una corrección simple tipo: valoracion Volvería, estado Pendiente, tags hplc,shimadzu.'
+      };
+    }
+    throw error;
+  }
+
   if (!raw) throw new Error('Gemini no devolvió edición');
 
   const parsed = JSON.parse(raw) as EditResult;
@@ -158,6 +178,115 @@ function normalizeChanges(changes: ItemEditChanges): ItemEditChanges {
   }
 
   return out;
+}
+
+
+function tryParseSimpleEditInstruction(instruction: string): EditResult | null {
+  const raw = instruction.trim();
+  const lower = removeAccents(raw).toLowerCase();
+  const changes: ItemEditChanges = {};
+
+  const categoria = pickAfter(raw, lower, ['categoria principal', 'categoria', 'no es compra, es', 'no es compras, es']);
+  if (categoria) changes.categoria_principal = normalizeKnownCategoria(categoria);
+
+  const subcategoria = pickAfter(raw, lower, ['subcategoria', 'subcategoría']);
+  if (subcategoria) changes.subcategorias = splitValues(subcategoria).map(capitalizeLoose);
+
+  const estado = pickAfter(raw, lower, ['estado']);
+  if (estado) changes.estado = capitalizeLoose(firstValue(estado));
+
+  const importancia = pickAfter(raw, lower, ['importancia']);
+  if (importancia) changes.importancia = capitalizeLoose(firstValue(importancia));
+
+  const valoracion = pickAfter(raw, lower, ['valoracion', 'valoración']);
+  if (valoracion) changes.valoracion = normalizeValoracion(firstValue(valoracion));
+
+  const tipo = pickAfter(raw, lower, ['tipo']);
+  if (tipo) changes.tipo_item = capitalizeLoose(firstValue(tipo));
+
+  const tags = pickAfter(raw, lower, ['tags', 'etiquetas']);
+  if (tags) changes.tags = splitValues(tags).map(normalizeTag).filter(Boolean);
+
+  const accion = pickAfter(raw, lower, ['accion futura', 'acción futura', 'pendiente']);
+  if (accion) changes.accion_futura = accion.trim();
+
+  if (!Object.keys(changes).length) return null;
+  return { changes: normalizeChanges(changes), explanation: 'Interpretado sin usar Gemini.' };
+}
+
+function pickAfter(raw: string, lower: string, labels: string[]) {
+  for (const label of labels) {
+    const idx = lower.indexOf(label);
+    if (idx === -1) continue;
+
+    let tail = raw.slice(idx + label.length).trim();
+    tail = tail.replace(/^\s*[:=\-]\s*/, '').trim();
+
+    const stop = findNextFieldIndex(tail);
+    if (stop !== -1) tail = tail.slice(0, stop).trim();
+    return tail;
+  }
+  return '';
+}
+
+function findNextFieldIndex(text: string) {
+  const markers = [
+    /,\s*(categoria|subcategoria|subcategoría|estado|importancia|valoracion|valoración|tipo|tags|etiquetas|accion futura|acción futura|pendiente)\b/i,
+    /;\s*(categoria|subcategoria|subcategoría|estado|importancia|valoracion|valoración|tipo|tags|etiquetas|accion futura|acción futura|pendiente)\b/i
+  ];
+  const indexes = markers.map(r => text.search(r)).filter(i => i >= 0);
+  return indexes.length ? Math.min(...indexes) : -1;
+}
+
+function firstValue(text: string) {
+  return splitValues(text)[0] || text.trim();
+}
+
+function splitValues(text: string) {
+  return text
+    .split(/[;,]/g)
+    .map(v => v.trim())
+    .filter(Boolean);
+}
+
+function capitalizeLoose(text: string) {
+  const t = text.trim();
+  if (!t) return t;
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+function normalizeKnownCategoria(text: string) {
+  const lower = removeAccents(text).toLowerCase();
+  if (lower.includes('preferencia')) return 'Preferencias personales';
+  if (lower.includes('trabajo')) return 'Trabajo';
+  if (lower.includes('estudio')) return 'Estudio';
+  if (lower.includes('compra')) return 'Compras';
+  if (lower.includes('cocina') || lower.includes('receta')) return 'Cocina';
+  if (lower.includes('proyecto') || lower.includes('idea')) return 'Ideas / Proyectos';
+  if (lower.includes('salud')) return 'Salud / Cuerpo';
+  if (lower.includes('casa')) return 'Casa / Vida diaria';
+  if (lower.includes('cultural') || lower.includes('video') || lower.includes('podcast')) return 'Consumo cultural';
+  if (lower.includes('lugar')) return 'Lugares';
+  if (lower.includes('persona')) return 'Personas';
+  if (lower.includes('finanza') || lower.includes('gasto')) return 'Finanzas personales';
+  return capitalizeLoose(text);
+}
+
+function normalizeValoracion(text: string) {
+  const lower = removeAccents(text).toLowerCase();
+  if (lower.includes('no volver')) return 'No volvería';
+  if (lower.includes('volver')) return 'Volvería';
+  if (lower.includes('no me gusto') || lower.includes('no me gust')) return 'No me gustó';
+  if (lower.includes('me gusto') || lower.includes('me gust')) return 'Me gustó';
+  if (lower.includes('util')) return 'Útil';
+  if (lower.includes('dudoso')) return 'Dudoso';
+  if (lower.includes('riesgoso')) return 'Riesgoso';
+  if (lower.includes('neutral')) return 'Neutral';
+  return capitalizeLoose(text);
+}
+
+function removeAccents(value: string) {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
 function normalizeTag(tag: unknown) {

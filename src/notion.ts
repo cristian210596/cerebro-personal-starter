@@ -70,21 +70,26 @@ function notionItemProperties(item: any) {
   return {
     'Título': { title: [{ text: { content: titulo } }] },
     'Fecha evento': item.fecha_evento ? { date: { start: item.fecha_evento } } : { date: null },
-    'Categoría': item.categoria_principal ? { select: { name: item.categoria_principal } } : { select: null },
+    'Categoría': selectProp(item.categoria_principal),
     'Subcategorías': { multi_select: toMultiSelect(item.subcategorias) },
-    'Tipo': item.tipo_item ? { select: { name: item.tipo_item } } : { select: null },
-    'Estado': item.estado ? { select: { name: item.estado } } : { select: null },
-    'Valoración': item.valoracion ? { select: { name: item.valoracion } } : { select: null },
-    'Importancia': item.importancia ? { select: { name: item.importancia } } : { select: null },
+    'Tipo': selectProp(item.tipo_item),
+    'Estado': selectProp(item.estado),
+    'Valoración': selectProp(normalizeValoracion(item.valoracion)),
+    'Importancia': selectProp(item.importancia),
     'Tags': { multi_select: toMultiSelect(item.tags) },
     'Resumen': { rich_text: resumen ? [{ text: { content: resumen } }] : [] },
     'Texto original': { rich_text: textoOriginal ? [{ text: { content: textoOriginal } }] : [] },
     'Acción futura': accion ? { rich_text: [{ text: { content: accion } }] } : { rich_text: [] },
     'URL': item.url ? { url: item.url } : { url: null },
-    'Fuente': item.fuente ? { select: { name: item.fuente } } : { select: null },
+    'Fuente': selectProp(item.fuente),
     'Entidades': entidades ? { rich_text: [{ text: { content: entidades } }] } : { rich_text: [] },
     'Item ID Supabase': { rich_text: [{ text: { content: item.id } }] }
   };
+}
+
+function selectProp(value: unknown) {
+  const name = cleanNotionOptionName(value);
+  return name ? { select: { name } } : { select: null };
 }
 
 function notionItemChildren(item: any): any[] {
@@ -96,9 +101,7 @@ function notionItemChildren(item: any): any[] {
   const subcats = Array.isArray(item.subcategorias) && item.subcategorias.length ? item.subcategorias.join(', ') : '-';
   const entidades = entidadesText(item) || '-';
 
-  if (resumen) {
-    blocks.push(calloutBlock('🧾', resumen));
-  }
+  if (resumen) blocks.push(calloutBlock('🧾', resumen));
 
   blocks.push(headingBlock('Datos'));
   blocks.push(bulletBlock(`Categoría: ${item.categoria_principal || '-'}`));
@@ -110,9 +113,7 @@ function notionItemChildren(item: any): any[] {
   blocks.push(bulletBlock(`Tags: ${tags}`));
   blocks.push(bulletBlock(`Entidades: ${entidades}`));
 
-  if (accion) {
-    blocks.push(calloutBlock('🎯', `Acción futura: ${accion}`));
-  }
+  if (accion) blocks.push(calloutBlock('🎯', `Acción futura: ${accion}`));
 
   if (original) {
     blocks.push(headingBlock('Texto original'));
@@ -182,5 +183,44 @@ function calloutBlock(emoji: string, text: string) {
 
 function toMultiSelect(values: string[] | null | undefined) {
   if (!Array.isArray(values)) return [];
-  return values.filter(Boolean).slice(0, 50).map(name => ({ name: String(name).slice(0, 100) }));
+
+  const cleanValues = values
+    .flatMap(value => String(value || '').split(/[;,]/g))
+    .map(cleanNotionOptionName)
+    .filter(Boolean) as string[];
+
+  return [...new Set(cleanValues)].slice(0, 50).map(name => ({ name }));
+}
+
+function normalizeValoracion(value: unknown) {
+  const original = String(value || '').trim();
+  if (!original) return '';
+
+  const lower = removeAccents(original).toLowerCase();
+
+  if (lower.includes('no volver')) return 'No volvería';
+  if (lower.includes('volver')) return 'Volvería';
+  if (lower.includes('no me gusto') || lower.includes('no me gust')) return 'No me gustó';
+  if (lower.includes('me gusto') || lower.includes('me gust')) return 'Me gustó';
+  if (lower.includes('util')) return 'Útil';
+  if (lower.includes('dudoso')) return 'Dudoso';
+  if (lower.includes('riesgoso')) return 'Riesgoso';
+  if (lower.includes('neutral')) return 'Neutral';
+
+  return original;
+}
+
+function cleanNotionOptionName(value: unknown) {
+  const text = String(value || '')
+    .trim()
+    .replace(/,/g, ' -')
+    .replace(/\s+/g, ' ')
+    .slice(0, 100)
+    .trim();
+
+  return text || null;
+}
+
+function removeAccents(value: string) {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }

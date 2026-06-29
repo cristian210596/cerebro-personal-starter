@@ -89,7 +89,20 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   await sendMessage(chatId, 'Procesando...');
 
-  const clasificacion = await classifyText(text);
+  let clasificacion: any;
+  try {
+    clasificacion = await classifyText(text);
+  } catch (error: any) {
+    console.error('No se pudo clasificar con IA:', error);
+    const msg = String(error?.message || '');
+    if (msg.includes('429') || String(error?.status || '') === '429') {
+      await sendMessage(chatId, 'No pude guardar porque Gemini se quedó sin cuota temporalmente. Probá más tarde o cambiamos a una API con más cuota.');
+      return;
+    }
+    await sendMessage(chatId, 'No pude clasificar este mensaje. Revisá logs de Vercel.');
+    return;
+  }
+
   const insert: ItemInsert = {
     fuente: 'telegram',
     telegram_user_id: msg.from?.id ? String(msg.from.id) : undefined,
@@ -219,7 +232,14 @@ async function handleEditCommand(chatId: number, text: string) {
 
   await sendMessage(chatId, 'Editando último item...');
 
-  const edit = await parseEditInstruction(instruction, current);
+  let edit;
+  try {
+    edit = await parseEditInstruction(instruction, current);
+  } catch (error) {
+    console.error('No se pudo interpretar edición:', error);
+    return sendMessage(chatId, 'No pude interpretar la corrección. Probá con formato simple: valoracion Volvería, estado Pendiente, tags hplc,shimadzu');
+  }
+
   const changes = edit.changes || {};
   if (!Object.keys(changes).length) {
     return sendMessage(chatId, `No apliqué cambios. ${edit.explanation || ''}`.trim());
