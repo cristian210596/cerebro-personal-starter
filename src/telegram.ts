@@ -7,6 +7,8 @@ import {
   latestItems,
   latestMemorias,
   pendingItems,
+  mergeEntidades,
+  normalizeEntidadesDatabase,
   rebuildDerivedData,
   saveItem,
   searchEntidades,
@@ -122,6 +124,14 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return handleRebuildCommand(chatId, text);
   }
 
+  if (text.startsWith('/normalizar')) {
+    return handleNormalizeCommand(chatId);
+  }
+
+  if (text.startsWith('/fusionar')) {
+    return handleMergeEntityCommand(chatId, text);
+  }
+
   if (isEditCommand(text)) {
     return handleEditCommand(chatId, text);
   }
@@ -200,7 +210,9 @@ function introText() {
     '/entidades',
     '/entidad hplc',
     '/stats',
-    '/reconstruir 20'
+    '/reconstruir 5',
+    '/normalizar',
+    '/fusionar Café Colombia => Café Martínez Colombia'
   ].join('\n');
 }
 
@@ -276,24 +288,12 @@ function formatStats(stats: any) {
 }
 
 async function handleRebuildCommand(chatId: number, text: string) {
-  const n = Number(text.replace('/reconstruir', '').trim() || 20);
-  const limit = Math.max(1, Math.min(n || 20, 50));
+  const n = Number(text.replace('/reconstruir', '').trim() || 5);
+  const limit = Math.max(1, Math.min(n || 5, 5));
 
-  await sendMessage(chatId, `Reconstruyendo entidades/memorias de los últimos ${limit} items...`);
+  await sendMessage(chatId, `Reconstruyendo últimos ${limit} items. Límite máximo: 5 para evitar reintentos de Telegram/Vercel.`);
 
   const result = await rebuildDerivedData(limit);
-
-  let notionEntidades = 0;
-  let notionMemorias = 0;
-  try {
-    for (const item of result.items) {
-      const notionResult = await syncNotionDerivedForItem(item);
-      notionEntidades += notionResult.entidades;
-      notionMemorias += notionResult.memorias;
-    }
-  } catch (error) {
-    console.error('No se pudo sincronizar derivados a Notion:', error);
-  }
 
   return sendMessage(chatId, [
     'Reconstrucción terminada.',
@@ -301,11 +301,68 @@ async function handleRebuildCommand(chatId: number, text: string) {
     `Items procesados: ${result.processedItems}`,
     `Menciones de entidades detectadas: ${result.entityMentions}`,
     `Memorias sugeridas detectadas: ${result.memoryMentions}`,
-    `Entidades sincronizadas a Notion: ${notionEntidades}`,
-    `Memorias sincronizadas a Notion: ${notionMemorias}`,
     '',
-    'Probá ahora: /entidades y /memorias'
+    'Probá ahora: /entidades y /memorias',
+    'Para limpiar duplicados: /normalizar'
   ].join('\n'));
+}
+
+async function handleNormalizeCommand(chatId: number) {
+  await sendMessage(chatId, 'Normalizando entidades duplicadas exactas...');
+
+  try {
+    const result = await normalizeEntidadesDatabase(500);
+    return sendMessage(chatId, [
+      'Normalización terminada.',
+      '',
+      `Entidades revisadas: ${result.scanned}`,
+      `Grupos fusionados: ${result.groupsMerged}`,
+      `Filas duplicadas eliminadas: ${result.rowsMerged}`,
+      `Alias preservados/agregados: ${result.aliasesAdded}`,
+      '',
+      'Nota: esto fusiona duplicados claros por normalización exacta. Para casos dudosos usá /fusionar origen => destino.'
+    ].join('\n'));
+  } catch (error: any) {
+    console.error('No se pudo normalizar entidades:', error);
+    return sendMessage(chatId, `No pude normalizar entidades: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleMergeEntityCommand(chatId: number, text: string) {
+  const raw = text.replace('/fusionar', '').trim();
+  const match = raw.match(/^(.+?)\s*(?:=>|->|→)\s*(.+)$/);
+
+  if (!match) {
+    return sendMessage(chatId, 'Usá: /fusionar Café Colombia => Café Martínez Colombia');
+  }
+
+  const source = match[1].trim();
+  const target = match[2].trim();
+
+  if (!source || !target) {
+    return sendMessage(chatId, 'Usá: /fusionar entidad vieja => entidad correcta');
+  }
+
+  await sendMessage(chatId, `Fusionando "${source}" dentro de "${target}"...`);
+
+  try {
+    const result = await mergeEntidades(source, target);
+    if (!result.merged) return sendMessage(chatId, 'No fusioné nada: ambas búsquedas apuntan a la misma entidad.');
+
+    return sendMessage(chatId, [
+      'Fusión terminada.',
+      '',
+      `Origen eliminado: ${result.source.nombre}`,
+      `Destino conservado: ${result.target.nombre}`,
+      `Vínculos movidos: ${result.movedLinks}`,
+      `Alias del destino: ${(result.target.alias || []).join(', ') || '-'}`,
+      '',
+      'Desde ahora, si aparece el origen como alias, se reutiliza la entidad destino.'
+    ].join('\n'));
+  } catch (error: any) {
+    console.error('No se pudo fusionar entidad:', error);
+    return sendMessage(chatId, `No pude fusionar: ${error?.message || 'error desconocido'}`);
+  }
 }
 
 function isEditCommand(text: string) {
