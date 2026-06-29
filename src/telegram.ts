@@ -1,7 +1,23 @@
 import type { ItemInsert } from './types.js';
 import { classifyText } from './classifier.js';
-import { latestItemForChat, latestItems, latestMemorias, pendingItems, saveItem, searchItems, supabase, updateItemFields } from './supabaseClient.js';
-import { createNotionItemPage, updateNotionItemPage } from './notion.js';
+import {
+  itemsByEntity,
+  latestEntidades,
+  latestItemForChat,
+  latestItems,
+  latestMemorias,
+  pendingItems,
+  rebuildDerivedData,
+  saveItem,
+  searchEntidades,
+  searchItems,
+  searchMemorias,
+  statsCerebro,
+  supabase,
+  syncItemDerivedData,
+  updateItemFields
+} from './supabaseClient.js';
+import { createNotionItemPage, syncNotionDerivedForItem, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
 import { parseEditInstruction } from './editor.js';
 
@@ -79,8 +95,31 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   }
 
   if (text.startsWith('/memorias')) {
-    const results = await latestMemorias(10);
-    return sendMessage(chatId, formatMemorias(results));
+    const q = text.replace('/memorias', '').trim();
+    const results = q ? await searchMemorias(q, 10) : await latestMemorias(10);
+    return sendMessage(chatId, formatMemorias(results, q ? `Memorias: ${q}` : 'Memorias vigentes'));
+  }
+
+  if (text.startsWith('/entidades')) {
+    const q = text.replace('/entidades', '').trim();
+    const results = q ? await searchEntidades(q, 20) : await latestEntidades(20);
+    return sendMessage(chatId, formatEntidades(results, q ? `Entidades: ${q}` : 'Últimas entidades'));
+  }
+
+  if (text.startsWith('/entidad')) {
+    const q = text.replace('/entidad', '').trim();
+    if (!q) return sendMessage(chatId, 'Usá: /entidad hplc');
+    const results = await itemsByEntity(q, 10);
+    return sendMessage(chatId, formatItems(results, `Items vinculados a entidad: ${q}`));
+  }
+
+  if (text.startsWith('/stats')) {
+    const stats = await statsCerebro();
+    return sendMessage(chatId, formatStats(stats));
+  }
+
+  if (text.startsWith('/reconstruir')) {
+    return handleRebuildCommand(chatId, text);
   }
 
   if (isEditCommand(text)) {
@@ -130,6 +169,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     if (notionPageId) {
       await supabase.from('items').update({ notion_page_id: notionPageId }).eq('id', item.id);
     }
+    await syncNotionDerivedForItem(item);
   } catch (error) {
     console.error('No se pudo sincronizar Notion:', error);
   }
@@ -156,7 +196,11 @@ function introText() {
     '/buscar hplc lampara d2',
     '/ultimos',
     '/pendientes',
-    '/memorias'
+    '/memorias',
+    '/entidades',
+    '/entidad hplc',
+    '/stats',
+    '/reconstruir 20'
   ].join('\n');
 }
 
@@ -171,12 +215,13 @@ function formatSaved(c: any) {
     `Estado: ${c.estado || '-'}`,
     `Valoración: ${c.valoracion || '-'}`,
     `Importancia: ${c.importancia || '-'}`,
-    `Tags: ${(c.tags || []).join(', ') || '-'}`
+    `Tags: ${(c.tags || []).join(', ') || '-'}`,
+    `Entidades: ${(c.entidades || []).map((e: any) => `${e.tipo}: ${e.nombre}`).join(', ') || '-'}`
   ];
 
   if (c.accion_futura) lines.push(`Acción futura: ${c.accion_futura}`);
   if (c.memorias_sugeridas?.length) {
-    lines.push('', 'Memoria sugerida:');
+    lines.push('', 'Memorias sugeridas:');
     for (const m of c.memorias_sugeridas) lines.push(`- ${m.afirmacion}`);
   }
   return lines.join('\n');
@@ -196,9 +241,9 @@ function formatItems(items: any[], title: string) {
   return lines.join('\n');
 }
 
-function formatMemorias(memorias: any[]) {
-  if (!memorias.length) return 'No hay memorias vigentes.';
-  const lines = ['Memorias vigentes', ''];
+function formatMemorias(memorias: any[], title = 'Memorias vigentes') {
+  if (!memorias.length) return `${title}\n\nSin memorias.`;
+  const lines = [title, ''];
   for (const memoria of memorias) {
     lines.push(`• ${memoria.afirmacion}`);
     if (memoria.categoria) lines.push(`  Categoría: ${memoria.categoria}`);
@@ -208,7 +253,60 @@ function formatMemorias(memorias: any[]) {
   return lines.join('\n');
 }
 
+function formatEntidades(entidades: any[], title: string) {
+  if (!entidades.length) return `${title}\n\nSin entidades.`;
+  const lines = [title, ''];
+  for (const entidad of entidades) {
+    lines.push(`• ${entidad.nombre}`);
+    lines.push(`  Tipo: ${entidad.tipo || '-'}`);
+    if (entidad.categoria_relacionada) lines.push(`  Categoría: ${entidad.categoria_relacionada}`);
+    lines.push('');
+  }
+  return lines.join('\n');
+}
 
+function formatStats(stats: any) {
+  return [
+    'Estado del cerebro',
+    '',
+    `Items: ${stats.itemsCount}`,
+    `Entidades: ${stats.entidadesCount}`,
+    `Memorias vigentes: ${stats.memoriasCount}`
+  ].join('\n');
+}
+
+async function handleRebuildCommand(chatId: number, text: string) {
+  const n = Number(text.replace('/reconstruir', '').trim() || 20);
+  const limit = Math.max(1, Math.min(n || 20, 50));
+
+  await sendMessage(chatId, `Reconstruyendo entidades/memorias de los últimos ${limit} items...`);
+
+  const result = await rebuildDerivedData(limit);
+
+  let notionEntidades = 0;
+  let notionMemorias = 0;
+  try {
+    for (const item of result.items) {
+      const notionResult = await syncNotionDerivedForItem(item);
+      notionEntidades += notionResult.entidades;
+      notionMemorias += notionResult.memorias;
+    }
+  } catch (error) {
+    console.error('No se pudo sincronizar derivados a Notion:', error);
+  }
+
+  return sendMessage(chatId, [
+    'Reconstrucción terminada.',
+    '',
+    `Items procesados: ${result.processedItems}`,
+    `Menciones de entidades detectadas: ${result.entityMentions}`,
+    `Memorias sugeridas detectadas: ${result.memoryMentions}`,
+    `Entidades sincronizadas a Notion: ${notionEntidades}`,
+    `Memorias sincronizadas a Notion: ${notionMemorias}`,
+    '',
+    'Probá ahora: /entidades y /memorias'
+  ].join('\n'));
+}
 
 function isEditCommand(text: string) {
   const lower = text.toLowerCase();
@@ -256,6 +354,7 @@ async function handleEditCommand(chatId: number, text: string) {
   });
 
   try {
+    await syncItemDerivedData(updated);
     if (updated.notion_page_id) {
       await updateNotionItemPage(updated);
     } else {
@@ -264,8 +363,9 @@ async function handleEditCommand(chatId: number, text: string) {
         await supabase.from('items').update({ notion_page_id: notionPageId }).eq('id', updated.id);
       }
     }
+    await syncNotionDerivedForItem(updated);
   } catch (error) {
-    console.error('No se pudo actualizar Notion:', error);
+    console.error('No se pudo actualizar Notion/derivados:', error);
   }
 
   return sendMessage(chatId, formatEdited(updated, Object.keys(changes), edit.explanation));

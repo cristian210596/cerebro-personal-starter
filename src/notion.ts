@@ -60,6 +60,122 @@ export async function updateNotionItemPage(item: any) {
   return item.notion_page_id;
 }
 
+export async function syncNotionDerivedForItem(item: any) {
+  const notion = getNotionClient();
+  if (!notion) return { entidades: 0, memorias: 0 };
+
+  const dbConfig = loadNotionDbConfig();
+  let entidades = 0;
+  let memorias = 0;
+
+  if (dbConfig.entidadesDatabaseId && Array.isArray(item.entidades_json)) {
+    for (const entidad of item.entidades_json) {
+      if (!entidad?.tipo || !entidad?.nombre) continue;
+      await createOrUpdateNotionEntidad(notion, dbConfig.entidadesDatabaseId, {
+        ...entidad,
+        categoria_relacionada: item.categoria_principal
+      });
+      entidades += 1;
+    }
+  }
+
+  const memoriasSugeridas = item.classifier_json?.memorias_sugeridas || [];
+  if (dbConfig.memoriasDatabaseId && Array.isArray(memoriasSugeridas)) {
+    for (const memoria of memoriasSugeridas) {
+      if (!memoria?.afirmacion) continue;
+      await createOrUpdateNotionMemoria(notion, dbConfig.memoriasDatabaseId, {
+        ...memoria,
+        origen: item.id
+      });
+      memorias += 1;
+    }
+  }
+
+  return { entidades, memorias };
+}
+
+async function createOrUpdateNotionEntidad(notion: Client, databaseId: string, entidad: any) {
+  const nombre = cleanNotionText(entidad.nombre, 180);
+  if (!nombre) return null;
+
+  const properties = {
+    'Nombre': { title: [{ text: { content: nombre } }] },
+    'Tipo': selectProp(entidad.tipo),
+    'Alias': { rich_text: [] },
+    'Descripción': entidad.descripcion
+      ? { rich_text: [{ text: { content: cleanNotionText(entidad.descripcion, 1900) } }] }
+      : { rich_text: [] },
+    'Categoría relacionada': selectProp(entidad.categoria_relacionada)
+  };
+
+  const existingPageId = await findPageByTitle(notion, databaseId, 'Nombre', nombre);
+
+  if (existingPageId) {
+    await notion.pages.update({ page_id: existingPageId, icon: { type: 'emoji', emoji: emojiForEntity(entidad.tipo) }, properties });
+    return existingPageId;
+  }
+
+  const page = await notion.pages.create({
+    parent: { database_id: databaseId },
+    icon: { type: 'emoji', emoji: emojiForEntity(entidad.tipo) },
+    properties,
+    children: [
+      calloutBlock('🧩', `Entidad detectada automáticamente desde Telegram.`),
+      bulletBlock(`Tipo: ${entidad.tipo || '-'}`),
+      bulletBlock(`Categoría relacionada: ${entidad.categoria_relacionada || '-'}`)
+    ] as any
+  });
+
+  return page.id;
+}
+
+async function createOrUpdateNotionMemoria(notion: Client, databaseId: string, memoria: any) {
+  const afirmacion = cleanNotionText(memoria.afirmacion, 180);
+  if (!afirmacion) return null;
+
+  const properties = {
+    'Afirmación': { title: [{ text: { content: afirmacion } }] },
+    'Categoría': selectProp(memoria.categoria),
+    'Confianza': selectProp(memoria.confianza || 'Media'),
+    'Vigente': { checkbox: true },
+    'Origen': memoria.origen ? { rich_text: [{ text: { content: String(memoria.origen).slice(0, 1900) } }] } : { rich_text: [] },
+    'Última confirmación': { date: { start: new Date().toISOString().slice(0, 10) } }
+  };
+
+  const existingPageId = await findPageByTitle(notion, databaseId, 'Afirmación', afirmacion);
+
+  if (existingPageId) {
+    await notion.pages.update({ page_id: existingPageId, icon: { type: 'emoji', emoji: '🧠' }, properties });
+    return existingPageId;
+  }
+
+  const page = await notion.pages.create({
+    parent: { database_id: databaseId },
+    icon: { type: 'emoji', emoji: '🧠' },
+    properties,
+    children: [
+      calloutBlock('🧠', afirmacion),
+      bulletBlock(`Categoría: ${memoria.categoria || '-'}`),
+      bulletBlock(`Confianza: ${memoria.confianza || 'Media'}`)
+    ] as any
+  });
+
+  return page.id;
+}
+
+async function findPageByTitle(notion: Client, databaseId: string, property: string, equals: string) {
+  const result = await notion.databases.query({
+    database_id: databaseId,
+    filter: {
+      property,
+      title: { equals }
+    },
+    page_size: 1
+  });
+
+  return result.results?.[0]?.id || null;
+}
+
 function notionItemProperties(item: any) {
   const titulo = String(item.titulo || 'Item sin título').slice(0, 180);
   const resumen = String(item.resumen || '').slice(0, 1900);
@@ -138,6 +254,20 @@ function emojiForCategory(category: string | null | undefined) {
   if (c.includes('finanzas')) return '💸';
   if (c.includes('preferencia')) return '⭐';
   return '🧠';
+}
+
+function emojiForEntity(tipo: string | null | undefined) {
+  const t = String(tipo || '').toLowerCase();
+  if (t.includes('equipo')) return '⚙️';
+  if (t.includes('marca') || t.includes('modelo')) return '🏷️';
+  if (t.includes('persona')) return '👤';
+  if (t.includes('producto')) return '🛒';
+  if (t.includes('ingrediente')) return '🥘';
+  if (t.includes('materia')) return '📚';
+  if (t.includes('norma')) return '📘';
+  if (t.includes('lugar')) return '📍';
+  if (t.includes('app') || t.includes('herramienta')) return '🧰';
+  return '🧩';
 }
 
 function entidadesText(item: any) {
@@ -219,6 +349,10 @@ function cleanNotionOptionName(value: unknown) {
     .trim();
 
   return text || null;
+}
+
+function cleanNotionText(value: unknown, max = 1900) {
+  return String(value || '').trim().replace(/\s+/g, ' ').slice(0, max).trim();
 }
 
 function removeAccents(value: string) {
