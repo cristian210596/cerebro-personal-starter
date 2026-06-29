@@ -74,66 +74,73 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return;
   }
 
-  if (text === '/start') {
+  const command = parseTelegramCommand(text);
+
+  if (command?.name === 'start') {
     await sendMessage(chatId, introText());
     return;
   }
 
-  if (text.startsWith('/buscar')) {
-    const q = text.replace('/buscar', '').trim();
+  if (command?.name === 'buscar') {
+    const q = command.args;
     if (!q) return sendMessage(chatId, 'Usá: /buscar hplc lampara d2');
     const results = await searchItems(q, 10);
     return sendMessage(chatId, formatItems(results, `Resultados para: ${q}`));
   }
 
-  if (text.startsWith('/ultimos')) {
+  if (command?.name === 'ultimos') {
     const results = await latestItems(10);
     return sendMessage(chatId, formatItems(results, 'Últimos items'));
   }
 
-  if (text.startsWith('/pendientes')) {
+  if (command?.name === 'pendientes') {
     const results = await pendingItems(10);
     return sendMessage(chatId, formatItems(results, 'Pendientes'));
   }
 
-  if (text.startsWith('/memorias')) {
-    const q = text.replace('/memorias', '').trim();
+  if (command?.name === 'memorias') {
+    const q = command.args;
     const results = q ? await searchMemorias(q, 10) : await latestMemorias(10);
     return sendMessage(chatId, formatMemorias(results, q ? `Memorias: ${q}` : 'Memorias vigentes'));
   }
 
-  if (text.startsWith('/entidades')) {
-    const q = text.replace('/entidades', '').trim();
+  if (command?.name === 'entidades') {
+    const q = command.args;
     const results = q ? await searchEntidades(q, 20) : await latestEntidades(20);
     return sendMessage(chatId, formatEntidades(results, q ? `Entidades: ${q}` : 'Últimas entidades'));
   }
 
-  if (text.startsWith('/entidad')) {
-    const q = text.replace('/entidad', '').trim();
+  if (command?.name === 'entidad') {
+    const q = command.args;
     if (!q) return sendMessage(chatId, 'Usá: /entidad hplc');
     const results = await itemsByEntity(q, 10);
     return sendMessage(chatId, formatItems(results, `Items vinculados a entidad: ${q}`));
   }
 
-  if (text.startsWith('/stats')) {
+  if (command?.name === 'stats') {
     const stats = await statsCerebro();
     return sendMessage(chatId, formatStats(stats));
   }
 
-  if (text.startsWith('/reconstruir')) {
-    return handleRebuildCommand(chatId, text);
+  if (command?.name === 'reconstruir') {
+    return handleRebuildCommand(chatId, command.args);
   }
 
-  if (text.startsWith('/normalizar')) {
+  if (command?.name === 'normalizar') {
     return handleNormalizeCommand(chatId);
   }
 
-  if (text.startsWith('/fusionar')) {
-    return handleMergeEntityCommand(chatId, text);
+  if (command?.name === 'fusionar') {
+    return handleMergeEntityCommand(chatId, command.args);
   }
 
   if (isEditCommand(text)) {
     return handleEditCommand(chatId, text);
+  }
+
+  // Regla de seguridad: ningún comando desconocido se guarda como item.
+  if (command) {
+    return sendMessage(chatId, `Comando no reconocido: /${command.name}. No lo guardé como item.`);
   }
 
   await sendMessage(chatId, 'Procesando...');
@@ -287,8 +294,8 @@ function formatStats(stats: any) {
   ].join('\n');
 }
 
-async function handleRebuildCommand(chatId: number, text: string) {
-  const n = Number(text.replace('/reconstruir', '').trim() || 5);
+async function handleRebuildCommand(chatId: number, args: string) {
+  const n = Number(args.trim() || 5);
   const limit = Math.max(1, Math.min(n || 5, 5));
 
   await sendMessage(chatId, `Reconstruyendo últimos ${limit} items. Límite máximo: 5 para evitar reintentos de Telegram/Vercel.`);
@@ -328,8 +335,8 @@ async function handleNormalizeCommand(chatId: number) {
   }
 }
 
-async function handleMergeEntityCommand(chatId: number, text: string) {
-  const raw = text.replace('/fusionar', '').trim();
+async function handleMergeEntityCommand(chatId: number, args: string) {
+  const raw = args.trim();
   const match = raw.match(/^(.+?)\s*(?:=>|->|→)\s*(.+)$/);
 
   if (!match) {
@@ -363,6 +370,19 @@ async function handleMergeEntityCommand(chatId: number, text: string) {
     console.error('No se pudo fusionar entidad:', error);
     return sendMessage(chatId, `No pude fusionar: ${error?.message || 'error desconocido'}`);
   }
+}
+
+function parseTelegramCommand(text: string): { name: string; args: string } | null {
+  const match = text.trim().match(/^\/([^\s@]+)(?:@[^\s]+)?(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  return {
+    name: removeAccents(match[1]).toLowerCase(),
+    args: (match[2] || '').trim()
+  };
+}
+
+function removeAccents(value: string) {
+  return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
 function isEditCommand(text: string) {
