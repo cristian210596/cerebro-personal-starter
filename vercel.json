@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/telegram.ts": { "maxDuration": 60 },
+    "api/setWebhook.ts": { "maxDuration": 30 },
+    "api/health.ts": { "maxDuration": 10 }
+  }
+}
