@@ -27,6 +27,7 @@ import { config } from './config.js';
 import { parseEditInstruction } from './editor.js';
 import { generateBackupZip } from './backup.js';
 import { buildDocumentText, describeImage, transcribeAudio, type TelegramFileInfo } from './media.js';
+import { formatFinanceSaved, formatFinanceSummary, getFinanceSummary, looksLikeFinanceText, saveFinanceFromText } from './finance.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -139,6 +140,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return sendMessage(chatId, formatStats(stats));
   }
 
+  if (command?.name === 'finanzas') {
+    return handleFinanceSummaryCommand(chatId);
+  }
+
   if (command?.name === 'backup') {
     return handleBackupCommand(chatId);
   }
@@ -162,6 +167,11 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   // Regla de seguridad: ningún comando desconocido se guarda como item.
   if (command) {
     return sendMessage(chatId, `Comando no reconocido: /${command.name}. No lo guardé como item.`);
+  }
+
+  if (looksLikeFinanceText(text)) {
+    const financeHandled = await handleFinanceNaturalText(chatId, msg.message_id, msg.from?.id, text);
+    if (financeHandled) return;
   }
 
   await sendMessage(chatId, 'Procesando...');
@@ -191,7 +201,7 @@ export async function sendDocument(chatId: number, filename: string, buffer: Buf
   const form = new FormData();
   form.append('chat_id', String(chatId));
   if (caption) form.append('caption', caption.slice(0, 1000));
-  form.append('document', new Blob([buffer], { type: 'application/zip' }), filename);
+  form.append('document', new Blob([new Uint8Array(buffer)], { type: 'application/zip' }), filename);
 
   const res = await fetch(`${apiBase}/sendDocument`, {
     method: 'POST',
@@ -454,6 +464,7 @@ function introText() {
     '/entidades',
     '/entidad hplc',
     '/stats',
+    '/finanzas',
     '/backup',
     '/reconstruir 5',
     '/normalizar',
@@ -592,6 +603,53 @@ function formatSmartItems(results: any[], title: string) {
     i += 1;
   }
   return lines.join('\n');
+}
+
+
+async function handleFinanceSummaryCommand(chatId: number) {
+  try {
+    const summary = await getFinanceSummary();
+    return sendMessage(chatId, formatFinanceSummary(summary));
+  } catch (error: any) {
+    console.error('No pude generar resumen financiero:', error);
+    return sendMessage(chatId, 'No pude generar el resumen financiero. Si acabás de instalar el parche, primero ejecutá el SQL de finanzas en Supabase.');
+  }
+}
+
+async function handleFinanceNaturalText(chatId: number, messageId: number, userId: number | undefined, text: string) {
+  await sendMessage(chatId, 'Procesando finanzas...');
+
+  try {
+    const result = await saveFinanceFromText({ chatId, messageId, userId, text });
+    if (!result.ok) return false;
+
+    try {
+      const notionPageId = await createNotionItemPage(result.item);
+      if (notionPageId) {
+        await supabase.from('items').update({ notion_page_id: notionPageId }).eq('id', result.item.id);
+        result.item.notion_page_id = notionPageId;
+      }
+      await syncNotionDerivedForItem(result.item);
+    } catch (error) {
+      console.error('No se pudo sincronizar Notion para finanzas:', error);
+    }
+
+    await sendMessage(chatId, formatFinanceSaved(result));
+    return true;
+  } catch (error: any) {
+    console.error('No pude procesar finanzas:', error);
+    const msg = String(error?.message || '');
+    if (msg.includes('429') || String(error?.status || '') === '429') {
+      await sendMessage(chatId, 'No pude procesar finanzas porque Gemini se quedó sin cuota temporalmente. Probá más tarde.');
+      return true;
+    }
+    if (msg.includes('finanzas_movimientos') || msg.includes('finanzas_deudas') || msg.includes('finanzas_particiones')) {
+      await sendMessage(chatId, 'Todavía no están creadas las tablas de finanzas. Ejecutá primero el SQL del parche en Supabase.');
+      return true;
+    }
+    await sendMessage(chatId, 'No pude procesar este movimiento financiero. Lo guardo como nota normal.');
+    return false;
+  }
 }
 
 async function handleRebuildCommand(chatId: number, args: string) {

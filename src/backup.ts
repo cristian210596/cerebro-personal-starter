@@ -7,7 +7,10 @@ const TABLES = [
   'item_entidades',
   'memorias',
   'archivos',
-  'taxonomia'
+  'taxonomia',
+  'finanzas_movimientos',
+  'finanzas_deudas',
+  'finanzas_particiones'
 ];
 
 export async function generateBackupZip() {
@@ -17,10 +20,15 @@ export async function generateBackupZip() {
   const counts: Record<string, number> = {};
 
   for (const table of TABLES) {
-    const rows = await fetchAllRows(table);
-    counts[table] = rows.length;
-    zip.file(`${table}.json`, JSON.stringify(rows, null, 2));
-    zip.file(`${table}.csv`, toCsv(rows));
+    try {
+      const rows = await fetchAllRows(table);
+      counts[table] = rows.length;
+      zip.file(`${table}.json`, JSON.stringify(rows, null, 2));
+      zip.file(`${table}.csv`, toCsv(rows));
+    } catch (error: any) {
+      counts[table] = -1;
+      zip.file(`${table}-ERROR.txt`, `No se pudo exportar ${table}: ${error?.message || error}`);
+    }
   }
 
   zip.file('backup-info.json', JSON.stringify({
