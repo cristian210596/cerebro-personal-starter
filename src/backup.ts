@@ -10,7 +10,8 @@ const TABLES = [
   'taxonomia',
   'finanzas_movimientos',
   'finanzas_deudas',
-  'finanzas_particiones'
+  'finanzas_particiones',
+  'finanzas_cierres'
 ];
 
 export async function generateBackupZip() {

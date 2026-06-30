@@ -115,7 +115,7 @@ export function looksLikeFinanceText(text: string) {
   const keywords = [
     'gaste','gasté','compre','compré','pague','pagué','pago','pagó','me pago','me pagó','me devolvio','me devolvió',
     'me debe','le debo','debo','deuda','dividir','repartir','entre','tarjeta','visa','master','mastercard','mercado pago','mp',
-    'sueldo','salario','aguinaldo','vacaciones','ingreso','transferencia','cuotas','carrefour','supermercado'
+    'sueldo','salario','aguinaldo','vacaciones','ingreso','transferencia','cuotas','cierre','vencimiento','carrefour','supermercado'
   ];
   if (keywords.some(k => t.includes(normalizeLoose(k)))) return true;
   return /\$\s*\d/.test(text) || /\b\d+[\.,]?\d*\s*(pesos|ars)\b/i.test(text);

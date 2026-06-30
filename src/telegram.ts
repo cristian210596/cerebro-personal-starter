@@ -29,6 +29,7 @@ import { generateBackupZip } from './backup.js';
 import { buildDocumentText, describeImage, transcribeAudio, type TelegramFileInfo } from './media.js';
 import { createSignedFileUrl, uploadTelegramFileToStorage } from './storage.js';
 import { formatFinanceSaved, formatFinanceSummary, getFinanceSummary, looksLikeFinanceText, saveFinanceFromText } from './finance.js';
+import { correctLastFinanceMovement, deleteLastFinanceMovement, deleteLastItem, formatCardSummary, formatDebts, formatFinanceCorrection, formatMovements, getCardSummary, listFinanceDebts, listFinanceMovements, looksLikeFinanceProText, markDebtPaidFromText, payCardFromText, saveCardStatementFromText } from './financePro.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -145,6 +146,26 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return handleFinanceSummaryCommand(chatId);
   }
 
+  if (command?.name === 'gastos') {
+    return handleGastosCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'deudas') {
+    return handleDeudasCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'tarjetas') {
+    return handleTarjetasCommand(chatId);
+  }
+
+  if (command?.name === 'pagar') {
+    return handlePagarCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'borrar') {
+    return handleBorrarCommand(chatId, command.args);
+  }
+
   if (command?.name === 'backup') {
     return handleBackupCommand(chatId);
   }
@@ -159,6 +180,11 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (command?.name === 'fusionar') {
     return handleMergeEntityCommand(chatId, command.args);
+  }
+
+  if (looksLikeFinanceProText(text)) {
+    const handled = await handleFinanceProNaturalText(chatId, text);
+    if (handled) return;
   }
 
   if (isEditCommand(text)) {
@@ -476,6 +502,9 @@ function introText() {
     '/entidad hplc',
     '/stats',
     '/finanzas',
+    '/gastos visa',
+    '/deudas',
+    '/tarjetas',
     '/backup',
     '/reconstruir 5',
     '/normalizar',
@@ -672,6 +701,101 @@ async function loadArchivosByItem(itemIds: string[]) {
   return map;
 }
 
+
+async function handleGastosCommand(chatId: number, args: string) {
+  try {
+    const rows = await listFinanceMovements(args, 12);
+    return sendMessage(chatId, formatMovements(rows, args ? `Gastos / movimientos: ${args}` : 'Últimos gastos / movimientos'));
+  } catch (error: any) {
+    console.error('No pude listar gastos:', error);
+    return sendMessage(chatId, `No pude listar gastos: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleDeudasCommand(chatId: number, args: string) {
+  try {
+    const rows = await listFinanceDebts(args, 15);
+    return sendMessage(chatId, formatDebts(rows, args ? `Deudas: ${args}` : 'Deudas abiertas'));
+  } catch (error: any) {
+    console.error('No pude listar deudas:', error);
+    return sendMessage(chatId, `No pude listar deudas: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleTarjetasCommand(chatId: number) {
+  try {
+    const rows = await getCardSummary();
+    return sendMessage(chatId, formatCardSummary(rows));
+  } catch (error: any) {
+    console.error('No pude listar tarjetas:', error);
+    return sendMessage(chatId, 'No pude listar tarjetas. Si acabás de instalar el parche, ejecutá supabase/finance_pro.sql.');
+  }
+}
+
+async function handlePagarCommand(chatId: number, args: string) {
+  if (!args) return sendMessage(chatId, 'Usá: /pagar Juan 5000 o /pagar deuda de Juan confirmar');
+  try {
+    const result = await markDebtPaidFromText(args);
+    if (!result.ok) return sendMessage(chatId, result.message);
+    return sendMessage(chatId, [
+      'Pago/deuda actualizado.',
+      '',
+      `${result.deuda.persona}: ${result.deuda.estado}`,
+      `Saldo pendiente: $${Number(result.deuda.saldo_pendiente || 0).toLocaleString('es-AR')}`
+    ].join('\n'));
+  } catch (error: any) {
+    console.error('No pude aplicar pago:', error);
+    return sendMessage(chatId, `No pude aplicar el pago: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleBorrarCommand(chatId: number, args: string) {
+  const a = removeAccents(args || '').toLowerCase();
+  try {
+    if (a.includes('gasto')) {
+      const result = await deleteLastFinanceMovement(a.includes('confirmar'));
+      return sendMessage(chatId, result.message);
+    }
+    if (a.includes('ultimo') || a.includes('último')) {
+      const result = await deleteLastItem(a.includes('confirmar'));
+      return sendMessage(chatId, result.message);
+    }
+    return sendMessage(chatId, 'Usá: /borrar gasto ultimo confirmar o /borrar ultimo confirmar');
+  } catch (error: any) {
+    console.error('No pude borrar:', error);
+    return sendMessage(chatId, `No pude borrar: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleFinanceProNaturalText(chatId: number, text: string) {
+  const clean = removeAccents(text).toLowerCase();
+  try {
+    if (clean.startsWith('corregir ultimo gasto') || clean.startsWith('corregir último gasto') || clean.startsWith('corregir gasto')) {
+      const result = await correctLastFinanceMovement(text);
+      return sendMessage(chatId, formatFinanceCorrection(result));
+    }
+    if (clean.startsWith('marcar deuda') || clean.startsWith('saldar deuda')) {
+      const result = await markDebtPaidFromText(text);
+      if (!result.ok) return sendMessage(chatId, result.message);
+      return sendMessage(chatId, `Deuda actualizada. ${result.deuda.persona}: ${result.deuda.estado}. Saldo: $${Number(result.deuda.saldo_pendiente || 0).toLocaleString('es-AR')}`);
+    }
+    if (clean.startsWith('cierre visa') || clean.startsWith('cierre master')) {
+      const result = await saveCardStatementFromText(text);
+      if (!result.ok) return sendMessage(chatId, result.message);
+      return sendMessage(chatId, `Cierre guardado. ${result.cierre.tarjeta} ${result.cierre.periodo}: $${Number(result.cierre.monto_total || 0).toLocaleString('es-AR')}${result.cierre.fecha_vencimiento ? ` vence ${result.cierre.fecha_vencimiento}` : ''}`);
+    }
+    if (clean.startsWith('pague visa') || clean.startsWith('pagué visa') || clean.startsWith('pague master') || clean.startsWith('pagué master')) {
+      const result = await payCardFromText(text);
+      if (!result.ok) return sendMessage(chatId, result.message);
+      return sendMessage(chatId, `Pago de tarjeta registrado. ${result.cierre.tarjeta}: saldo pendiente $${Number(result.cierre.saldo_pendiente || 0).toLocaleString('es-AR')}`);
+    }
+    return false;
+  } catch (error: any) {
+    console.error('No pude procesar finanzas pro:', error);
+    await sendMessage(chatId, `No pude procesar esta acción financiera: ${error?.message || 'error desconocido'}`);
+    return true;
+  }
+}
 
 async function handleFinanceSummaryCommand(chatId: number) {
   try {
