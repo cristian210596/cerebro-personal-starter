@@ -1,0 +1,28 @@
+{
+  "name": "cerebro-personal-starter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "setup:supabase": "tsx src/scripts/setupSupabase.ts",
+    "setup:notion": "tsx src/scripts/setupNotion.ts",
+    "test:classify": "tsx src/scripts/testClassifier.ts",
+    "set:webhook": "tsx src/scripts/setWebhook.ts"
+  },
+  "dependencies": {
+    "@google/genai": "latest",
+    "@notionhq/client": "2.2.15",
+    "@supabase/supabase-js": "latest",
+    "dotenv": "latest",
+    "jszip": "^3.10.1",
+    "postgres": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}
