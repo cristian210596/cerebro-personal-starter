@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Client } from '@notionhq/client';
 import { config } from './config.js';
+import { getAppConfigMap, setAppConfigValue, supabase } from './supabaseClient.js';
 import { createSignedFileUrl } from './storage.js';
 
 type NotionDbConfig = {
@@ -10,6 +11,9 @@ type NotionDbConfig = {
   memoriasDatabaseId?: string;
   archivosDatabaseId?: string;
   taxonomiaDatabaseId?: string;
+  finanzasMovimientosDatabaseId?: string;
+  finanzasDeudasDatabaseId?: string;
+  finanzasParticionesDatabaseId?: string;
 };
 
 function notionAvailable() {
@@ -229,6 +233,313 @@ async function findPageByTitle(notion: Client, databaseId: string, property: str
   });
 
   return result.results?.[0]?.id || null;
+}
+
+
+
+export async function syncNotionFinanceResult(result: any) {
+  const notion = getNotionClient();
+  if (!notion || !result?.ok) return { movimientos: 0, deudas: 0, particiones: 0 };
+
+  const dbs = await ensureFinanceDatabases(notion);
+  const persisted = result.persisted || {};
+  let movimientos = 0;
+  let deudas = 0;
+  let particiones = 0;
+
+  if (persisted.movimiento) {
+    const pageId = await createOrUpdateNotionMovimiento(notion, dbs.finanzasMovimientosDatabaseId, persisted.movimiento);
+    if (pageId) movimientos += 1;
+  }
+
+  if (persisted.deuda) {
+    const pageId = await createOrUpdateNotionDeuda(notion, dbs.finanzasDeudasDatabaseId, persisted.deuda);
+    if (pageId) deudas += 1;
+  }
+
+  if (Array.isArray(persisted.deudasCreadas)) {
+    for (const deuda of persisted.deudasCreadas) {
+      const pageId = await createOrUpdateNotionDeuda(notion, dbs.finanzasDeudasDatabaseId, deuda);
+      if (pageId) deudas += 1;
+    }
+  }
+
+  if (persisted.pago?.applied && persisted.pago?.deuda) {
+    const pageId = await createOrUpdateNotionDeuda(notion, dbs.finanzasDeudasDatabaseId, persisted.pago.deuda);
+    if (pageId) deudas += 1;
+  }
+
+  if (Array.isArray(persisted.particiones)) {
+    for (const particion of persisted.particiones) {
+      const pageId = await createOrUpdateNotionParticion(notion, dbs.finanzasParticionesDatabaseId, particion);
+      if (pageId) particiones += 1;
+    }
+  }
+
+  return { movimientos, deudas, particiones };
+}
+
+async function ensureFinanceDatabases(notion: Client) {
+  const fileCfg = loadNotionDbConfig();
+  let dbs: Required<Pick<NotionDbConfig, 'finanzasMovimientosDatabaseId' | 'finanzasDeudasDatabaseId' | 'finanzasParticionesDatabaseId'>> = {
+    finanzasMovimientosDatabaseId: fileCfg.finanzasMovimientosDatabaseId || '',
+    finanzasDeudasDatabaseId: fileCfg.finanzasDeudasDatabaseId || '',
+    finanzasParticionesDatabaseId: fileCfg.finanzasParticionesDatabaseId || ''
+  };
+
+  try {
+    const cfg = await getAppConfigMap([
+      'notion_finanzas_movimientos_database_id',
+      'notion_finanzas_deudas_database_id',
+      'notion_finanzas_particiones_database_id'
+    ]);
+    dbs.finanzasMovimientosDatabaseId ||= cfg.notion_finanzas_movimientos_database_id || '';
+    dbs.finanzasDeudasDatabaseId ||= cfg.notion_finanzas_deudas_database_id || '';
+    dbs.finanzasParticionesDatabaseId ||= cfg.notion_finanzas_particiones_database_id || '';
+  } catch (error) {
+    console.error('No pude leer app_config para Notion finanzas. Ejecutá supabase/finance_notion.sql.', error);
+    throw error;
+  }
+
+  if (dbs.finanzasMovimientosDatabaseId && dbs.finanzasDeudasDatabaseId && dbs.finanzasParticionesDatabaseId) return dbs;
+
+  const parentPageId = config.notionParentPageId();
+  if (!parentPageId) throw new Error('Falta NOTION_PARENT_PAGE_ID para crear bases financieras de Notion.');
+
+  if (!dbs.finanzasMovimientosDatabaseId) {
+    dbs.finanzasMovimientosDatabaseId = await createFinanceDatabase(notion, parentPageId, '💰 Finanzas - Movimientos', financeMovementProperties());
+    await setAppConfigValue('notion_finanzas_movimientos_database_id', dbs.finanzasMovimientosDatabaseId);
+  }
+  if (!dbs.finanzasDeudasDatabaseId) {
+    dbs.finanzasDeudasDatabaseId = await createFinanceDatabase(notion, parentPageId, '🤝 Finanzas - Deudas', financeDebtProperties());
+    await setAppConfigValue('notion_finanzas_deudas_database_id', dbs.finanzasDeudasDatabaseId);
+  }
+  if (!dbs.finanzasParticionesDatabaseId) {
+    dbs.finanzasParticionesDatabaseId = await createFinanceDatabase(notion, parentPageId, '🍕 Finanzas - Gastos compartidos', financeSplitProperties());
+    await setAppConfigValue('notion_finanzas_particiones_database_id', dbs.finanzasParticionesDatabaseId);
+  }
+
+  return dbs;
+}
+
+async function createFinanceDatabase(notion: Client, parentPageId: string, title: string, properties: any) {
+  const db = await notion.databases.create({
+    parent: { type: 'page_id', page_id: parentPageId },
+    title: [{ type: 'text', text: { content: title } }],
+    properties
+  });
+  return db.id;
+}
+
+function financeMovementProperties() {
+  return {
+    'Título': { title: {} },
+    'Fecha': { date: {} },
+    'Tipo': { select: { options: selectOptions(['gasto','ingreso','devolucion','transferencia','ajuste']) } },
+    'Monto': { number: { format: 'number' } },
+    'Moneda': { select: { options: selectOptions(['ARS','USD','EUR','Otro']) } },
+    'Categoría': { select: { options: selectOptions(['Alimentos','Supermercado','Comida afuera','Transporte','Casa','Servicios','Salud','Farmacia','Ropa','Tecnología','Educación','Trabajo','Ocio','Regalos','Suscripciones','Impuestos','Alquiler','Auto','Transferencias','Deudas / compartidos','Ingreso laboral','Otros']) } },
+    'Medio pago': { select: { options: selectOptions(['Visa crédito','Mastercard crédito','Mercado Pago','Banco Galicia','Débito','Efectivo','Transferencia','Otro']) } },
+    'Tarjeta': { select: { options: selectOptions(['Visa','Mastercard','Otra']) } },
+    'Banco / billetera': { select: { options: selectOptions(['Banco Galicia','Mercado Pago','Otro']) } },
+    'Comercio': { rich_text: {} },
+    'Cuotas': { number: { format: 'number' } },
+    'Estado': { select: { options: selectOptions(['confirmado','pendiente','revisar','anulado']) } },
+    'Descripción': { rich_text: {} },
+    'Movimiento ID': { rich_text: {} },
+    'Item ID': { rich_text: {} }
+  };
+}
+
+function financeDebtProperties() {
+  return {
+    'Título': { title: {} },
+    'Persona': { rich_text: {} },
+    'Tipo': { select: { options: selectOptions(['me_debe','yo_debo']) } },
+    'Monto total': { number: { format: 'number' } },
+    'Monto pagado': { number: { format: 'number' } },
+    'Saldo pendiente': { number: { format: 'number' } },
+    'Moneda': { select: { options: selectOptions(['ARS','USD','EUR','Otro']) } },
+    'Concepto': { rich_text: {} },
+    'Estado': { select: { options: selectOptions(['pendiente','parcial','saldado','cancelado']) } },
+    'Fecha origen': { date: {} },
+    'Fecha vencimiento': { date: {} },
+    'Deuda ID': { rich_text: {} },
+    'Item ID': { rich_text: {} }
+  };
+}
+
+function financeSplitProperties() {
+  return {
+    'Título': { title: {} },
+    'Persona': { rich_text: {} },
+    'Monto asignado': { number: { format: 'number' } },
+    'Monto pagado': { number: { format: 'number' } },
+    'Estado': { select: { options: selectOptions(['pendiente','pagado','parcial','cancelado']) } },
+    'Movimiento ID': { rich_text: {} },
+    'Partición ID': { rich_text: {} }
+  };
+}
+
+async function createOrUpdateNotionMovimiento(notion: Client, databaseId: string, row: any) {
+  if (!databaseId || !row?.id) return null;
+  const properties = notionMovimientoProperties(row);
+  if (row.notion_page_id) {
+    await notion.pages.update({ page_id: row.notion_page_id, icon: { type: 'emoji', emoji: emojiForMovimiento(row.tipo) }, properties });
+    return row.notion_page_id;
+  }
+  const page = await notion.pages.create({
+    parent: { database_id: databaseId },
+    icon: { type: 'emoji', emoji: emojiForMovimiento(row.tipo) },
+    properties,
+    children: financeMovimientoChildren(row) as any
+  });
+  await supabase.from('finanzas_movimientos').update({ notion_page_id: page.id }).eq('id', row.id);
+  return page.id;
+}
+
+async function createOrUpdateNotionDeuda(notion: Client, databaseId: string, row: any) {
+  if (!databaseId || !row?.id) return null;
+  const properties = notionDeudaProperties(row);
+  if (row.notion_page_id) {
+    await notion.pages.update({ page_id: row.notion_page_id, icon: { type: 'emoji', emoji: row.tipo === 'yo_debo' ? '📤' : '📥' }, properties });
+    return row.notion_page_id;
+  }
+  const page = await notion.pages.create({
+    parent: { database_id: databaseId },
+    icon: { type: 'emoji', emoji: row.tipo === 'yo_debo' ? '📤' : '📥' },
+    properties,
+    children: financeDebtChildren(row) as any
+  });
+  await supabase.from('finanzas_deudas').update({ notion_page_id: page.id }).eq('id', row.id);
+  return page.id;
+}
+
+async function createOrUpdateNotionParticion(notion: Client, databaseId: string, row: any) {
+  if (!databaseId || !row?.id) return null;
+  const properties = notionParticionProperties(row);
+  if (row.notion_page_id) {
+    await notion.pages.update({ page_id: row.notion_page_id, icon: { type: 'emoji', emoji: '🍕' }, properties });
+    return row.notion_page_id;
+  }
+  const page = await notion.pages.create({
+    parent: { database_id: databaseId },
+    icon: { type: 'emoji', emoji: '🍕' },
+    properties,
+    children: [calloutBlock('🍕', `Parte de gasto compartido para ${row.persona || '-'}.`)] as any
+  });
+  await supabase.from('finanzas_particiones').update({ notion_page_id: page.id }).eq('id', row.id);
+  return page.id;
+}
+
+function notionMovimientoProperties(row: any) {
+  const title = `${labelMovimiento(row.tipo)} ${moneyText(row.monto)}${row.comercio ? ` - ${row.comercio}` : ''}`.slice(0, 180);
+  return {
+    'Título': { title: [{ text: { content: title || 'Movimiento financiero' } }] },
+    'Fecha': row.fecha_movimiento ? { date: { start: row.fecha_movimiento } } : { date: null },
+    'Tipo': selectProp(row.tipo),
+    'Monto': { number: Number(row.monto || 0) },
+    'Moneda': selectProp(row.moneda || 'ARS'),
+    'Categoría': selectProp(row.categoria_financiera),
+    'Medio pago': selectProp(row.medio_pago),
+    'Tarjeta': selectProp(row.tarjeta),
+    'Banco / billetera': selectProp(row.banco_billetera),
+    'Comercio': richTextProp(row.comercio),
+    'Cuotas': row.cuotas ? { number: Number(row.cuotas) } : { number: null },
+    'Estado': selectProp(row.estado || 'confirmado'),
+    'Descripción': richTextProp(row.descripcion),
+    'Movimiento ID': richTextProp(row.id),
+    'Item ID': richTextProp(row.item_id)
+  };
+}
+
+function notionDeudaProperties(row: any) {
+  const label = row.tipo === 'yo_debo' ? `Yo debo a ${row.persona}` : `${row.persona} me debe`;
+  const title = `${label} ${moneyText(row.saldo_pendiente || row.monto_total)} - ${row.concepto || ''}`.slice(0, 180);
+  return {
+    'Título': { title: [{ text: { content: title || 'Deuda' } }] },
+    'Persona': richTextProp(row.persona),
+    'Tipo': selectProp(row.tipo),
+    'Monto total': { number: Number(row.monto_total || 0) },
+    'Monto pagado': { number: Number(row.monto_pagado || 0) },
+    'Saldo pendiente': { number: Number(row.saldo_pendiente || 0) },
+    'Moneda': selectProp(row.moneda || 'ARS'),
+    'Concepto': richTextProp(row.concepto),
+    'Estado': selectProp(row.estado),
+    'Fecha origen': row.fecha_origen ? { date: { start: row.fecha_origen } } : { date: null },
+    'Fecha vencimiento': row.fecha_vencimiento ? { date: { start: row.fecha_vencimiento } } : { date: null },
+    'Deuda ID': richTextProp(row.id),
+    'Item ID': richTextProp(row.item_id)
+  };
+}
+
+function notionParticionProperties(row: any) {
+  const title = `${row.persona || 'Persona'} - ${moneyText(row.monto_asignado)} ${row.estado || ''}`.slice(0, 180);
+  return {
+    'Título': { title: [{ text: { content: title || 'Gasto compartido' } }] },
+    'Persona': richTextProp(row.persona),
+    'Monto asignado': { number: Number(row.monto_asignado || 0) },
+    'Monto pagado': { number: Number(row.monto_pagado || 0) },
+    'Estado': selectProp(row.estado),
+    'Movimiento ID': richTextProp(row.movimiento_id),
+    'Partición ID': richTextProp(row.id)
+  };
+}
+
+function financeMovimientoChildren(row: any) {
+  return [
+    calloutBlock('💰', `${labelMovimiento(row.tipo)} por ${moneyText(row.monto)}.`),
+    headingBlock('Datos'),
+    bulletBlock(`Categoría: ${row.categoria_financiera || '-'}`),
+    bulletBlock(`Medio de pago: ${row.medio_pago || '-'}`),
+    bulletBlock(`Comercio/persona: ${row.comercio || '-'}`),
+    bulletBlock(`Descripción: ${row.descripcion || '-'}`)
+  ];
+}
+
+function financeDebtChildren(row: any) {
+  const label = row.tipo === 'yo_debo' ? `Yo debo a ${row.persona}` : `${row.persona} me debe`;
+  return [
+    calloutBlock(row.tipo === 'yo_debo' ? '📤' : '📥', `${label}: saldo pendiente ${moneyText(row.saldo_pendiente)}.`),
+    headingBlock('Datos'),
+    bulletBlock(`Monto total: ${moneyText(row.monto_total)}`),
+    bulletBlock(`Monto pagado: ${moneyText(row.monto_pagado)}`),
+    bulletBlock(`Concepto: ${row.concepto || '-'}`),
+    bulletBlock(`Estado: ${row.estado || '-'}`)
+  ];
+}
+
+function selectOptions(names: string[]) {
+  return names.map(name => ({ name }));
+}
+
+function richTextProp(value: unknown) {
+  const text = cleanNotionText(value, 1900);
+  return text ? { rich_text: [{ text: { content: text } }] } : { rich_text: [] };
+}
+
+function labelMovimiento(tipo: string | null | undefined) {
+  const t = String(tipo || '').toLowerCase();
+  if (t === 'gasto') return 'Gasto';
+  if (t === 'ingreso') return 'Ingreso';
+  if (t === 'devolucion') return 'Devolución';
+  if (t === 'transferencia') return 'Transferencia';
+  if (t === 'ajuste') return 'Ajuste';
+  return 'Movimiento';
+}
+
+function emojiForMovimiento(tipo: string | null | undefined) {
+  const t = String(tipo || '').toLowerCase();
+  if (t === 'gasto') return '💸';
+  if (t === 'ingreso') return '💰';
+  if (t === 'devolucion') return '↩️';
+  if (t === 'transferencia') return '🔁';
+  return '💳';
+}
+
+function moneyText(value: unknown) {
+  const n = Number(value || 0);
+  return `$${Math.round(n).toLocaleString('es-AR')}`;
 }
 
 function notionItemProperties(item: any) {

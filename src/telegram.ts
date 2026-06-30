@@ -697,6 +697,7 @@ async function handleFinanceNaturalText(chatId: number, messageId: number, userI
         result.item.notion_page_id = notionPageId;
       }
       await syncNotionDerivedForItem(result.item);
+      await syncNotionFinanceResult(result);
     } catch (error) {
       console.error('No se pudo sincronizar Notion para finanzas:', error);
     }

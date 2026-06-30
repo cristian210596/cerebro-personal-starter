@@ -10,6 +10,39 @@ export const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
+
+export async function getAppConfigValue(key: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('app_config')
+    .select('value')
+    .eq('key', key)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data?.value || null;
+}
+
+export async function setAppConfigValue(key: string, value: string) {
+  const { error } = await supabase
+    .from('app_config')
+    .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+
+  if (error) throw error;
+}
+
+export async function getAppConfigMap(keys: string[]): Promise<Record<string, string>> {
+  if (!keys.length) return {};
+  const { data, error } = await supabase
+    .from('app_config')
+    .select('key,value')
+    .in('key', keys);
+
+  if (error) throw error;
+  const out: Record<string, string> = {};
+  for (const row of data || []) out[row.key] = row.value;
+  return out;
+}
+
 type EntidadRow = {
   id: string;
   tipo: string | null;
