@@ -279,38 +279,64 @@ export async function syncNotionFinanceResult(result: any) {
   return { movimientos, deudas, particiones };
 }
 
-export async function setupFinanceNotionDatabases() {
+export async function setupFinanceNotionDatabases(options: { force?: boolean } = {}) {
   const notion = getNotionClient();
   if (!notion) throw new Error('Falta NOTION_TOKEN.');
-  return ensureFinanceDatabases(notion);
+  return ensureFinanceDatabases(notion, options);
 }
 
-async function ensureFinanceDatabases(notion: Client) {
+async function ensureFinanceDatabases(notion: Client, options: { force?: boolean } = {}) {
   const fileCfg = loadNotionDbConfig();
   let dbs: Required<Pick<NotionDbConfig, 'finanzasMovimientosDatabaseId' | 'finanzasDeudasDatabaseId' | 'finanzasParticionesDatabaseId'>> = {
-    finanzasMovimientosDatabaseId: fileCfg.finanzasMovimientosDatabaseId || '',
-    finanzasDeudasDatabaseId: fileCfg.finanzasDeudasDatabaseId || '',
-    finanzasParticionesDatabaseId: fileCfg.finanzasParticionesDatabaseId || ''
+    finanzasMovimientosDatabaseId: options.force ? '' : (fileCfg.finanzasMovimientosDatabaseId || ''),
+    finanzasDeudasDatabaseId: options.force ? '' : (fileCfg.finanzasDeudasDatabaseId || ''),
+    finanzasParticionesDatabaseId: options.force ? '' : (fileCfg.finanzasParticionesDatabaseId || '')
   };
 
+  let cfg: Record<string, string> = {};
   try {
-    const cfg = await getAppConfigMap([
+    cfg = await getAppConfigMap([
       'notion_finanzas_movimientos_database_id',
       'notion_finanzas_deudas_database_id',
       'notion_finanzas_particiones_database_id'
     ]);
-    dbs.finanzasMovimientosDatabaseId ||= cfg.notion_finanzas_movimientos_database_id || '';
-    dbs.finanzasDeudasDatabaseId ||= cfg.notion_finanzas_deudas_database_id || '';
-    dbs.finanzasParticionesDatabaseId ||= cfg.notion_finanzas_particiones_database_id || '';
   } catch (error) {
     console.error('No pude leer app_config para Notion finanzas. Ejecutá supabase/finance_notion.sql.', error);
     throw error;
+  }
+
+  if (!options.force) {
+    dbs.finanzasMovimientosDatabaseId ||= cfg.notion_finanzas_movimientos_database_id || '';
+    dbs.finanzasDeudasDatabaseId ||= cfg.notion_finanzas_deudas_database_id || '';
+    dbs.finanzasParticionesDatabaseId ||= cfg.notion_finanzas_particiones_database_id || '';
+  }
+
+  // Validación crítica: antes se confiaba en IDs guardados en app_config/notion-databases.json.
+  // Si esas bases fueron borradas o estaban mal, el setup devolvía OK pero no creaba nada nuevo.
+  if (dbs.finanzasMovimientosDatabaseId && !(await notionDatabaseExists(notion, dbs.finanzasMovimientosDatabaseId))) {
+    console.warn('Base de movimientos financieros no encontrada. Se recreará.');
+    dbs.finanzasMovimientosDatabaseId = '';
+  }
+  if (dbs.finanzasDeudasDatabaseId && !(await notionDatabaseExists(notion, dbs.finanzasDeudasDatabaseId))) {
+    console.warn('Base de deudas financieras no encontrada. Se recreará.');
+    dbs.finanzasDeudasDatabaseId = '';
+  }
+  if (dbs.finanzasParticionesDatabaseId && !(await notionDatabaseExists(notion, dbs.finanzasParticionesDatabaseId))) {
+    console.warn('Base de gastos compartidos no encontrada. Se recreará.');
+    dbs.finanzasParticionesDatabaseId = '';
   }
 
   if (dbs.finanzasMovimientosDatabaseId && dbs.finanzasDeudasDatabaseId && dbs.finanzasParticionesDatabaseId) return dbs;
 
   const parentPageId = config.notionParentPageId();
   if (!parentPageId) throw new Error('Falta NOTION_PARENT_PAGE_ID para crear bases financieras de Notion.');
+
+  // Validar que la integración vea la página madre antes de crear.
+  try {
+    await notion.pages.retrieve({ page_id: parentPageId });
+  } catch (error: any) {
+    throw new Error(`La integración de Notion no puede ver NOTION_PARENT_PAGE_ID (${parentPageId}). Compartí la página madre con la integración Cerebro Personal Bot. Detalle: ${error?.message || error}`);
+  }
 
   if (!dbs.finanzasMovimientosDatabaseId) {
     dbs.finanzasMovimientosDatabaseId = await createFinanceDatabase(notion, parentPageId, '💰 Finanzas - Movimientos', financeMovementProperties());
@@ -326,6 +352,16 @@ async function ensureFinanceDatabases(notion: Client) {
   }
 
   return dbs;
+}
+
+async function notionDatabaseExists(notion: Client, databaseId: string) {
+  try {
+    await notion.databases.retrieve({ database_id: databaseId });
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'object_not_found' || error?.status === 404) return false;
+    throw error;
+  }
 }
 
 async function createFinanceDatabase(notion: Client, parentPageId: string, title: string, properties: any) {

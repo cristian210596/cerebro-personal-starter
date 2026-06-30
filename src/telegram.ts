@@ -22,7 +22,7 @@ import {
   syncItemDerivedData,
   updateItemFields
 } from './supabaseClient.js';
-import { createNotionArchivoPage, createNotionItemPage, syncNotionDerivedForItem, updateNotionItemPage } from './notion.js';
+import { createNotionArchivoPage, createNotionItemPage, syncNotionDerivedForItem, syncNotionFinanceResult, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
 import { parseEditInstruction } from './editor.js';
 import { generateBackupZip } from './backup.js';

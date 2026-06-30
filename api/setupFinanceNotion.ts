@@ -6,10 +6,11 @@ export const config = {
 
 export default async function handler(req: any, res: any) {
   try {
-    const result = await setupFinanceNotionDatabases();
+    const force = String(req?.query?.force || '').toLowerCase() === 'true';
+    const result = await setupFinanceNotionDatabases({ force });
     return res.status(200).json({
       ok: true,
-      message: 'Bases financieras de Notion listas.',
+      message: force ? 'Bases financieras de Notion recreadas/listas.' : 'Bases financieras de Notion listas.',
       databases: result
     });
   } catch (error: any) {
