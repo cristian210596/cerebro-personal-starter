@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import { config } from './config.js';
 import type { Clasificacion, EntidadClasificada, ItemInsert, MemoriaSugerida } from './types.js';
+import { embedText, cosineSimilarity, simpleHash } from './embeddings.js';
+
 
 export const supabase = createClient(
   config.supabaseUrl(),
@@ -582,6 +584,255 @@ async function findBestEntidad(query: string): Promise<EntidadRow | null> {
     || rows[0]
     || null;
 }
+
+
+export type SmartSearchResult = {
+  item: any;
+  score: number;
+  mode: 'exacto' | 'semantico' | 'mixto';
+  reason: string;
+};
+
+export async function smartSearchItems(query: string, limit = 8) {
+  const q = cleanText(query);
+  if (!q) return { results: [] as SmartSearchResult[], semanticUsed: false, semanticError: null as string | null, indexedNow: 0 };
+
+  const candidates = await loadSearchCandidates(350);
+  let indexedNow = 0;
+
+  // Indexa pocos items por búsqueda. Evita timeouts/cuota, pero mejora solo con el uso.
+  for (const item of candidates) {
+    if (indexedNow >= 4) break;
+    if (!hasCurrentEmbedding(item)) {
+      try {
+        await ensureItemSearchEmbedding(item);
+        indexedNow += 1;
+      } catch (error) {
+        // No cortamos la búsqueda si Gemini/cuota falla.
+        break;
+      }
+    }
+  }
+
+  const exact = scoreExactCandidates(q, candidates);
+  let semanticUsed = false;
+  let semanticError: string | null = null;
+  let semantic: SmartSearchResult[] = [];
+
+  try {
+    const queryEmbedding = await embedText(buildQueryEmbeddingText(q));
+    if (queryEmbedding.length) {
+      semanticUsed = true;
+      semantic = candidates
+        .map(item => {
+          const embedding = getStoredEmbedding(item);
+          const score = embedding.length ? cosineSimilarity(queryEmbedding, embedding) : 0;
+          return {
+            item,
+            score,
+            mode: 'semantico' as const,
+            reason: `similitud ${(score * 100).toFixed(0)}%`
+          };
+        })
+        .filter(r => r.score >= 0.58)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit * 2);
+    }
+  } catch (error: any) {
+    semanticError = String(error?.message || error || 'error semántico');
+  }
+
+  const merged = mergeSearchResults(exact, semantic)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return { results: merged, semanticUsed, semanticError, indexedNow };
+}
+
+export async function indexSearchEmbeddings(limit = 10) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 10, 20));
+  const items = await latestItems(safeLimit);
+  let indexed = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  for (const item of items) {
+    if (hasCurrentEmbedding(item)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await ensureItemSearchEmbedding(item);
+      indexed += 1;
+    } catch {
+      failed += 1;
+      break;
+    }
+  }
+
+  return { indexed, skipped, failed, checked: items.length };
+}
+
+async function loadSearchCandidates(limit = 350) {
+  const { data, error } = await supabase
+    .from('items')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return data || [];
+}
+
+function scoreExactCandidates(query: string, items: any[]): SmartSearchResult[] {
+  const queryTokens = tokenizeSearch(query);
+  if (!queryTokens.length) return [];
+
+  return items
+    .map(item => {
+      const text = buildItemSearchText(item);
+      const textNorm = normalizeLoose(text);
+      let score = 0;
+      const hits: string[] = [];
+
+      for (const token of queryTokens) {
+        if (textNorm.includes(token)) {
+          score += 2;
+          hits.push(token);
+        }
+      }
+
+      const qNorm = normalizeLoose(query);
+      if (qNorm.length >= 4 && textNorm.includes(qNorm)) score += 5;
+
+      if (Array.isArray(item.tags)) {
+        const tagText = normalizeLoose(item.tags.join(' '));
+        for (const token of queryTokens) {
+          if (tagText.includes(token)) score += 2;
+        }
+      }
+
+      if (item.categoria_principal && queryTokens.some(t => normalizeLoose(item.categoria_principal).includes(t))) score += 2;
+      if (item.estado && queryTokens.some(t => normalizeLoose(item.estado).includes(t))) score += 1.5;
+      if (item.valoracion && queryTokens.some(t => normalizeLoose(item.valoracion).includes(t))) score += 1.5;
+
+      const finalScore = Math.min(0.92, score / Math.max(6, queryTokens.length * 3));
+      return {
+        item,
+        score: finalScore,
+        mode: 'exacto' as const,
+        reason: hits.length ? `coincide: ${hits.slice(0, 5).join(', ')}` : 'coincidencia exacta'
+      };
+    })
+    .filter(r => r.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 25);
+}
+
+function mergeSearchResults(exact: SmartSearchResult[], semantic: SmartSearchResult[]) {
+  const byId = new Map<string, SmartSearchResult>();
+
+  for (const r of [...exact, ...semantic]) {
+    const id = r.item?.id;
+    if (!id) continue;
+    const prev = byId.get(id);
+    if (!prev) {
+      byId.set(id, r);
+      continue;
+    }
+
+    byId.set(id, {
+      item: r.item,
+      score: Math.max(prev.score, r.score) + 0.05,
+      mode: prev.mode === r.mode ? r.mode : 'mixto',
+      reason: prev.mode === r.mode ? prev.reason : `${prev.reason}; ${r.reason}`
+    });
+  }
+
+  return [...byId.values()];
+}
+
+async function ensureItemSearchEmbedding(item: any) {
+  const text = buildItemEmbeddingText(item);
+  const hash = simpleHash(text);
+  const existing = item.classifier_json?.search_embedding;
+
+  if (existing?.hash === hash && Array.isArray(existing?.values) && existing.values.length) return item;
+
+  const values = await embedText(text);
+  if (!values.length) return item;
+
+  const classifier = {
+    ...(item.classifier_json || {}),
+    search_embedding: {
+      model: config.geminiEmbeddingModel(),
+      hash,
+      values,
+      updated_at: new Date().toISOString()
+    }
+  };
+
+  const { data, error } = await supabase
+    .from('items')
+    .update({ classifier_json: classifier, updated_at: new Date().toISOString() })
+    .eq('id', item.id)
+    .select()
+    .single();
+
+  if (error) throw error;
+  item.classifier_json = data.classifier_json;
+  return data;
+}
+
+function hasCurrentEmbedding(item: any) {
+  const text = buildItemEmbeddingText(item);
+  const emb = item.classifier_json?.search_embedding;
+  return Boolean(emb?.hash === simpleHash(text) && Array.isArray(emb?.values) && emb.values.length);
+}
+
+function getStoredEmbedding(item: any): number[] {
+  const values = item.classifier_json?.search_embedding?.values;
+  return Array.isArray(values) ? values.map(Number).filter(Number.isFinite) : [];
+}
+
+function buildQueryEmbeddingText(query: string) {
+  return `Consulta de búsqueda del cerebro personal: ${query}`;
+}
+
+function buildItemEmbeddingText(item: any) {
+  return [
+    item.titulo ? `Título: ${item.titulo}` : '',
+    item.resumen ? `Resumen: ${item.resumen}` : '',
+    item.categoria_principal ? `Categoría: ${item.categoria_principal}` : '',
+    Array.isArray(item.subcategorias) && item.subcategorias.length ? `Subcategorías: ${item.subcategorias.join(', ')}` : '',
+    item.tipo_item ? `Tipo: ${item.tipo_item}` : '',
+    item.estado ? `Estado: ${item.estado}` : '',
+    item.valoracion ? `Valoración: ${item.valoracion}` : '',
+    item.importancia ? `Importancia: ${item.importancia}` : '',
+    item.accion_futura ? `Acción futura: ${item.accion_futura}` : '',
+    Array.isArray(item.tags) && item.tags.length ? `Tags: ${item.tags.join(', ')}` : '',
+    Array.isArray(item.entidades_json) && item.entidades_json.length
+      ? `Entidades: ${item.entidades_json.map((e: any) => `${e.tipo}: ${e.nombre}`).join('; ')}`
+      : '',
+    item.texto_original ? `Texto original: ${String(item.texto_original).slice(0, 2500)}` : ''
+  ].filter(Boolean).join('\n');
+}
+
+function buildItemSearchText(item: any) {
+  return [
+    buildItemEmbeddingText(item),
+    JSON.stringify(item.classifier_json?.memorias_sugeridas || [])
+  ].filter(Boolean).join('\n');
+}
+
+function tokenizeSearch(value: string) {
+  const stop = new Set(['que', 'como', 'para', 'con', 'una', 'uno', 'unos', 'unas', 'los', 'las', 'del', 'por', 'mis', 'tus', 'sus', 'algo', 'cosas', 'cosa']);
+  return normalizeLoose(value)
+    .split(/[^a-z0-9]+/)
+    .map(t => t.trim())
+    .filter(t => t.length >= 2 && !stop.has(t));
+}
+
 
 export async function statsCerebro() {
   const [itemsCount, entidadesCount, memoriasCount] = await Promise.all([

@@ -17,6 +17,7 @@ export const config = {
   supabaseDbUrl: () => process.env.SUPABASE_DB_URL?.trim() || '',
   geminiApiKey: () => required('GEMINI_API_KEY'),
   geminiModel: () => process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash',
+  geminiEmbeddingModel: () => process.env.GEMINI_EMBEDDING_MODEL?.trim() || 'text-embedding-004',
   notionToken: () => process.env.NOTION_TOKEN?.trim() || '',
   notionParentPageId: () => process.env.NOTION_PARENT_PAGE_ID?.trim() || '',
   notionItemsDatabaseId: () => process.env.NOTION_ITEMS_DATABASE_ID?.trim() || ''

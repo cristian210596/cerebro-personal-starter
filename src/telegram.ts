@@ -14,6 +14,8 @@ import {
   saveItem,
   searchEntidades,
   searchItems,
+  smartSearchItems,
+  indexSearchEmbeddings,
   searchMemorias,
   statsCerebro,
   supabase,
@@ -96,8 +98,11 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (command?.name === 'buscar') {
     const q = command.args;
     if (!q) return sendMessage(chatId, 'Usá: /buscar hplc lampara d2');
-    const results = await searchItems(q, 10);
-    return sendMessage(chatId, formatItems(results, `Resultados para: ${q}`));
+    return handleSmartSearchCommand(chatId, q);
+  }
+
+  if (command?.name === 'indexar') {
+    return handleIndexCommand(chatId, command.args);
   }
 
   if (command?.name === 'ultimos') {
@@ -525,6 +530,68 @@ function formatStats(stats: any) {
     `Entidades: ${stats.entidadesCount}`,
     `Memorias vigentes: ${stats.memoriasCount}`
   ].join('\n');
+}
+
+
+async function handleSmartSearchCommand(chatId: number, query: string) {
+  await sendMessage(chatId, 'Buscando...');
+
+  try {
+    const result = await smartSearchItems(query, 8);
+    const header = [
+      `Resultados para: ${query}`,
+      result.semanticUsed ? 'Modo: exacto + semántico' : 'Modo: exacto',
+      result.indexedNow ? `Indexados ahora: ${result.indexedNow}` : '',
+      result.semanticError ? 'Aviso: la parte semántica no respondió; usé búsqueda exacta.' : ''
+    ].filter(Boolean).join('\n');
+
+    return sendMessage(chatId, formatSmartItems(result.results, header));
+  } catch (error: any) {
+    console.error('No se pudo buscar:', error);
+    return sendMessage(chatId, `No pude buscar: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleIndexCommand(chatId: number, args: string) {
+  const n = Number(args.trim() || 10);
+  const limit = Math.max(1, Math.min(n || 10, 20));
+  await sendMessage(chatId, `Indexando últimos ${limit} items para búsqueda semántica...`);
+
+  try {
+    const result = await indexSearchEmbeddings(limit);
+    return sendMessage(chatId, [
+      'Indexación terminada.',
+      '',
+      `Revisados: ${result.checked}`,
+      `Indexados: ${result.indexed}`,
+      `Ya estaban indexados: ${result.skipped}`,
+      `Fallidos: ${result.failed}`,
+      '',
+      'Ahora usá /buscar normalmente.'
+    ].join('\n'));
+  } catch (error: any) {
+    console.error('No se pudo indexar:', error);
+    return sendMessage(chatId, `No pude indexar: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+function formatSmartItems(results: any[], title: string) {
+  if (!results.length) return `${title}\n\nSin resultados.`;
+  const lines = [title, ''];
+  let i = 1;
+  for (const result of results) {
+    const item = result.item || result;
+    lines.push(`${i}. ${item.titulo || 'Sin título'}`);
+    lines.push(`   ${item.categoria_principal || '-'} / ${item.tipo_item || '-'}`);
+    if (item.estado) lines.push(`   Estado: ${item.estado}`);
+    if (item.valoracion) lines.push(`   Valoración: ${item.valoracion}`);
+    if (item.tags?.length) lines.push(`   Tags: ${item.tags.slice(0, 8).join(', ')}`);
+    if (result.mode) lines.push(`   Match: ${result.mode} (${Math.round((result.score || 0) * 100)}%) - ${result.reason || '-'}`);
+    if (item.resumen) lines.push(`   ${String(item.resumen).slice(0, 260)}`);
+    lines.push('');
+    i += 1;
+  }
+  return lines.join('\n');
 }
 
 async function handleRebuildCommand(chatId: number, args: string) {
