@@ -27,6 +27,7 @@ import { config } from './config.js';
 import { parseEditInstruction } from './editor.js';
 import { generateBackupZip } from './backup.js';
 import { buildDocumentText, describeImage, transcribeAudio, type TelegramFileInfo } from './media.js';
+import { createSignedFileUrl, uploadTelegramFileToStorage } from './storage.js';
 import { formatFinanceSaved, formatFinanceSummary, getFinanceSummary, looksLikeFinanceText, saveFinanceFromText } from './finance.js';
 
 type TelegramUpdate = {
@@ -295,6 +296,15 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
     }
 
     const downloaded = await downloadTelegramFile(media.fileId);
+    const stored = await uploadTelegramFileToStorage({
+      buffer: downloaded.buffer,
+      fileName: media.fileName || `${media.kind}-${msg.message_id}`,
+      mimeType: media.mimeType || downloaded.mimeType || 'application/octet-stream',
+      kind: media.kind,
+      chatId,
+      messageId: msg.message_id
+    });
+
     let textForItem = '';
     let transcripcion: string | null = null;
     let descripcionIa: string | null = null;
@@ -324,7 +334,7 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       userId: msg.from?.id,
       text: textForItem,
       source: `telegram_${media.kind}`,
-      url: `telegram://${media.fileId}`
+      url: stored.signedUrl || null
     });
 
     if (!result.ok) return sendMessage(chatId, result.message);
@@ -334,7 +344,7 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       tipo_archivo: media.kind,
       nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
       mime_type: media.mimeType || downloaded.mimeType || null,
-      storage_url: `telegram://${media.fileId}`,
+      storage_url: stored.storageRef,
       transcripcion,
       descripcion_ia: descripcionIa
     });
@@ -352,6 +362,7 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       `Categoría: ${result.clasificacion.categoria_principal}`,
       `Tipo: ${result.clasificacion.tipo_item}`,
       `Tags: ${(result.clasificacion.tags || []).join(', ') || '-'}`,
+      stored.signedUrl ? `Archivo: ${stored.signedUrl}` : '',
       transcripcion ? `\nTranscripción: ${transcripcion.slice(0, 900)}` : ''
     ].filter(Boolean).join('\n'));
   } catch (error: any) {
@@ -556,7 +567,7 @@ async function handleSmartSearchCommand(chatId: number, query: string) {
       result.semanticError ? 'Aviso: la parte semántica no respondió; usé búsqueda exacta.' : ''
     ].filter(Boolean).join('\n');
 
-    return sendMessage(chatId, formatSmartItems(result.results, header));
+    return sendMessage(chatId, await formatSmartItemsWithFiles(result.results, header));
   } catch (error: any) {
     console.error('No se pudo buscar:', error);
     return sendMessage(chatId, `No pude buscar: ${error?.message || 'error desconocido'}`);
@@ -603,6 +614,62 @@ function formatSmartItems(results: any[], title: string) {
     i += 1;
   }
   return lines.join('\n');
+}
+
+
+async function formatSmartItemsWithFiles(results: any[], title: string) {
+  if (!results.length) return `${title}\n\nSin resultados.`;
+
+  const itemIds = results.map((r: any) => (r.item || r).id).filter(Boolean);
+  const archivosByItem = await loadArchivosByItem(itemIds);
+
+  const lines = [title, ''];
+  let i = 1;
+  for (const result of results) {
+    const item = result.item || result;
+    lines.push(`${i}. ${item.titulo || 'Sin título'}`);
+    lines.push(`   ${item.categoria_principal || '-'} / ${item.tipo_item || '-'}`);
+    if (item.estado) lines.push(`   Estado: ${item.estado}`);
+    if (item.valoracion) lines.push(`   Valoración: ${item.valoracion}`);
+    if (item.tags?.length) lines.push(`   Tags: ${item.tags.slice(0, 8).join(', ')}`);
+    if (result.mode) lines.push(`   Match: ${result.mode} (${Math.round((result.score || 0) * 100)}%) - ${result.reason || '-'}`);
+    if (item.resumen) lines.push(`   ${String(item.resumen).slice(0, 220)}`);
+
+    const archivos = archivosByItem.get(item.id) || [];
+    for (const archivo of archivos.slice(0, 2)) {
+      const url = await createSignedFileUrl(archivo.storage_url, 60 * 60 * 24 * 7);
+      lines.push(`   Archivo: ${archivo.nombre_archivo || 'archivo'}`);
+      if (url) lines.push(`   Link: ${url}`);
+    }
+
+    lines.push('');
+    i += 1;
+  }
+  return lines.join('\n');
+}
+
+async function loadArchivosByItem(itemIds: string[]) {
+  const map = new Map<string, any[]>();
+  if (!itemIds.length) return map;
+
+  const { data, error } = await supabase
+    .from('archivos')
+    .select('*')
+    .in('item_id', itemIds)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error('No pude cargar archivos para búsqueda:', error);
+    return map;
+  }
+
+  for (const archivo of data || []) {
+    if (!archivo.item_id) continue;
+    if (!map.has(archivo.item_id)) map.set(archivo.item_id, []);
+    map.get(archivo.item_id)!.push(archivo);
+  }
+
+  return map;
 }
 
 

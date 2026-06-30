@@ -20,5 +20,6 @@ export const config = {
   geminiEmbeddingModel: () => process.env.GEMINI_EMBEDDING_MODEL?.trim() || 'text-embedding-004',
   notionToken: () => process.env.NOTION_TOKEN?.trim() || '',
   notionParentPageId: () => process.env.NOTION_PARENT_PAGE_ID?.trim() || '',
-  notionItemsDatabaseId: () => process.env.NOTION_ITEMS_DATABASE_ID?.trim() || ''
+  notionItemsDatabaseId: () => process.env.NOTION_ITEMS_DATABASE_ID?.trim() || '',
+  supabaseStorageBucket: () => process.env.SUPABASE_STORAGE_BUCKET?.trim() || 'cerebro-archivos'
 };

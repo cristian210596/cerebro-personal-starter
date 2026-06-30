@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Client } from '@notionhq/client';
 import { config } from './config.js';
+import { createSignedFileUrl } from './storage.js';
 
 type NotionDbConfig = {
   itemsDatabaseId?: string;
@@ -70,11 +71,12 @@ export async function createNotionArchivoPage(archivo: any) {
   if (!databaseId) return null;
 
   const nombre = cleanNotionText(archivo.nombre_archivo || 'Archivo Telegram', 180) || 'Archivo Telegram';
+  const signedUrl = await createSignedFileUrl(archivo.storage_url, 60 * 60 * 24 * 7);
   const properties = {
     'Nombre': { title: [{ text: { content: nombre } }] },
     'Tipo archivo': selectProp(normalizeTipoArchivo(archivo.tipo_archivo)),
     'MIME': archivo.mime_type ? { rich_text: [{ text: { content: cleanNotionText(archivo.mime_type, 300) } }] } : { rich_text: [] },
-    'URL Storage': archivo.storage_url && String(archivo.storage_url).startsWith('http') ? { url: archivo.storage_url } : { url: null },
+    'URL Storage': signedUrl ? { url: signedUrl } : { url: null },
     'Transcripción': archivo.transcripcion ? { rich_text: [{ text: { content: cleanNotionText(archivo.transcripcion, 1900) } }] } : { rich_text: [] },
     'Descripción IA': archivo.descripcion_ia ? { rich_text: [{ text: { content: cleanNotionText(archivo.descripcion_ia, 1900) } }] } : { rich_text: [] },
     'Item ID Supabase': archivo.item_id ? { rich_text: [{ text: { content: String(archivo.item_id).slice(0, 1900) } }] } : { rich_text: [] }
@@ -85,7 +87,8 @@ export async function createNotionArchivoPage(archivo: any) {
     icon: { type: 'emoji', emoji: emojiForArchivo(archivo.tipo_archivo) },
     properties,
     children: [
-      calloutBlock('📎', `Archivo recibido por Telegram. Referencia interna: ${archivo.storage_url || '-'}`),
+      calloutBlock('📎', `Archivo guardado en Supabase Storage. Referencia interna permanente: ${archivo.storage_url || '-'}`),
+      signedUrl ? paragraphBlock(`Link temporal de descarga: ${signedUrl}`) : null,
       archivo.transcripcion ? headingBlock('Transcripción') : null,
       archivo.transcripcion ? paragraphBlock(String(archivo.transcripcion).slice(0, 1900)) : null,
       archivo.descripcion_ia ? headingBlock('Descripción IA') : null,
