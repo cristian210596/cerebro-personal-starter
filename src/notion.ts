@@ -60,6 +60,58 @@ export async function updateNotionItemPage(item: any) {
   return item.notion_page_id;
 }
 
+
+export async function createNotionArchivoPage(archivo: any) {
+  const notion = getNotionClient();
+  if (!notion) return null;
+
+  const dbConfig = loadNotionDbConfig();
+  const databaseId = dbConfig.archivosDatabaseId;
+  if (!databaseId) return null;
+
+  const nombre = cleanNotionText(archivo.nombre_archivo || 'Archivo Telegram', 180) || 'Archivo Telegram';
+  const properties = {
+    'Nombre': { title: [{ text: { content: nombre } }] },
+    'Tipo archivo': selectProp(normalizeTipoArchivo(archivo.tipo_archivo)),
+    'MIME': archivo.mime_type ? { rich_text: [{ text: { content: cleanNotionText(archivo.mime_type, 300) } }] } : { rich_text: [] },
+    'URL Storage': archivo.storage_url && String(archivo.storage_url).startsWith('http') ? { url: archivo.storage_url } : { url: null },
+    'Transcripción': archivo.transcripcion ? { rich_text: [{ text: { content: cleanNotionText(archivo.transcripcion, 1900) } }] } : { rich_text: [] },
+    'Descripción IA': archivo.descripcion_ia ? { rich_text: [{ text: { content: cleanNotionText(archivo.descripcion_ia, 1900) } }] } : { rich_text: [] },
+    'Item ID Supabase': archivo.item_id ? { rich_text: [{ text: { content: String(archivo.item_id).slice(0, 1900) } }] } : { rich_text: [] }
+  };
+
+  const page = await notion.pages.create({
+    parent: { database_id: databaseId },
+    icon: { type: 'emoji', emoji: emojiForArchivo(archivo.tipo_archivo) },
+    properties,
+    children: [
+      calloutBlock('📎', `Archivo recibido por Telegram. Referencia interna: ${archivo.storage_url || '-'}`),
+      archivo.transcripcion ? headingBlock('Transcripción') : null,
+      archivo.transcripcion ? paragraphBlock(String(archivo.transcripcion).slice(0, 1900)) : null,
+      archivo.descripcion_ia ? headingBlock('Descripción IA') : null,
+      archivo.descripcion_ia ? paragraphBlock(String(archivo.descripcion_ia).slice(0, 1900)) : null
+    ].filter(Boolean) as any
+  });
+
+  return page.id;
+}
+
+function normalizeTipoArchivo(value: unknown) {
+  const v = String(value || '').toLowerCase();
+  if (v.includes('photo') || v.includes('foto') || v.includes('image')) return 'foto';
+  if (v.includes('voice') || v.includes('audio')) return 'audio';
+  if (v.includes('document')) return 'documento';
+  return 'otro';
+}
+
+function emojiForArchivo(tipo: unknown) {
+  const t = String(tipo || '').toLowerCase();
+  if (t.includes('voice') || t.includes('audio')) return '🎙️';
+  if (t.includes('photo') || t.includes('foto')) return '🖼️';
+  if (t.includes('document')) return '📄';
+  return '📎';
+}
+
 export async function syncNotionDerivedForItem(item: any) {
   const notion = getNotionClient();
   if (!notion) return { entidades: 0, memorias: 0 };

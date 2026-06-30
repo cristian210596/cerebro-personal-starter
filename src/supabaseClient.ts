@@ -216,6 +216,34 @@ async function findExistingMemoria(afirmacion: string) {
   return (data || []).find((m: any) => memoryKey(m.afirmacion) === target) || null;
 }
 
+
+export async function saveArchivo(row: {
+  item_id?: string | null;
+  tipo_archivo?: string | null;
+  nombre_archivo?: string | null;
+  mime_type?: string | null;
+  storage_url?: string | null;
+  transcripcion?: string | null;
+  descripcion_ia?: string | null;
+}) {
+  const { data, error } = await supabase
+    .from('archivos')
+    .insert({
+      item_id: row.item_id || null,
+      tipo_archivo: row.tipo_archivo || null,
+      nombre_archivo: row.nombre_archivo || null,
+      mime_type: row.mime_type || null,
+      storage_url: row.storage_url || null,
+      transcripcion: row.transcripcion || null,
+      descripcion_ia: row.descripcion_ia || null
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
 export async function latestItemForChat(chatId: string) {
   const { data, error } = await supabase
     .from('items')

@@ -17,6 +17,7 @@
     "@notionhq/client": "2.2.15",
     "@supabase/supabase-js": "latest",
     "dotenv": "latest",
+    "jszip": "^3.10.1",
     "postgres": "latest"
   },
   "devDependencies": {

@@ -10,6 +10,7 @@ import {
   mergeEntidades,
   normalizeEntidadesDatabase,
   rebuildDerivedData,
+  saveArchivo,
   saveItem,
   searchEntidades,
   searchItems,
@@ -19,9 +20,11 @@ import {
   syncItemDerivedData,
   updateItemFields
 } from './supabaseClient.js';
-import { createNotionItemPage, syncNotionDerivedForItem, updateNotionItemPage } from './notion.js';
+import { createNotionArchivoPage, createNotionItemPage, syncNotionDerivedForItem, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
 import { parseEditInstruction } from './editor.js';
+import { generateBackupZip } from './backup.js';
+import { buildDocumentText, describeImage, transcribeAudio, type TelegramFileInfo } from './media.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -30,6 +33,11 @@ type TelegramUpdate = {
     chat: { id: number; type: string };
     from?: { id: number; username?: string; first_name?: string };
     text?: string;
+    caption?: string;
+    voice?: { file_id: string; file_unique_id?: string; mime_type?: string; file_size?: number; duration?: number };
+    audio?: { file_id: string; file_unique_id?: string; file_name?: string; mime_type?: string; file_size?: number; duration?: number };
+    document?: { file_id: string; file_unique_id?: string; file_name?: string; mime_type?: string; file_size?: number };
+    photo?: Array<{ file_id: string; file_unique_id?: string; file_size?: number; width?: number; height?: number }>;
   };
 };
 
@@ -69,8 +77,12 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   const chatId = msg.chat.id;
   const text = msg.text?.trim();
 
+  if (!text && hasTelegramMedia(msg)) {
+    return handleMediaMessage(msg as any);
+  }
+
   if (!text) {
-    await sendMessage(chatId, 'Por ahora este MVP guarda texto. Después agregamos audios, fotos y documentos.');
+    await sendMessage(chatId, 'No encontré texto ni archivo compatible para guardar.');
     return;
   }
 
@@ -122,6 +134,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return sendMessage(chatId, formatStats(stats));
   }
 
+  if (command?.name === 'backup') {
+    return handleBackupCommand(chatId);
+  }
+
   if (command?.name === 'reconstruir') {
     return handleRebuildCommand(chatId, command.args);
   }
@@ -145,26 +161,77 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   await sendMessage(chatId, 'Procesando...');
 
+  const result = await saveClassifiedText({
+    chatId,
+    messageId: msg.message_id,
+    userId: msg.from?.id,
+    text,
+    source: 'telegram'
+  });
+
+  if (!result.ok) return sendMessage(chatId, result.message);
+  await sendMessage(chatId, formatSaved(result.clasificacion));
+}
+
+export async function sendMessage(chatId: number, text: string) {
+  const res = await fetch(`${apiBase}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 3900) })
+  });
+  if (!res.ok) throw new Error(`Telegram sendMessage falló: ${res.status}`);
+}
+
+export async function sendDocument(chatId: number, filename: string, buffer: Buffer, caption?: string) {
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (caption) form.append('caption', caption.slice(0, 1000));
+  form.append('document', new Blob([buffer], { type: 'application/zip' }), filename);
+
+  const res = await fetch(`${apiBase}/sendDocument`, {
+    method: 'POST',
+    body: form
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Telegram sendDocument falló: ${res.status} ${text}`);
+  }
+}
+
+
+type SaveClassifiedTextInput = {
+  chatId: number;
+  messageId: number;
+  userId?: number;
+  text: string;
+  source: string;
+  url?: string | null;
+};
+
+type SaveClassifiedTextResult =
+  | { ok: true; item: any; clasificacion: any }
+  | { ok: false; message: string };
+
+async function saveClassifiedText(input: SaveClassifiedTextInput): Promise<SaveClassifiedTextResult> {
   let clasificacion: any;
   try {
-    clasificacion = await classifyText(text);
+    clasificacion = await classifyText(input.text);
   } catch (error: any) {
     console.error('No se pudo clasificar con IA:', error);
     const msg = String(error?.message || '');
     if (msg.includes('429') || String(error?.status || '') === '429') {
-      await sendMessage(chatId, 'No pude guardar porque Gemini se quedó sin cuota temporalmente. Probá más tarde o cambiamos a una API con más cuota.');
-      return;
+      return { ok: false, message: 'No pude guardar porque Gemini se quedó sin cuota temporalmente. Probá más tarde.' };
     }
-    await sendMessage(chatId, 'No pude clasificar este mensaje. Revisá logs de Vercel.');
-    return;
+    return { ok: false, message: 'No pude clasificar este mensaje. Revisá logs de Vercel.' };
   }
 
   const insert: ItemInsert = {
-    fuente: 'telegram',
-    telegram_user_id: msg.from?.id ? String(msg.from.id) : undefined,
-    telegram_chat_id: String(chatId),
-    telegram_message_id: String(msg.message_id),
-    texto_original: text,
+    fuente: input.source,
+    telegram_user_id: input.userId ? String(input.userId) : undefined,
+    telegram_chat_id: String(input.chatId),
+    telegram_message_id: String(input.messageId),
+    texto_original: input.text,
     titulo: clasificacion.titulo,
     resumen: clasificacion.resumen,
     categoria_principal: clasificacion.categoria_principal,
@@ -176,6 +243,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     accion_futura: clasificacion.accion_futura,
     tags: clasificacion.tags,
     entidades_json: clasificacion.entidades,
+    url: input.url || null,
     classifier_json: clasificacion
   };
 
@@ -185,22 +253,186 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     const notionPageId = await createNotionItemPage(item);
     if (notionPageId) {
       await supabase.from('items').update({ notion_page_id: notionPageId }).eq('id', item.id);
+      item.notion_page_id = notionPageId;
     }
     await syncNotionDerivedForItem(item);
   } catch (error) {
     console.error('No se pudo sincronizar Notion:', error);
   }
 
-  await sendMessage(chatId, formatSaved(clasificacion));
+  return { ok: true, item, clasificacion };
 }
 
-export async function sendMessage(chatId: number, text: string) {
-  const res = await fetch(`${apiBase}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 3900) })
-  });
-  if (!res.ok) throw new Error(`Telegram sendMessage falló: ${res.status}`);
+function hasTelegramMedia(msg: any) {
+  return Boolean(msg.voice || msg.audio || msg.document || (Array.isArray(msg.photo) && msg.photo.length));
+}
+
+async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
+  const chatId = msg.chat.id;
+  await sendMessage(chatId, 'Recibido. Procesando archivo...');
+
+  try {
+    const media = pickTelegramMedia(msg as any);
+    if (!media) return sendMessage(chatId, 'No pude identificar el archivo recibido.');
+
+    if (media.fileSize && media.fileSize > 18 * 1024 * 1024) {
+      return sendMessage(chatId, 'El archivo es demasiado grande para procesarlo ahora. Mandalo más chico o guardalo manualmente como link/nota.');
+    }
+
+    const downloaded = await downloadTelegramFile(media.fileId);
+    let textForItem = '';
+    let transcripcion: string | null = null;
+    let descripcionIa: string | null = null;
+    const caption = String((msg as any).caption || '').trim();
+
+    if (media.kind === 'voice' || media.kind === 'audio') {
+      transcripcion = await transcribeAudio(downloaded.buffer, media.mimeType || 'audio/ogg');
+      textForItem = [
+        'Audio recibido por Telegram.',
+        caption ? `Comentario del usuario: ${caption}` : '',
+        transcripcion ? `Transcripción: ${transcripcion}` : 'Transcripción no disponible.'
+      ].filter(Boolean).join('\n');
+    } else if (media.kind === 'photo') {
+      descripcionIa = await describeImage(downloaded.buffer, media.mimeType || 'image/jpeg', caption);
+      textForItem = [
+        'Foto recibida por Telegram.',
+        caption ? `Comentario del usuario: ${caption}` : '',
+        descripcionIa ? `Descripción de imagen: ${descripcionIa}` : 'Descripción no disponible.'
+      ].filter(Boolean).join('\n');
+    } else {
+      textForItem = buildDocumentText(media, caption);
+    }
+
+    const result = await saveClassifiedText({
+      chatId,
+      messageId: msg.message_id,
+      userId: msg.from?.id,
+      text: textForItem,
+      source: `telegram_${media.kind}`,
+      url: `telegram://${media.fileId}`
+    });
+
+    if (!result.ok) return sendMessage(chatId, result.message);
+
+    const archivo = await saveArchivo({
+      item_id: result.item.id,
+      tipo_archivo: media.kind,
+      nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
+      mime_type: media.mimeType || downloaded.mimeType || null,
+      storage_url: `telegram://${media.fileId}`,
+      transcripcion,
+      descripcion_ia: descripcionIa
+    });
+
+    try {
+      await createNotionArchivoPage(archivo);
+    } catch (error) {
+      console.error('No se pudo sincronizar archivo a Notion:', error);
+    }
+
+    return sendMessage(chatId, [
+      media.kind === 'voice' || media.kind === 'audio' ? 'Audio guardado.' : media.kind === 'photo' ? 'Foto guardada.' : 'Documento guardado.',
+      '',
+      `Título: ${result.clasificacion.titulo}`,
+      `Categoría: ${result.clasificacion.categoria_principal}`,
+      `Tipo: ${result.clasificacion.tipo_item}`,
+      `Tags: ${(result.clasificacion.tags || []).join(', ') || '-'}`,
+      transcripcion ? `\nTranscripción: ${transcripcion.slice(0, 900)}` : ''
+    ].filter(Boolean).join('\n'));
+  } catch (error: any) {
+    console.error('No se pudo procesar archivo Telegram:', error);
+    const msgText = String(error?.message || '');
+    if (msgText.includes('429') || String(error?.status || '') === '429') {
+      return sendMessage(chatId, 'No pude procesar el archivo porque Gemini quedó sin cuota temporalmente. Probá más tarde.');
+    }
+    return sendMessage(chatId, `No pude procesar el archivo: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+function pickTelegramMedia(msg: any): TelegramFileInfo | null {
+  if (msg.voice) {
+    return {
+      kind: 'voice',
+      fileId: msg.voice.file_id,
+      fileUniqueId: msg.voice.file_unique_id,
+      mimeType: msg.voice.mime_type || 'audio/ogg',
+      fileSize: msg.voice.file_size,
+      fileName: `voice-${msg.message_id}.ogg`
+    };
+  }
+
+  if (msg.audio) {
+    return {
+      kind: 'audio',
+      fileId: msg.audio.file_id,
+      fileUniqueId: msg.audio.file_unique_id,
+      mimeType: msg.audio.mime_type || 'audio/mpeg',
+      fileSize: msg.audio.file_size,
+      fileName: msg.audio.file_name || `audio-${msg.message_id}`
+    };
+  }
+
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    const photo = [...msg.photo].sort((a, b) => (b.file_size || 0) - (a.file_size || 0))[0];
+    return {
+      kind: 'photo',
+      fileId: photo.file_id,
+      fileUniqueId: photo.file_unique_id,
+      mimeType: 'image/jpeg',
+      fileSize: photo.file_size,
+      fileName: `photo-${msg.message_id}.jpg`
+    };
+  }
+
+  if (msg.document) {
+    return {
+      kind: 'document',
+      fileId: msg.document.file_id,
+      fileUniqueId: msg.document.file_unique_id,
+      mimeType: msg.document.mime_type || 'application/octet-stream',
+      fileSize: msg.document.file_size,
+      fileName: msg.document.file_name || `document-${msg.message_id}`
+    };
+  }
+
+  return null;
+}
+
+async function downloadTelegramFile(fileId: string) {
+  const fileRes = await fetch(`${apiBase}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  if (!fileRes.ok) throw new Error(`Telegram getFile falló: ${fileRes.status}`);
+  const fileJson = await fileRes.json() as { ok: boolean; result?: { file_path?: string } };
+  if (!fileJson.ok || !fileJson.result?.file_path) throw new Error('Telegram no devolvió file_path');
+
+  const downloadUrl = `https://api.telegram.org/file/bot${config.telegramBotToken()}/${fileJson.result.file_path}`;
+  const dataRes = await fetch(downloadUrl);
+  if (!dataRes.ok) throw new Error(`Telegram download falló: ${dataRes.status}`);
+  const arrayBuffer = await dataRes.arrayBuffer();
+  return {
+    buffer: Buffer.from(arrayBuffer),
+    mimeType: dataRes.headers.get('content-type') || undefined
+  };
+}
+
+async function handleBackupCommand(chatId: number) {
+  await sendMessage(chatId, 'Generando backup...');
+
+  try {
+    const backup = await generateBackupZip();
+    await sendDocument(chatId, backup.filename, backup.buffer, [
+      'Backup generado.',
+      '',
+      `Items: ${backup.counts.items || 0}`,
+      `Entidades: ${backup.counts.entidades || 0}`,
+      `Memorias: ${backup.counts.memorias || 0}`,
+      `Archivos: ${backup.counts.archivos || 0}`,
+      '',
+      'Guardá este ZIP fuera de Telegram si querés doble resguardo.'
+    ].join('\n'));
+  } catch (error: any) {
+    console.error('No se pudo generar backup:', error);
+    return sendMessage(chatId, `No pude generar backup: ${error?.message || 'error desconocido'}`);
+  }
 }
 
 function introText() {
@@ -217,6 +449,7 @@ function introText() {
     '/entidades',
     '/entidad hplc',
     '/stats',
+    '/backup',
     '/reconstruir 5',
     '/normalizar',
     '/fusionar Café Colombia => Café Martínez Colombia'
