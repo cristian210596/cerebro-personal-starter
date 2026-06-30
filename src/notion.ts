@@ -279,6 +279,12 @@ export async function syncNotionFinanceResult(result: any) {
   return { movimientos, deudas, particiones };
 }
 
+export async function setupFinanceNotionDatabases() {
+  const notion = getNotionClient();
+  if (!notion) throw new Error('Falta NOTION_TOKEN.');
+  return ensureFinanceDatabases(notion);
+}
+
 async function ensureFinanceDatabases(notion: Client) {
   const fileCfg = loadNotionDbConfig();
   let dbs: Required<Pick<NotionDbConfig, 'finanzasMovimientosDatabaseId' | 'finanzasDeudasDatabaseId' | 'finanzasParticionesDatabaseId'>> = {
