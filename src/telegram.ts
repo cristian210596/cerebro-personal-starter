@@ -93,9 +93,21 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   const command = parseTelegramCommand(text);
 
-  if (command?.name === 'start') {
+  if (command?.name === 'start' || command?.name === 'ayuda') {
     await sendMessage(chatId, introText());
     return;
+  }
+
+  if (command?.name === 'estado') {
+    return handleEstadoCommand(chatId);
+  }
+
+  if (command?.name === 'archivos') {
+    return handleArchivosCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'archivo') {
+    return handleArchivoCommand(chatId, command.args);
   }
 
   if (command?.name === 'buscar') {
@@ -495,20 +507,24 @@ function introText() {
     '',
     'Comandos:',
     '/buscar hplc lampara d2',
+    '/archivos dni',
+    '/archivo ultimo',
     '/ultimos',
     '/pendientes',
     '/memorias',
     '/entidades',
     '/entidad hplc',
+    '/estado',
     '/stats',
     '/finanzas',
     '/gastos visa',
     '/deudas',
     '/tarjetas',
+    '/pagar Juan 5000',
+    '/borrar gasto ultimo confirmar',
+    '/borrar archivo ultimo confirmar',
     '/backup',
-    '/reconstruir 5',
-    '/normalizar',
-    '/fusionar Café Colombia => Café Martínez Colombia'
+    '/normalizar'
   ].join('\n');
 }
 
@@ -702,6 +718,111 @@ async function loadArchivosByItem(itemIds: string[]) {
 }
 
 
+
+async function handleEstadoCommand(chatId: number) {
+  try {
+    const tables = ['items', 'entidades', 'memorias', 'archivos', 'finanzas_movimientos', 'finanzas_deudas', 'finanzas_particiones', 'finanzas_cierres'];
+    const lines = ['Estado del cerebro', ''];
+    for (const table of tables) {
+      try {
+        const { count, error } = await supabase.from(table).select('*', { count: 'exact', head: true });
+        if (error) throw error;
+        lines.push(`${table}: ${count ?? 0}`);
+      } catch {
+        lines.push(`${table}: no disponible`);
+      }
+    }
+    lines.push('', 'Servicios:');
+    lines.push(`Telegram: activo`);
+    lines.push(`Supabase: activo`);
+    lines.push(`Notion: ${config.notionToken() ? 'configurado' : 'sin token'}`);
+    lines.push(`Gemini: ${config.geminiApiKey() ? 'configurado' : 'sin key'}`);
+    lines.push('', 'Comandos útiles: /backup, /buscar, /archivos, /finanzas, /gastos, /deudas, /tarjetas');
+    return sendMessage(chatId, lines.join('\n'));
+  } catch (error: any) {
+    console.error('No pude generar estado:', error);
+    return sendMessage(chatId, `No pude generar estado: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleArchivosCommand(chatId: number, args: string) {
+  try {
+    const q = removeAccents(String(args || '').toLowerCase()).trim();
+    const { data, error } = await supabase
+      .from('archivos')
+      .select('*, items(titulo,categoria_principal,resumen,tags)')
+      .order('created_at', { ascending: false })
+      .limit(40);
+    if (error) throw error;
+
+    let rows = data || [];
+    if (q) {
+      rows = rows.filter((a: any) => {
+        const haystack = removeAccents([
+          a.nombre_archivo,
+          a.tipo_archivo,
+          a.mime_type,
+          a.transcripcion,
+          a.descripcion_ia,
+          a.items?.titulo,
+          a.items?.categoria_principal,
+          a.items?.resumen,
+          ...(a.items?.tags || [])
+        ].filter(Boolean).join(' ').toLowerCase());
+        return q.split(/\s+/).every(part => haystack.includes(part));
+      });
+    }
+
+    if (!rows.length) return sendMessage(chatId, q ? `Archivos: ${args}\n\nSin resultados.` : 'Archivos\n\nSin archivos registrados.');
+
+    const lines = [q ? `Archivos: ${args}` : 'Últimos archivos', ''];
+    let n = 1;
+    for (const a of rows.slice(0, 8)) {
+      const url = await createSignedFileUrl(a.storage_url, 60 * 60 * 24 * 7);
+      lines.push(`${n}. ${a.nombre_archivo || 'Archivo'}`);
+      lines.push(`   Tipo: ${a.tipo_archivo || '-'}${a.items?.titulo ? ` — ${a.items.titulo}` : ''}`);
+      if (a.descripcion_ia) lines.push(`   ${String(a.descripcion_ia).slice(0, 180)}`);
+      if (a.transcripcion) lines.push(`   Transcripción: ${String(a.transcripcion).slice(0, 180)}`);
+      if (url) lines.push(`   Link: ${url}`);
+      lines.push('');
+      n += 1;
+    }
+    return sendMessage(chatId, lines.join('\n'));
+  } catch (error: any) {
+    console.error('No pude listar archivos:', error);
+    return sendMessage(chatId, `No pude listar archivos: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleArchivoCommand(chatId: number, args: string) {
+  try {
+    const q = String(args || '').trim();
+    if (!q || removeAccents(q.toLowerCase()).includes('ultimo')) {
+      const { data, error } = await supabase.from('archivos').select('*').order('created_at', { ascending: false }).limit(1).maybeSingle();
+      if (error) throw error;
+      if (!data) return sendMessage(chatId, 'No encontré archivos.');
+      const url = await createSignedFileUrl(data.storage_url, 60 * 60 * 24 * 7);
+      return sendMessage(chatId, [`Archivo último`, '', `Nombre: ${data.nombre_archivo || '-'}`, `Tipo: ${data.tipo_archivo || '-'}`, url ? `Link: ${url}` : 'Sin link disponible'].join('\n'));
+    }
+    return handleArchivosCommand(chatId, q);
+  } catch (error: any) {
+    console.error('No pude obtener archivo:', error);
+    return sendMessage(chatId, `No pude obtener archivo: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function deleteLastArchivo(confirm: boolean) {
+  if (!confirm) return { ok: false as const, message: 'Para borrar el último archivo usá: /borrar archivo ultimo confirmar' };
+  const { data: row, error } = await supabase.from('archivos').select('*').order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (error) throw error;
+  if (!row) return { ok: false as const, message: 'No encontré archivos para borrar.' };
+
+  await supabase.from('archivos').delete().eq('id', row.id);
+  if (row.item_id) await supabase.from('items').delete().eq('id', row.item_id);
+
+  return { ok: true as const, message: `Archivo borrado: ${row.nombre_archivo || row.id}` };
+}
+
 async function handleGastosCommand(chatId: number, args: string) {
   try {
     const rows = await listFinanceMovements(args, 12);
@@ -756,11 +877,15 @@ async function handleBorrarCommand(chatId: number, args: string) {
       const result = await deleteLastFinanceMovement(a.includes('confirmar'));
       return sendMessage(chatId, result.message);
     }
+    if (a.includes('archivo')) {
+      const result = await deleteLastArchivo(a.includes('confirmar'));
+      return sendMessage(chatId, result.message);
+    }
     if (a.includes('ultimo') || a.includes('último')) {
       const result = await deleteLastItem(a.includes('confirmar'));
       return sendMessage(chatId, result.message);
     }
-    return sendMessage(chatId, 'Usá: /borrar gasto ultimo confirmar o /borrar ultimo confirmar');
+    return sendMessage(chatId, 'Usá: /borrar gasto ultimo confirmar, /borrar archivo ultimo confirmar o /borrar ultimo confirmar');
   } catch (error: any) {
     console.error('No pude borrar:', error);
     return sendMessage(chatId, `No pude borrar: ${error?.message || 'error desconocido'}`);
