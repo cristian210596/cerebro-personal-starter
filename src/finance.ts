@@ -105,6 +105,8 @@ Reglas:
 - Si un gasto se divide entre varias personas, incluir participantes. Si aparece "yo", "mí", "Cristian" o "Cris", dividir_incluye_usuario=true.
 - participantes_pagaron incluye personas que ya pagaron su parte.
 - No inventes cuotas si no aparecen.
+- IMPORTANTE: "tengo que comprar...", "quiero comprar...", "necesito comprar..." o similares NO son gastos ni movimientos financieros si no indican pago real, monto real pagado o deuda real. Deben quedar fuera de finanzas.
+- Nunca registres gastos de monto 0. Si no hay monto real, es_finanza=false salvo que sea un cierre/pago/deuda explícita con monto.
 - Entidades útiles: Comercio, Persona, Medio de pago, Banco / billetera, Tarjeta, Categoría financiera.
 `;
 
@@ -112,13 +114,25 @@ export function looksLikeFinanceText(text: string) {
   const t = normalizeLoose(text);
   if (!t) return false;
   if (/^\/?finanzas\b/.test(t)) return true;
-  const keywords = [
-    'gaste','gasté','compre','compré','pague','pagué','pago','pagó','me pago','me pagó','me devolvio','me devolvió',
-    'me debe','le debo','debo','deuda','dividir','repartir','entre','tarjeta','visa','master','mastercard','mercado pago','mp',
-    'sueldo','salario','aguinaldo','vacaciones','ingreso','transferencia','cuotas','cierre','vencimiento','carrefour','supermercado'
-  ];
-  if (keywords.some(k => t.includes(normalizeLoose(k)))) return true;
-  return /\$\s*\d/.test(text) || /\b\d+[\.,]?\d*\s*(pesos|ars)\b/i.test(text);
+
+  // Guardrail: comprar pendiente/deseado NO es gasto.
+  // Ej.: "tengo que comprar pan" debe ir como item/pendiente, no como gasto $0.
+  if (/^(tengo que|quiero|necesito|hay que|debo)\s+comprar\b/.test(t)) return false;
+
+  const hasAmount = /\$\s*\d/.test(text) || /\b\d+[\.,]?\d*\s*(pesos|ars)?\b/i.test(text);
+  const explicitMovement = /\b(gaste|gasté|pague|pagué|abone|aboné|cobre|cobré|recibi|recibí|me entro|me entró|ingreso|sueldo|salario|aguinaldo|transferencia)\b/.test(t);
+  const explicitDebt = /\b(me debe|le debo|yo le debo|deuda|me pago|me pagó|me devolvio|me devolvió)\b/.test(t);
+  const explicitSplit = /\b(dividir|repartir|gasto compartido|entre .* y yo|entre .* conmigo)\b/.test(t);
+  const explicitCard = /^(cierre|vencimiento|pague|pagué)\s+(visa|master|mastercard)\b/.test(t);
+
+  if (explicitCard) return true;
+  if ((explicitMovement || explicitDebt || explicitSplit) && hasAmount) return true;
+
+  // Medio de pago + monto + comercio/concepto suele ser gasto aunque no diga "gasté".
+  const paymentMethod = /\b(visa|master|mastercard|mercado pago|mp|tarjeta|debito|débito|efectivo|transferencia)\b/.test(t);
+  if (hasAmount && paymentMethod && /\b(en|por|para|con)\b/.test(t)) return true;
+
+  return false;
 }
 
 export async function parseFinanceText(text: string): Promise<FinanceParse> {
@@ -136,6 +150,35 @@ export async function parseFinanceText(text: string): Promise<FinanceParse> {
   return normalizeFinanceParse(JSON.parse(raw));
 }
 
+
+function validateFinanceParse(parsed: FinanceParse, originalText: string): { ok: true } | { ok: false; reason: string } {
+  const t = normalizeLoose(originalText);
+
+  // Pendientes de compra no son movimientos financieros.
+  if (/^(tengo que|quiero|necesito|hay que|debo)\s+comprar\b/.test(t)) {
+    return { ok: false, reason: 'compra_pendiente_no_es_gasto' };
+  }
+
+  const amount = Number(parsed.monto || parsed.pago_deuda_monto || 0);
+
+  if (parsed.intencion === 'movimiento') {
+    if (!amount || amount <= 0) return { ok: false, reason: 'movimiento_sin_monto' };
+    if (!parsed.tipo_movimiento || parsed.tipo_movimiento === 'ajuste') return { ok: false, reason: 'tipo_movimiento_no_claro' };
+  }
+
+  if (parsed.intencion === 'deuda') {
+    if (!amount || amount <= 0) return { ok: false, reason: 'deuda_sin_monto' };
+    if (!parsed.persona_deuda) return { ok: false, reason: 'deuda_sin_persona' };
+  }
+
+  if (parsed.intencion === 'pago_deuda') {
+    if (!amount || amount <= 0) return { ok: false, reason: 'pago_deuda_sin_monto' };
+    if (!parsed.persona_deuda) return { ok: false, reason: 'pago_deuda_sin_persona' };
+  }
+
+  return { ok: true };
+}
+
 export async function saveFinanceFromText(input: {
   chatId: number;
   messageId: number;
@@ -144,6 +187,9 @@ export async function saveFinanceFromText(input: {
 }) {
   const parsed = await parseFinanceText(input.text);
   if (!parsed.es_finanza || parsed.intencion === 'ninguna') return { ok: false as const, reason: 'no_finance' };
+
+  const valid = validateFinanceParse(parsed, input.text);
+  if (!valid.ok) return { ok: false as const, reason: valid.reason };
 
   const clasificacion = financeToClassification(parsed, input.text);
   const insert: ItemInsert = {
