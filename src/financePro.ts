@@ -19,11 +19,14 @@ export async function listFinanceMovements(query = '', limit = 12) {
     .select('*')
     .order('fecha_movimiento', { ascending: false })
     .order('created_at', { ascending: false })
-    .limit(200);
+    .limit(300);
   if (error) throw error;
   const q = norm(query);
+  const month = monthFromQuery(q);
   const rows = (data || []).filter((row: any) => {
-    if (!q) return true;
+    if (month && !String(row.fecha_movimiento || '').includes(`-${month}-`)) return false;
+    const tokens = q.split(/\s+/).filter(Boolean).filter(token => !isMonthToken(token));
+    if (!tokens.length) return true;
     const haystack = norm([
       row.descripcion,
       row.categoria_financiera,
@@ -36,7 +39,7 @@ export async function listFinanceMovements(query = '', limit = 12) {
       row.estado,
       row.fecha_movimiento
     ].filter(Boolean).join(' '));
-    return q.split(/\s+/).filter(Boolean).every(token => haystack.includes(token));
+    return tokens.every(token => haystack.includes(token));
   });
   return rows.slice(0, limit);
 }
@@ -272,6 +275,17 @@ export async function deleteLastItem(confirm: boolean) {
   return { ok: true as const, message: `Borré el último item: ${row.titulo || row.id}.` };
 }
 
+
+function monthFromQuery(q: string) {
+  const months: Record<string, string> = { enero:'01', febrero:'02', marzo:'03', abril:'04', mayo:'05', junio:'06', julio:'07', agosto:'08', septiembre:'09', setiembre:'09', octubre:'10', noviembre:'11', diciembre:'12' };
+  for (const [name, mm] of Object.entries(months)) if (q.includes(name)) return mm;
+  const m = q.match(/(0?[1-9]|1[0-2])/);
+  return m ? m[1].padStart(2, '0') : null;
+}
+function isMonthToken(token: string) {
+  return ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','setiembre','octubre','noviembre','diciembre'].includes(token);
+}
+
 function extractAfter(text: string, regex: RegExp) {
   const m = text.match(regex);
   return m ? clean(m[2] || m[1]) : '';
@@ -344,3 +358,93 @@ function norm(value: unknown) {
 function clean(value: unknown) { return String(value || '').trim().replace(/\s+/g, ' '); }
 function money(value: any) { return `$${Number(value || 0).toLocaleString('es-AR')}`; }
 function round(n: number) { return Math.round(n * 100) / 100; }
+
+export function looksLikeBudgetText(text: string) {
+  const t = norm(text);
+  return /^presupuesto\b/.test(t) || /^\/presupuesto\b/.test(t);
+}
+
+export async function saveBudgetFromText(text: string) {
+  const cleaned = text.replace(/^\/presupuesto\s*/i, '').replace(/^presupuesto\s*/i, '').trim();
+  const amount = parseAmount(cleaned);
+  if (amount === null) return { ok: false as const, message: 'Usá: /presupuesto supermercado 250000 mensual' };
+  const categoryText = cleaned.replace(/(?:\$\s*)?(\d{1,3}(?:[\. ]\d{3})+|\d+)(?:,(\d{1,2}))?/g, '').replace(/mensual|mes|por mes/gi, '').trim();
+  const categoria = normalizeCategory(categoryText || 'Otros');
+  const periodo = new Date().toISOString().slice(0, 7);
+
+  const { data: existing, error: findError } = await supabase
+    .from('finanzas_presupuestos')
+    .select('*')
+    .eq('categoria_financiera', categoria)
+    .eq('periodo', periodo)
+    .maybeSingle();
+  if (findError) throw findError;
+
+  if (existing) {
+    const { data, error } = await supabase
+      .from('finanzas_presupuestos')
+      .update({ monto_presupuestado: amount, updated_at: new Date().toISOString(), activo: true })
+      .eq('id', existing.id)
+      .select()
+      .single();
+    if (error) throw error;
+    return { ok: true as const, presupuesto: data, updated: true };
+  }
+
+  const { data, error } = await supabase
+    .from('finanzas_presupuestos')
+    .insert({ categoria_financiera: categoria, monto_presupuestado: amount, moneda: 'ARS', periodo, frecuencia: 'mensual', activo: true })
+    .select()
+    .single();
+  if (error) throw error;
+  return { ok: true as const, presupuesto: data, updated: false };
+}
+
+export async function listBudgets() {
+  const periodo = new Date().toISOString().slice(0, 7);
+  const { data: presupuestos, error } = await supabase
+    .from('finanzas_presupuestos')
+    .select('*')
+    .eq('activo', true)
+    .order('categoria_financiera', { ascending: true });
+  if (error) throw error;
+
+  const monthStart = `${periodo}-01`;
+  const now = new Date().toISOString().slice(0, 10);
+  const { data: movements, error: movError } = await supabase
+    .from('finanzas_movimientos')
+    .select('*')
+    .eq('tipo', 'gasto')
+    .gte('fecha_movimiento', monthStart)
+    .lte('fecha_movimiento', now)
+    .limit(1000);
+  if (movError) throw movError;
+
+  return (presupuestos || []).map((p: any) => {
+    const gastado = (movements || [])
+      .filter((m: any) => norm(m.categoria_financiera) === norm(p.categoria_financiera))
+      .reduce((sum: number, m: any) => sum + Number(m.monto || 0), 0);
+    return { ...p, gastado, restante: Number(p.monto_presupuestado || 0) - gastado };
+  });
+}
+
+export function formatBudgetSaved(result: Awaited<ReturnType<typeof saveBudgetFromText>>) {
+  if (!result.ok) return result.message;
+  return [
+    result.updated ? 'Presupuesto actualizado.' : 'Presupuesto guardado.',
+    '',
+    `Categoría: ${result.presupuesto.categoria_financiera}`,
+    `Monto mensual: ${money(result.presupuesto.monto_presupuestado)}`,
+    `Período: ${result.presupuesto.periodo}`
+  ].join('\n');
+}
+
+export function formatBudgets(rows: any[]) {
+  if (!rows.length) return 'Presupuestos\n\nSin presupuestos activos.';
+  const lines = ['Presupuestos', ''];
+  for (const p of rows) {
+    lines.push(`• ${p.categoria_financiera}: ${money(p.gastado)} / ${money(p.monto_presupuestado)}`);
+    lines.push(`  Restante: ${money(p.restante)}`);
+  }
+  return lines.join('\n');
+}

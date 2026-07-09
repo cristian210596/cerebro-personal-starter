@@ -29,7 +29,8 @@ import { generateBackupZip } from './backup.js';
 import { buildDocumentText, describeImage, transcribeAudio, type TelegramFileInfo } from './media.js';
 import { createSignedFileUrl, uploadTelegramFileToStorage } from './storage.js';
 import { formatFinanceSaved, formatFinanceSummary, getFinanceSummary, looksLikeFinanceText, saveFinanceFromText } from './finance.js';
-import { correctLastFinanceMovement, deleteLastFinanceMovement, deleteLastItem, formatCardSummary, formatDebts, formatFinanceCorrection, formatMovements, getCardSummary, listFinanceDebts, listFinanceMovements, looksLikeFinanceProText, markDebtPaidFromText, payCardFromText, saveCardStatementFromText } from './financePro.js';
+import { correctLastFinanceMovement, deleteLastFinanceMovement, deleteLastItem, formatBudgetSaved, formatBudgets, formatCardSummary, formatDebts, formatFinanceCorrection, formatMovements, getCardSummary, listBudgets, listFinanceDebts, listFinanceMovements, looksLikeBudgetText, looksLikeFinanceProText, markDebtPaidFromText, payCardFromText, saveBudgetFromText, saveCardStatementFromText } from './financePro.js';
+import { deleteLastPending, formatPendingDone, formatPendingSaved, formatPendientes, listPendientes, looksLikePendingText, markPendingDone, savePendingFromText } from './pending.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -126,8 +127,11 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   }
 
   if (command?.name === 'pendientes') {
-    const results = await pendingItems(10);
-    return sendMessage(chatId, formatItems(results, 'Pendientes'));
+    return handlePendientesCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'hecho') {
+    return handleHechoCommand(chatId, command.args);
   }
 
   if (command?.name === 'memorias') {
@@ -170,6 +174,14 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return handleTarjetasCommand(chatId);
   }
 
+  if (command?.name === 'presupuestos') {
+    return handlePresupuestosCommand(chatId);
+  }
+
+  if (command?.name === 'presupuesto') {
+    return handlePresupuestoCommand(chatId, command.args);
+  }
+
   if (command?.name === 'pagar') {
     return handlePagarCommand(chatId, command.args);
   }
@@ -194,6 +206,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return handleMergeEntityCommand(chatId, command.args);
   }
 
+  if (looksLikeBudgetText(text)) {
+    return handlePresupuestoCommand(chatId, text.replace(/^\/presupuesto\s*/i, '').replace(/^presupuesto\s*/i, ''));
+  }
+
   if (looksLikeFinanceProText(text)) {
     const handled = await handleFinanceProNaturalText(chatId, text);
     if (handled) return;
@@ -206,6 +222,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   // Regla de seguridad: ningún comando desconocido se guarda como item.
   if (command) {
     return sendMessage(chatId, `Comando no reconocido: /${command.name}. No lo guardé como item.`);
+  }
+
+  if (looksLikePendingText(text)) {
+    return handlePendingNaturalText(chatId, msg.message_id, msg.from?.id, text);
   }
 
   if (looksLikeFinanceText(text)) {
@@ -511,6 +531,7 @@ function introText() {
     '/archivo ultimo',
     '/ultimos',
     '/pendientes',
+    '/hecho comprar detergente',
     '/memorias',
     '/entidades',
     '/entidad hplc',
@@ -520,6 +541,8 @@ function introText() {
     '/gastos visa',
     '/deudas',
     '/tarjetas',
+    '/presupuesto supermercado 250000 mensual',
+    '/presupuestos',
     '/pagar Juan 5000',
     '/borrar gasto ultimo confirmar',
     '/borrar archivo ultimo confirmar',
@@ -721,7 +744,7 @@ async function loadArchivosByItem(itemIds: string[]) {
 
 async function handleEstadoCommand(chatId: number) {
   try {
-    const tables = ['items', 'entidades', 'memorias', 'archivos', 'finanzas_movimientos', 'finanzas_deudas', 'finanzas_particiones', 'finanzas_cierres'];
+    const tables = ['items', 'entidades', 'memorias', 'archivos', 'finanzas_movimientos', 'finanzas_deudas', 'finanzas_particiones', 'finanzas_cierres', 'finanzas_presupuestos', 'pendientes'];
     const lines = ['Estado del cerebro', ''];
     for (const table of tables) {
       try {
@@ -823,6 +846,67 @@ async function deleteLastArchivo(confirm: boolean) {
   return { ok: true as const, message: `Archivo borrado: ${row.nombre_archivo || row.id}` };
 }
 
+
+async function handlePendientesCommand(chatId: number, args: string) {
+  try {
+    const rows = await listPendientes(args, 20);
+    return sendMessage(chatId, formatPendientes(rows, args ? `Pendientes: ${args}` : 'Pendientes abiertos'));
+  } catch (error: any) {
+    console.error('No pude listar pendientes:', error);
+    return sendMessage(chatId, `No pude listar pendientes: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleHechoCommand(chatId: number, args: string) {
+  try {
+    const result = await markPendingDone(args);
+    return sendMessage(chatId, formatPendingDone(result));
+  } catch (error: any) {
+    console.error('No pude cerrar pendiente:', error);
+    return sendMessage(chatId, `No pude cerrar pendiente: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handlePendingNaturalText(chatId: number, messageId: number, userId: number | undefined, text: string) {
+  try {
+    const result = await savePendingFromText({ chatId, messageId, userId, text });
+    try {
+      const notionPageId = await createNotionItemPage(result.item);
+      if (notionPageId) {
+        await supabase.from('items').update({ notion_page_id: notionPageId }).eq('id', result.item.id);
+        result.item.notion_page_id = notionPageId;
+      }
+      await syncNotionDerivedForItem(result.item);
+    } catch (error) {
+      console.error('No se pudo sincronizar Notion para pendiente:', error);
+    }
+    return sendMessage(chatId, formatPendingSaved(result));
+  } catch (error: any) {
+    console.error('No pude guardar pendiente:', error);
+    return sendMessage(chatId, `No pude guardar pendiente: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handlePresupuestoCommand(chatId: number, args: string) {
+  try {
+    const result = await saveBudgetFromText(args);
+    return sendMessage(chatId, formatBudgetSaved(result));
+  } catch (error: any) {
+    console.error('No pude guardar presupuesto:', error);
+    return sendMessage(chatId, `No pude guardar presupuesto: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/interacciones_finanzas_plus.sql.`);
+  }
+}
+
+async function handlePresupuestosCommand(chatId: number) {
+  try {
+    const rows = await listBudgets();
+    return sendMessage(chatId, formatBudgets(rows));
+  } catch (error: any) {
+    console.error('No pude listar presupuestos:', error);
+    return sendMessage(chatId, `No pude listar presupuestos: ${error?.message || 'error desconocido'}.`);
+  }
+}
+
 async function handleGastosCommand(chatId: number, args: string) {
   try {
     const rows = await listFinanceMovements(args, 12);
@@ -881,11 +965,15 @@ async function handleBorrarCommand(chatId: number, args: string) {
       const result = await deleteLastArchivo(a.includes('confirmar'));
       return sendMessage(chatId, result.message);
     }
+    if (a.includes('pendiente')) {
+      const result = await deleteLastPending(a.includes('confirmar'));
+      return sendMessage(chatId, result.message);
+    }
     if (a.includes('ultimo') || a.includes('último')) {
       const result = await deleteLastItem(a.includes('confirmar'));
       return sendMessage(chatId, result.message);
     }
-    return sendMessage(chatId, 'Usá: /borrar gasto ultimo confirmar, /borrar archivo ultimo confirmar o /borrar ultimo confirmar');
+    return sendMessage(chatId, 'Usá: /borrar gasto ultimo confirmar, /borrar archivo ultimo confirmar, /borrar pendiente ultimo confirmar o /borrar ultimo confirmar');
   } catch (error: any) {
     console.error('No pude borrar:', error);
     return sendMessage(chatId, `No pude borrar: ${error?.message || 'error desconocido'}`);

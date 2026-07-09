@@ -11,7 +11,9 @@ const TABLES = [
   'finanzas_movimientos',
   'finanzas_deudas',
   'finanzas_particiones',
-  'finanzas_cierres'
+  'finanzas_cierres',
+  'finanzas_presupuestos',
+  'pendientes'
 ];
 
 export async function generateBackupZip() {
