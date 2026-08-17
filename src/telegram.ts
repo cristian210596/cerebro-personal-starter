@@ -522,6 +522,45 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
     let descripcionIa: string | null = null;
     const caption = String((msg as any).caption || '').trim();
 
+    // Importador financiero sin Gemini: no clasificamos el PDF como item general.
+    // Esto evita gastar cuota de Gemini y evita que un resumen de tarjeta quede como nota basura.
+    if (media.kind === 'document' && looksLikeFinanceFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption)) {
+      await sendMessage(chatId, 'Parece un resumen/movimiento financiero. Lo importo sin usar Gemini y sin guardarlo como item general...');
+
+      const archivo = await saveArchivo({
+        item_id: null,
+        tipo_archivo: media.kind,
+        nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
+        mime_type: media.mimeType || downloaded.mimeType || null,
+        storage_url: stored.storageRef,
+        transcripcion: null,
+        descripcion_ia: 'Documento financiero importado sin Gemini.'
+      });
+
+      try {
+        await createNotionArchivoPage(archivo);
+      } catch (error) {
+        console.error('No se pudo sincronizar archivo financiero a Notion:', error);
+      }
+
+      const financeImport = await importFinanceFile({
+        buffer: downloaded.buffer,
+        fileName: media.fileName || `${media.kind}-${msg.message_id}`,
+        mimeType: media.mimeType || downloaded.mimeType || 'application/octet-stream',
+        caption,
+        chatId,
+        itemId: null,
+        archivoId: archivo.id
+      });
+
+      const financeImportMessage = formatImportResult(financeImport);
+      return sendMessage(chatId, [
+        financeImport.recognized ? 'Documento financiero importado.' : 'Documento financiero guardado, pero no pude extraer movimientos automáticamente.',
+        stored.signedUrl ? `Archivo: ${stored.signedUrl}` : '',
+        financeImportMessage || 'No usé Gemini. Para este formato necesito parser específico o CSV/Excel exportado.'
+      ].filter(Boolean).join('\n\n'));
+    }
+
     if (media.kind === 'voice' || media.kind === 'audio') {
       transcripcion = await transcribeAudio(downloaded.buffer, media.mimeType || 'audio/ogg');
       textForItem = [

@@ -1,9 +1,6 @@
 import crypto from 'node:crypto';
-import { GoogleGenAI, Type } from '@google/genai';
-import { config } from './config.js';
 import { supabase } from './supabaseClient.js';
 
-const ai = new GoogleGenAI({ apiKey: config.geminiApiKey() });
 
 export type ImportedMovement = {
   fecha: string | null;
@@ -35,70 +32,6 @@ type ParsedFinanceDocument = {
   pago_minimo: number | null;
   movimientos: ImportedMovement[];
 };
-
-const movementSchema = {
-  type: Type.OBJECT,
-  properties: {
-    fecha: { type: Type.STRING, nullable: true },
-    descripcion_original: { type: Type.STRING },
-    comercio: { type: Type.STRING, nullable: true },
-    comprobante: { type: Type.STRING, nullable: true },
-    monto: { type: Type.NUMBER, nullable: true },
-    moneda: { type: Type.STRING },
-    tipo: { type: Type.STRING },
-    cuota_actual: { type: Type.NUMBER, nullable: true },
-    cuotas_totales: { type: Type.NUMBER, nullable: true },
-    categoria_sugerida: { type: Type.STRING, nullable: true },
-    subcategoria_sugerida: { type: Type.STRING, nullable: true },
-    confianza: { type: Type.NUMBER },
-    raw: { type: Type.STRING, nullable: true }
-  },
-  required: ['fecha', 'descripcion_original', 'comercio', 'comprobante', 'monto', 'moneda', 'tipo', 'cuota_actual', 'cuotas_totales', 'categoria_sugerida', 'subcategoria_sugerida', 'confianza', 'raw']
-};
-
-const documentSchema = {
-  type: Type.OBJECT,
-  properties: {
-    es_resumen_financiero: { type: Type.BOOLEAN },
-    tipo_fuente: { type: Type.STRING },
-    proveedor: { type: Type.STRING, nullable: true },
-    cuenta: { type: Type.STRING, nullable: true },
-    tarjeta: { type: Type.STRING, nullable: true },
-    periodo: { type: Type.STRING, nullable: true },
-    fecha_cierre: { type: Type.STRING, nullable: true },
-    fecha_vencimiento: { type: Type.STRING, nullable: true },
-    total_pesos: { type: Type.NUMBER, nullable: true },
-    total_dolares: { type: Type.NUMBER, nullable: true },
-    pago_minimo: { type: Type.NUMBER, nullable: true },
-    movimientos: { type: Type.ARRAY, items: movementSchema }
-  },
-  required: ['es_resumen_financiero', 'tipo_fuente', 'proveedor', 'cuenta', 'tarjeta', 'periodo', 'fecha_cierre', 'fecha_vencimiento', 'total_pesos', 'total_dolares', 'pago_minimo', 'movimientos']
-};
-
-const EXTRACT_PROMPT = `
-Extraé movimientos financieros de este archivo para un sistema personal de finanzas.
-
-Objetivo:
-- Detectar si es resumen de tarjeta, movimientos de Mercado Pago/banco, o documento financiero similar.
-- Extraer consumos/movimientos reales, no textos legales ni publicidad.
-- En resúmenes de tarjeta, extraer principalmente el DETALLE DEL CONSUMO.
-- No extraigas SALDO ANTERIOR ni TOTAL A PAGAR como gasto.
-- Los pagos de tarjeta como "SU PAGO EN PESOS" deben ser tipo="pago_tarjeta", no gasto.
-- Impuestos, intereses y cargos del resumen pueden extraerse como tipo="cargo_financiero".
-- Si un consumo está en dólares, moneda="USD" y monto debe ser el importe en dólares.
-- Si un consumo está en pesos, moneda="ARS".
-- Si aparece cuota tipo 01/03, cuota_actual=1 y cuotas_totales=3.
-- Si no aparece cuota, cuota_actual y cuotas_totales null.
-- Fechas en formato YYYY-MM-DD. Si el año aparece abreviado, inferilo desde el período/cierre del resumen.
-- Categorías sugeridas admitidas: Supermercado; Alimentos; Comida afuera; Transporte; Casa; Servicios; Salud; Farmacia; Ropa; Tecnología; Educación; Trabajo; Ocio; Regalos; Suscripciones; Impuestos; Alquiler; Auto; Transferencias; Deudas / compartidos; Ingreso laboral; Gastos financieros; Otros.
-- Para OPENAI, CHATGPT, GOOGLE, YOUTUBE, NETFLIX, SPOTIFY u otros cargos recurrentes, usá Suscripciones si corresponde.
-- Para CABIFY, SUBE, combustible, taxi/remis: Transporte.
-- Para universidad/cursos: Educación.
-- Para ABL, AYSA, Telecentro, luz, gas, internet: Servicios o Impuestos según corresponda.
-- No inventes movimientos si la línea no está clara.
-
-Devolvé solo JSON según schema.
-`;
 
 export function looksLikeFinanceFile(fileName = '', mimeType = '', caption = '') {
   const t = norm([fileName, mimeType, caption].join(' '));
@@ -148,14 +81,9 @@ export async function importFinanceFile(input: {
     const pdfText = await tryExtractPdfText(input.buffer, fileName, mimeType);
     if (pdfText && pdfText.length > 120) {
       parsed = parseVisaGaliciaPdfText(pdfText, fileName);
-      if (!parsed?.movimientos?.length) {
-        parsed = await extractFinanceTextWithGemini(pdfText, fileName, input.caption || '');
-      }
-    } else {
-      parsed = await extractFinanceDocumentWithGemini(input.buffer, mimeType, fileName, input.caption || '');
     }
   } else {
-    parsed = await extractFinanceDocumentWithGemini(input.buffer, mimeType, fileName, input.caption || '');
+    parsed = null;
   }
 
   if (!parsed?.es_resumen_financiero || !Array.isArray(parsed.movimientos) || !parsed.movimientos.length) {
@@ -189,52 +117,6 @@ export async function importFinanceFile(input: {
   };
 }
 
-async function extractFinanceDocumentWithGemini(buffer: Buffer, mimeType: string, fileName: string, caption: string): Promise<ParsedFinanceDocument> {
-  const response = await ai.models.generateContent({
-    model: config.geminiModel(),
-    contents: [
-      {
-        role: 'user',
-        parts: [
-          { text: `${EXTRACT_PROMPT}\nArchivo: ${fileName}\nComentario del usuario: ${caption || '-'}` },
-          { inlineData: { mimeType: mimeType || 'application/pdf', data: buffer.toString('base64') } }
-        ]
-      }
-    ],
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: documentSchema
-    }
-  });
-
-  const raw = response.text;
-  if (!raw) throw new Error('Gemini no devolvió extracción financiera');
-  return normalizeParsedDocument(JSON.parse(raw));
-}
-
-async function extractFinanceTextWithGemini(text: string, fileName: string, caption: string): Promise<ParsedFinanceDocument> {
-  const limitedText = text.slice(0, 55000);
-  const response = await ai.models.generateContent({
-    model: config.geminiModel(),
-    contents: [
-      {
-        role: 'user',
-        parts: [
-          { text: `${EXTRACT_PROMPT}\nArchivo: ${fileName}\nComentario del usuario: ${caption || '-'}\n\nTexto extraído del PDF/archivo:\n${limitedText}` }
-        ]
-      }
-    ],
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: documentSchema
-    }
-  });
-
-  const raw = response.text;
-  if (!raw) throw new Error('Gemini no devolvió extracción financiera desde texto');
-  return normalizeParsedDocument(JSON.parse(raw));
-}
-
 async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: string) {
   if (!isPdfLike(fileName, mimeType)) return null;
   try {
@@ -245,7 +127,7 @@ async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: str
     const text = clean(result?.text || '');
     return text.length ? text : null;
   } catch (error) {
-    console.error('No pude extraer texto del PDF con pdf-parse; uso fallback Gemini:', error);
+    console.error('No pude extraer texto del PDF con pdf-parse; no se usa Gemini para importaciones:', error);
     return null;
   }
 }
