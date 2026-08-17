@@ -68,10 +68,16 @@ export async function importFinanceFile(input: {
 
   const existing = await findExistingImport(hash);
   if (existing) {
+    // Si el archivo ya había sido subido en una versión anterior, puede haber quedado
+    // en staging: movimientos detectados/clasificados, pero todavía no consolidados
+    // dentro de finanzas_movimientos. Antes de devolver "ya importado", intentamos
+    // completar esa consolidación. Esto corrige el caso: detectados 58, importados 0.
+    const processed = await processFinanceImportation(existing.id);
     return {
       recognized: true as const,
       duplicate: true,
       importacion: existing,
+      processed,
       stats: await buildImportStats(existing.id),
       nextPending: await getNextPendingImportedMovement(existing.id)
     };
@@ -882,6 +888,19 @@ async function autoProcessImportedRows(rows: any[]) {
       continue;
     }
 
+    const alreadyConsolidated = await findMovementByExternalHash(row.external_hash);
+    if (alreadyConsolidated) {
+      await supabase.from('finanzas_movimientos_importados').update({
+        estado: 'importado',
+        movimiento_id: alreadyConsolidated.id,
+        match_score: 1,
+        match_reason: 'ya existía movimiento consolidado con el mismo external_hash',
+        updated_at: new Date().toISOString()
+      }).eq('id', row.id);
+      stats.autoInserted += 1;
+      continue;
+    }
+
     const match = await findManualMatch(row);
     if (match) {
       const updated = await mergeImportedIntoMovement(row, match);
@@ -895,6 +914,18 @@ async function autoProcessImportedRows(rows: any[]) {
     stats.autoInserted += 1;
   }
   return stats;
+}
+
+async function findMovementByExternalHash(externalHash: string | null) {
+  if (!externalHash) return null;
+  const { data, error } = await supabase
+    .from('finanzas_movimientos')
+    .select('*')
+    .eq('external_hash', externalHash)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
 }
 
 async function createMovementFromImported(row: any) {
@@ -1010,6 +1041,42 @@ async function markImportedConciliated(row: any, movement: any, score: number, r
   await supabase.from('finanzas_conciliaciones').insert({ movimiento_importado_id: row.id, movimiento_id: movement.id, tipo_match: 'automatico', score, estado: 'confirmado', notas: reason });
 }
 
+export async function processFinanceImportation(importacionId?: string | null) {
+  let id = importacionId || null;
+  if (!id) {
+    const latest = await latestFinanceImport();
+    id = latest?.id || null;
+  }
+  if (!id) {
+    return {
+      ok: false as const,
+      message: 'No hay importaciones financieras para procesar.',
+      processed: { autoInserted: 0, matchedManual: 0, pending: 0, ignored: 0 },
+      stats: { total: 0 } as Record<string, number>
+    };
+  }
+
+  // Procesa filas que quedaron en staging como "clasificado" pero sin movimiento final.
+  // No toca pendientes de revisión: esos requieren /clasificar.
+  const { data, error } = await supabase
+    .from('finanzas_movimientos_importados')
+    .select('*')
+    .eq('importacion_id', id)
+    .eq('estado', 'clasificado')
+    .is('movimiento_id', null)
+    .limit(1000);
+  if (error) throw error;
+
+  const processed = await autoProcessImportedRowsWithRules(data || []);
+  await updateImportationState(id);
+  return {
+    ok: true as const,
+    importacion_id: id,
+    processed,
+    stats: await buildImportStats(id)
+  };
+}
+
 export async function listFinanceImports(limit = 10) {
   const { data, error } = await supabase.from('finanzas_importaciones').select('*').order('created_at', { ascending: false }).limit(limit);
   if (error) throw error;
@@ -1116,7 +1183,7 @@ export async function buildImportStats(importacionId: string) {
 
 async function updateImportationState(importacionId: string) {
   const stats = await buildImportStats(importacionId);
-  const state = stats.pendiente_revision ? 'revision_pendiente' : 'procesada';
+  const state = stats.pendiente_revision ? 'revision_pendiente' : stats.clasificado ? 'procesando' : 'procesada';
   await supabase.from('finanzas_importaciones').update({ estado: state, updated_at: new Date().toISOString() }).eq('id', importacionId);
 }
 
@@ -1137,8 +1204,39 @@ export async function summarizeFinanceAnalytics(text: string) {
     .order('fecha_movimiento', { ascending: true })
     .limit(2000);
   if (error) throw error;
-  const rows = (data || []).filter((row: any) => matchesAnalyticsTarget(row, target));
+  const consolidatedRows = (data || []).filter((row: any) => matchesAnalyticsTarget(row, target));
+  const importedRows = await loadUnconsolidatedImportedAnalyticsRows(period, target);
+  const rows = [...consolidatedRows, ...importedRows];
   return { target, period, rows, totals: totalsByCurrency(rows), monthly: totalsByMonthAndCurrency(rows) };
+}
+
+async function loadUnconsolidatedImportedAnalyticsRows(period: { start: string; end: string }, target: { terms: string[] }) {
+  const { data, error } = await supabase
+    .from('finanzas_movimientos_importados')
+    .select('*')
+    .gte('fecha_movimiento', period.start)
+    .lte('fecha_movimiento', period.end)
+    .is('movimiento_id', null)
+    .in('estado', ['clasificado', 'pendiente_revision'])
+    .limit(2000);
+  if (error) throw error;
+  return (data || [])
+    .map((row: any) => ({
+      id: row.id,
+      fecha_movimiento: row.fecha_movimiento,
+      monto: Number(row.monto || 0),
+      moneda: row.moneda || 'ARS',
+      comercio: row.comercio_detectado || row.descripcion_original,
+      descripcion: row.descripcion_original,
+      categoria_financiera: row.categoria_confirmada || row.categoria_sugerida || null,
+      subcategoria_financiera: row.subcategoria_confirmada || row.subcategoria_sugerida || null,
+      medio_pago: row.tarjeta ? `${row.tarjeta} crédito` : row.proveedor || null,
+      tarjeta: row.tarjeta || null,
+      banco_billetera: row.proveedor || null,
+      merchant_key: row.merchant_key || null,
+      origen: 'importacion_no_consolidada'
+    }))
+    .filter((row: any) => matchesAnalyticsTarget(row, target));
 }
 
 export function formatFinanceAnalyticsReport(report: Awaited<ReturnType<typeof summarizeFinanceAnalytics>>) {
@@ -1168,9 +1266,29 @@ export function formatFinanceAnalyticsReport(report: Awaited<ReturnType<typeof s
   lines.push('');
   lines.push('Últimos movimientos:');
   for (const row of rows.slice(-6).reverse()) {
-    lines.push(`- ${row.fecha_movimiento}: ${formatMoney(Number(row.monto || 0), row.moneda || 'ARS')} — ${row.comercio || row.descripcion || '-'}`);
+    const extra = row.origen === 'importacion_no_consolidada' ? ' [importado no consolidado]' : '';
+    lines.push(`- ${row.fecha_movimiento}: ${formatMoney(Number(row.monto || 0), row.moneda || 'ARS')} — ${row.comercio || row.descripcion || '-'}${extra}`);
   }
   return lines.join('\n');
+}
+
+export function formatProcessImportResult(result: Awaited<ReturnType<typeof processFinanceImportation>>) {
+  if (!result.ok) return result.message;
+  const p = result.processed;
+  const s = result.stats || {};
+  return [
+    'Importación financiera procesada.',
+    '',
+    `Importados ahora: ${p.autoInserted || 0}`,
+    `Conciliados con gastos manuales: ${p.matchedManual || 0}`,
+    `Pendientes de clasificar: ${s.pendiente_revision || 0}`,
+    `Clasificados sin consolidar: ${s.clasificado || 0}`,
+    `Total detectados: ${s.total || 0}`,
+    '',
+    (s.clasificado || 0) > 0
+      ? 'Todavía quedan clasificados sin consolidar. Revisá /logs o /diagnostico si esto se repite.'
+      : 'Listo. Ahora los reportes deberían encontrar esos movimientos.'
+  ].join('\n');
 }
 
 export function formatImportResult(result: Awaited<ReturnType<typeof importFinanceFile>>) {
@@ -1188,8 +1306,18 @@ export function formatImportResult(result: Awaited<ReturnType<typeof importFinan
   lines.push(`Movimientos detectados: ${stats.total || 0}`);
   lines.push(`Importados: ${stats.importado || 0}`);
   lines.push(`Conciliados con manuales: ${stats.conciliado || 0}`);
+  if (stats.clasificado) lines.push(`Clasificados sin consolidar: ${stats.clasificado || 0}`);
   lines.push(`Pendientes de clasificar: ${stats.pendiente_revision || 0}`);
   lines.push(`Ignorados: ${stats.ignorado || 0}`);
+  const processed = (result as any).processed?.processed || (result as any).processed;
+  if (processed && (processed.autoInserted || processed.matchedManual || processed.pending)) {
+    lines.push('');
+    lines.push(`Consolidación automática: ${processed.autoInserted || 0} importados, ${processed.matchedManual || 0} conciliados, ${processed.pending || 0} pendientes.`);
+  }
+  if (stats.clasificado) {
+    lines.push('');
+    lines.push('Hay movimientos clasificados que todavía no quedaron como gasto consolidado. Mandá: /importacion procesar');
+  }
   if (result.nextPending) {
     lines.push('', 'Próximo pendiente:');
     lines.push(formatOnePending(result.nextPending, 1));

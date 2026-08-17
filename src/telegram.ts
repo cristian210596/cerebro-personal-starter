@@ -36,7 +36,7 @@ import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, format
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
-import { classifyImportedMovementByIndex, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, summarizeFinanceAnalytics } from './financeImport.js';
+import { classifyImportedMovementByIndex, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -1107,6 +1107,11 @@ async function handleImportacionesCommand(chatId: number) {
 async function handleImportacionCommand(chatId: number, args: string) {
   const a = removeAccents(args || '').toLowerCase();
   try {
+    if (a.includes('procesar') || a.includes('consolidar')) {
+      const result = await processFinanceImportation();
+      return sendMessage(chatId, formatProcessImportResult(result));
+    }
+
     if (!a || a.includes('ultima') || a.includes('última')) {
       const imp = await latestFinanceImport();
       if (!imp) return sendMessage(chatId, 'No hay importaciones financieras todavía.');
@@ -1120,19 +1125,23 @@ async function handleImportacionCommand(chatId: number, args: string) {
         `Periodo: ${imp.periodo || '-'}`,
         `Estado: ${imp.estado || '-'}`,
         `Movimientos: ${stats.total || 0}`,
+        `Importados: ${stats.importado || 0}`,
+        `Conciliados: ${stats.conciliado || 0}`,
+        `Clasificados sin consolidar: ${stats.clasificado || 0}`,
         `Pendientes: ${stats.pendiente_revision || 0}`,
         '',
+        stats.clasificado ? 'Para consolidar los ya clasificados: /importacion procesar' : '',
         pending.length ? formatPendingImported(pending.slice(0, 5)) : 'Sin pendientes de clasificación.'
-      ].join('\n'));
+      ].filter(Boolean).join('\n'));
     }
     if (a.includes('revisar') || a.includes('pendiente')) {
       const rows = await getPendingImportedMovements(12);
       return sendMessage(chatId, formatPendingImported(rows));
     }
-    return sendMessage(chatId, 'Usá: /importacion ultima o /importacion revisar');
+    return sendMessage(chatId, 'Usá: /importacion ultima, /importacion revisar o /importacion procesar');
   } catch (error: any) {
-    console.error('No pude revisar importación:', error);
-    return sendMessage(chatId, `No pude revisar importación: ${error?.message || 'error desconocido'}`);
+    console.error('No pude revisar/procesar importación:', error);
+    return sendMessage(chatId, `No pude revisar/procesar importación: ${error?.message || 'error desconocido'}`);
   }
 }
 
