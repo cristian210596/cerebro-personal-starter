@@ -98,10 +98,50 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return;
   }
 
+  // Router conversacional anti-basura: debe ejecutarse ANTES del clasificador general y antes de cualquier lógica secundaria.
+  // Si falla este filtro, frases operativas como "qué puedo hacer" o "eliminar ese último" terminan guardadas como items.
+  const earlyConversationalRoute = routeConversationalText(text);
+  if (earlyConversationalRoute) {
+    switch (earlyConversationalRoute.kind) {
+      case 'help':
+        return sendMessage(chatId, introText());
+      case 'status':
+        return handleEstadoCommand(chatId);
+      case 'diagnostics':
+        return handleDiagnosticoCommand(chatId);
+      case 'backup_status':
+        return handleBackupEstadoCommand(chatId);
+      case 'last':
+        return handleUltimoCommand(chatId);
+      case 'pending_list':
+        return handlePendientesCommand(chatId, earlyConversationalRoute.query);
+      case 'done':
+        return handleHechoCommand(chatId, earlyConversationalRoute.query);
+      case 'search':
+        return handleUnifiedSearchCommand(chatId, earlyConversationalRoute.query);
+      case 'summary':
+        return handleResumenCommand(chatId, earlyConversationalRoute.period);
+      case 'review':
+        return handleRevisionCommand(chatId, earlyConversationalRoute.period);
+      case 'delete':
+        if (!earlyConversationalRoute.confirm) return sendMessage(chatId, formatNaturalDeletePrompt(earlyConversationalRoute));
+        return handleBorrarCommand(chatId, naturalDeleteArgs(earlyConversationalRoute));
+      case 'do_not_save':
+        return sendMessage(chatId, 'No lo guardé como item. Para borrar el último registro, mandá: /borrar ultimo confirmar');
+      case 'clarify_correction':
+        return sendMessage(chatId, formatClarifyCorrection());
+    }
+  }
+
   const command = parseTelegramCommand(text);
 
   if (command?.name === 'start' || command?.name === 'ayuda') {
     await sendMessage(chatId, introText());
+    return;
+  }
+
+  if (command?.name === 'router') {
+    await sendMessage(chatId, 'Router antibasura activo v2. Frases como "Qué puedo hacer?", "Eliminar ese último" y "No guardes eso" no deben guardarse como items.');
     return;
   }
 
