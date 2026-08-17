@@ -40,6 +40,10 @@ import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, 
 import { classifyImportedMovementByIndex, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
 import { formatComprobanteDetail, formatComprobanteImportResult, formatComprobanteItems, formatComprobantes, formatProductRuleResult, formatProductSpendingReport, formatProducts, getComprobanteItems, getLastComprobante, importComprobanteFromFile, listComprobantes, listProducts, looksLikeComprobanteFile, looksLikeProductQueryText, saveProductRuleFromText, summarizeProductSpending } from './comprobantes.js';
 import { confirmLastSalaryReceipt, correctLastSalaryReceiptFromText, createManualSalaryReceiptFromText, formatSalaryConcepts, formatSalaryImportResult, formatSalaryList, formatSalaryReceipt, formatSalarySummary, getLastSalaryReceipt, getSalaryConcepts, importSalaryReceiptFromFile, listSalaryReceipts, looksLikeSalaryFile, looksLikeSalaryQueryText, summarizeSalaryFromText } from './salary.js';
+import { enqueueProcessingTask, cleanupQueueCompleted, formatQueue, formatQueueProcessResults, listQueue, processQueue, retryLastQueued } from './processingQueue.js';
+import { addAliasFromText, formatAliasAdded, formatAliases, formatMasterEntities, listAliases, listMasterEntities, seedDefaultEntityBrain } from './entityBrain.js';
+import { buildInbox, confirmConciliationByIndex, formatConciliationCandidates, formatConciliationDone, formatInbox, formatSources, getFinancialSourcesForLastMovement, listConciliationCandidates, rejectConciliationByIndex } from './conciliation.js';
+import { formatVersionInfo } from './version.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -149,6 +153,34 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return;
   }
 
+
+  if (command?.name === 'version' || command?.name === 'versión') {
+    return sendMessage(chatId, formatVersionInfo());
+  }
+
+  if (command?.name === 'cola') {
+    return handleColaCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'reprocesar') {
+    return handleReprocesarCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'bandeja') {
+    return handleBandejaCommand(chatId);
+  }
+
+  if (command?.name === 'conciliacion' || command?.name === 'conciliación' || command?.name === 'conciliar') {
+    return handleConciliacionCommand(chatId, command.name, command.args);
+  }
+
+  if (command?.name === 'alias') {
+    return handleAliasCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'maestras') {
+    return handleMaestrasCommand(chatId, command.args);
+  }
 
   if (command?.name === 'gemini') {
     return handleGeminiCommand(chatId, command.args);
@@ -372,6 +404,14 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
       case 'clarify_correction':
         return sendMessage(chatId, formatClarifyCorrection());
     }
+  }
+
+  if (/^(bandeja|que tengo pendiente|qué tengo pendiente|pendientes del sistema)$/i.test(text.trim())) {
+    return handleBandejaCommand(chatId);
+  }
+
+  if (/^(version|versión|que version|qué versión)/i.test(text.trim())) {
+    return sendMessage(chatId, formatVersionInfo());
   }
 
   if (looksLikeLastSavedQuestion(text)) {
@@ -968,6 +1008,13 @@ function introText() {
     '/backup estado',
     '/backup auto probar',
     '/supervivencia',
+    '/version',
+    '/cola',
+    '/cola procesar',
+    '/bandeja',
+    '/conciliacion pendientes',
+    '/alias openai',
+    '/entidades maestras',
     '/normalizar'
   ].join('\n');
 }
@@ -1332,6 +1379,105 @@ async function handleIgnorarImportadoCommand(chatId: number, args: string) {
 }
 
 
+
+async function handleColaCommand(chatId: number, args: string) {
+  const a = removeAccents(String(args || '').trim().toLowerCase());
+  try {
+    if (a.includes('limpiar')) {
+      const n = await cleanupQueueCompleted();
+      return sendMessage(chatId, `Cola limpiada. Completados borrados: ${n}`);
+    }
+    if (a.includes('procesar')) {
+      const m = a.match(/(\d+)/);
+      const limit = m ? Number(m[1]) : 5;
+      await sendMessage(chatId, `Procesando cola (${limit})...`);
+      const results = await processQueue(limit, a.includes('forzar'));
+      return sendMessage(chatId, formatQueueProcessResults(results));
+    }
+    const rows = await listQueue(a.replace(/^errores?/, 'error'), 20);
+    return sendMessage(chatId, formatQueue(rows));
+  } catch (error: any) {
+    console.error('No pude manejar cola:', error);
+    return sendMessage(chatId, `No pude manejar cola: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/mega_conexion.sql.`);
+  }
+}
+
+async function handleReprocesarCommand(chatId: number, args: string) {
+  try {
+    const last = await retryLastQueued();
+    if (!last) return sendMessage(chatId, 'No hay tareas para reprocesar.');
+    const results = await processQueue(1, true);
+    return sendMessage(chatId, formatQueueProcessResults(results));
+  } catch (error: any) {
+    console.error('No pude reprocesar:', error);
+    return sendMessage(chatId, `No pude reprocesar: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleBandejaCommand(chatId: number) {
+  try {
+    const inbox = await buildInbox();
+    return sendMessage(chatId, formatInbox(inbox));
+  } catch (error: any) {
+    console.error('No pude armar bandeja:', error);
+    return sendMessage(chatId, `No pude armar bandeja: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/mega_conexion.sql.`);
+  }
+}
+
+async function handleConciliacionCommand(chatId: number, name: string, args: string) {
+  const a = removeAccents(String(args || '').trim().toLowerCase());
+  try {
+    if (name === 'conciliar' && /\d+/.test(a) && a.includes('confirmar')) {
+      const n = Number((a.match(/\d+/) || ['0'])[0]);
+      const result = await confirmConciliationByIndex(n);
+      return sendMessage(chatId, formatConciliationDone(result));
+    }
+    if (name === 'conciliar' && /\d+/.test(a) && (a.includes('rechazar') || a.includes('no'))) {
+      const n = Number((a.match(/\d+/) || ['0'])[0]);
+      const result = await rejectConciliationByIndex(n);
+      return sendMessage(chatId, `Conciliación rechazada: ${result.tipo}`);
+    }
+    if (a.includes('fuentes') || a.includes('ultimo') || a.includes('último')) {
+      const payload = await getFinancialSourcesForLastMovement();
+      return sendMessage(chatId, formatSources(payload));
+    }
+    const rows = await listConciliationCandidates(15);
+    return sendMessage(chatId, formatConciliationCandidates(rows));
+  } catch (error: any) {
+    console.error('No pude conciliar:', error);
+    return sendMessage(chatId, `No pude conciliar: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/mega_conexion.sql.`);
+  }
+}
+
+async function handleAliasCommand(chatId: number, args: string) {
+  const a = String(args || '').trim();
+  try {
+    if (!a) return sendMessage(chatId, 'Usá: /alias openai o /alias OPENAI *CHATGPT => OpenAI / ChatGPT');
+    if (/=>|->|como|=/.test(a)) {
+      const result = await addAliasFromText(a);
+      return sendMessage(chatId, formatAliasAdded(result));
+    }
+    if (removeAccents(a.toLowerCase()).includes('sembrar') || removeAccents(a.toLowerCase()).includes('default')) {
+      const result = await seedDefaultEntityBrain();
+      return sendMessage(chatId, `Entidades maestras inicializadas. Aliases cargados: ${result.inserted}`);
+    }
+    const rows = await listAliases(a, 30);
+    return sendMessage(chatId, formatAliases(rows));
+  } catch (error: any) {
+    console.error('No pude manejar alias:', error);
+    return sendMessage(chatId, `No pude manejar alias: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/mega_conexion.sql.`);
+  }
+}
+
+async function handleMaestrasCommand(chatId: number, args: string) {
+  try {
+    const rows = await listMasterEntities(args || '', 30);
+    return sendMessage(chatId, formatMasterEntities(rows));
+  } catch (error: any) {
+    console.error('No pude listar entidades maestras:', error);
+    return sendMessage(chatId, `No pude listar entidades maestras: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/mega_conexion.sql.`);
+  }
+}
 
 async function handleComprobantesCommand(chatId: number, args: string) {
   try {
