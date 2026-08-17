@@ -21,8 +21,8 @@
     "postgres": "latest"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "tsx": "latest",
-    "typescript": "latest"
+    "@types/node": "22.15.30",
+    "tsx": "4.22.4",
+    "typescript": "5.8.3"
   }
 }
