@@ -18,6 +18,9 @@ const EXPECTED_TABLES = [
   'finanzas_movimientos_importados',
   'finanzas_reglas_comercios',
   'finanzas_conciliaciones',
+  'finanzas_comprobantes',
+  'finanzas_comprobante_items',
+  'finanzas_reglas_productos',
   'sueldos_recibos',
   'sueldos_conceptos',
   'pendientes'

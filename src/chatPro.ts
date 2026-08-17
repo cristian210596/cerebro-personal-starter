@@ -13,14 +13,15 @@ export function looksLikeUniversalCorrection(text: string) {
 }
 
 export async function getLastSavedSnapshot(chatId?: string) {
-  const [items, archivos, pendientes, movimientos, deudas, memorias, sueldos] = await Promise.all([
+  const [items, archivos, pendientes, movimientos, deudas, memorias, sueldos, comprobantes] = await Promise.all([
     queryLatest('items', chatId ? { telegram_chat_id: chatId } : undefined),
     queryLatest('archivos'),
     queryLatest('pendientes'),
     queryLatest('finanzas_movimientos'),
     queryLatest('finanzas_deudas'),
     queryLatest('memorias'),
-    queryLatest('sueldos_recibos')
+    queryLatest('sueldos_recibos'),
+    queryLatest('finanzas_comprobantes')
   ]);
 
   const candidates = [
@@ -30,7 +31,8 @@ export async function getLastSavedSnapshot(chatId?: string) {
     movimientos ? { kind: 'movimiento financiero', created_at: movimientos.created_at, row: movimientos } : null,
     deudas ? { kind: 'deuda', created_at: deudas.created_at, row: deudas } : null,
     memorias ? { kind: 'memoria', created_at: memorias.created_at, row: memorias } : null,
-    sueldos ? { kind: 'recibo de sueldo', created_at: sueldos.created_at, row: sueldos } : null
+    sueldos ? { kind: 'recibo de sueldo', created_at: sueldos.created_at, row: sueldos } : null,
+    comprobantes ? { kind: 'comprobante/ticket', created_at: comprobantes.created_at, row: comprobantes } : null
   ].filter(Boolean) as Array<{ kind: string; created_at: string; row: any }>;
 
   candidates.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
@@ -90,6 +92,12 @@ export function formatLastSaved(snapshot: Awaited<ReturnType<typeof getLastSaved
     lines.push('Dónde: Supabase/sueldos_recibos + finanzas_movimientos');
     lines.push(`Período: ${row.periodo || '-'}`);
     lines.push(`Neto: ${money(row.total_neto)}`);
+  } else if (kind === 'comprobante/ticket') {
+    lines.push(`Comercio: ${row.comercio || '-'}`);
+    lines.push('Dónde: Supabase/finanzas_comprobantes + finanzas_comprobante_items');
+    lines.push(`Fecha: ${row.fecha_emision || '-'}`);
+    lines.push(`Total: ${money(row.total)}`);
+    lines.push(`Estado: ${row.estado || '-'}`);
   }
 
   lines.push('', 'Últimos registros por área:');
@@ -106,7 +114,7 @@ function shortLabel(row: any) {
 export async function unifiedSearch(query: string) {
   const q = norm(query);
   const tokens = q.split(/\s+/).filter(Boolean);
-  const [items, archivos, pendientes, movimientos, deudas, presupuestos, memorias, sueldos] = await Promise.all([
+  const [items, archivos, pendientes, movimientos, deudas, presupuestos, memorias, sueldos, comprobantes, comprobanteItems] = await Promise.all([
     load('items', 80),
     load('archivos', 80, '*, items(titulo,categoria_principal,resumen,tags)'),
     load('pendientes', 80),
@@ -114,7 +122,9 @@ export async function unifiedSearch(query: string) {
     load('finanzas_deudas', 80),
     load('finanzas_presupuestos', 80),
     load('memorias', 80),
-    load('sueldos_recibos', 80)
+    load('sueldos_recibos', 80),
+    load('finanzas_comprobantes', 80),
+    load('finanzas_comprobante_items', 120)
   ]);
 
   return {
@@ -126,7 +136,9 @@ export async function unifiedSearch(query: string) {
     deudas: filterRows(deudas, tokens, r => [r.persona, r.concepto, r.tipo, r.estado]).slice(0, 5),
     presupuestos: filterRows(presupuestos, tokens, r => [r.categoria_financiera, r.periodo, r.frecuencia, r.notas]).slice(0, 5),
     memorias: filterRows(memorias, tokens, r => [r.afirmacion, r.categoria, r.confianza]).slice(0, 5),
-    sueldos: filterRows(sueldos, tokens, r => [r.empresa, r.empleado, r.periodo, r.estado, r.fecha_pago]).slice(0, 5)
+    sueldos: filterRows(sueldos, tokens, r => [r.empresa, r.empleado, r.periodo, r.estado, r.fecha_pago]).slice(0, 5),
+    comprobantes: filterRows(comprobantes, tokens, r => [r.comercio, r.razon_social, r.numero_comprobante, r.fecha_emision, r.medio_pago, r.tarjeta, r.estado]).slice(0, 5),
+    comprobanteItems: filterRows(comprobanteItems, tokens, r => [r.descripcion, r.descripcion_normalizada, r.marca, r.categoria, r.subcategoria]).slice(0, 8)
   };
 }
 
@@ -154,6 +166,8 @@ export function formatUnifiedSearch(result: Awaited<ReturnType<typeof unifiedSea
   addSection(lines, 'Presupuestos', result.presupuestos, r => [`• ${r.categoria_financiera || '-'} — ${money(r.monto_presupuestado)}`, `  ${r.periodo || '-'} / ${r.frecuencia || '-'}`]);
   addSection(lines, 'Memorias', result.memorias, r => [`• ${r.afirmacion || '-'}`, `  ${r.categoria || '-'} / ${r.confianza || '-'}`]);
   addSection(lines, 'Sueldos', result.sueldos, r => [`• ${r.periodo || '-'} — ${r.empresa || '-'} — ${money(r.total_neto)}`, `  Bruto ${money(r.total_bruto)} / ${r.estado || '-'}`]);
+  addSection(lines, 'Comprobantes', result.comprobantes, r => [`• ${r.fecha_emision || '-'} — ${r.comercio || '-'} — ${money(r.total)}`, `  ${r.tipo_comprobante || '-'} / ${r.estado || '-'}`]);
+  addSection(lines, 'Productos de comprobantes', result.comprobanteItems, r => [`• ${r.descripcion || '-'} — ${money(r.importe)}`, `  ${r.categoria || '-'} / ${r.subcategoria || '-'}`]);
 
   if (lines.length <= 2) return `Búsqueda unificada: ${result.query}\n\nSin resultados.`;
   return lines.join('\n').slice(0, 3900);

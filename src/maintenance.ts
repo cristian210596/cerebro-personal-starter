@@ -16,6 +16,9 @@ const BACKUP_TABLES_FOR_PING = [
   'finanzas_movimientos_importados',
   'finanzas_reglas_comercios',
   'finanzas_conciliaciones',
+  'finanzas_comprobantes',
+  'finanzas_comprobante_items',
+  'finanzas_reglas_productos',
   'sueldos_recibos',
   'sueldos_conceptos',
   'pendientes'
@@ -124,6 +127,8 @@ export async function runScheduledMaintenance(options?: { forceBackup?: boolean;
       `Memorias: ${backup.counts.memorias || 0}`,
       `Archivos: ${backup.counts.archivos || 0}`,
       `Gastos: ${backup.counts.finanzas_movimientos || 0}`,
+      `Comprobantes: ${backup.counts.finanzas_comprobantes || 0}`,
+      `Productos comprobantes: ${backup.counts.finanzas_comprobante_items || 0}`,
       `Pendientes: ${backup.counts.pendientes || 0}`,
       '',
       'Guardá este ZIP como respaldo externo.'

@@ -38,6 +38,7 @@ import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSyste
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
 import { classifyImportedMovementByIndex, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
+import { formatComprobanteDetail, formatComprobanteImportResult, formatComprobanteItems, formatComprobantes, formatProductRuleResult, formatProductSpendingReport, formatProducts, getComprobanteItems, getLastComprobante, importComprobanteFromFile, listComprobantes, listProducts, looksLikeComprobanteFile, looksLikeProductQueryText, saveProductRuleFromText, summarizeProductSpending } from './comprobantes.js';
 import { confirmLastSalaryReceipt, correctLastSalaryReceiptFromText, createManualSalaryReceiptFromText, formatSalaryConcepts, formatSalaryImportResult, formatSalaryList, formatSalaryReceipt, formatSalarySummary, getLastSalaryReceipt, getSalaryConcepts, importSalaryReceiptFromFile, listSalaryReceipts, looksLikeSalaryFile, looksLikeSalaryQueryText, summarizeSalaryFromText } from './salary.js';
 
 type TelegramUpdate = {
@@ -194,6 +195,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   }
 
   if (command?.name === 'clasificar') {
+    if (/^producto/i.test(command.args || '')) return handleProductoCommand(chatId, command.args);
     return handleClasificarImportadoCommand(chatId, command.args);
   }
 
@@ -270,6 +272,22 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (command?.name === 'stats') {
     const stats = await statsCerebro();
     return sendMessage(chatId, formatStats(stats));
+  }
+
+  if (command?.name === 'comprobantes') {
+    return handleComprobantesCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'comprobante') {
+    return handleComprobanteCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'productos') {
+    return handleProductosCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'producto') {
+    return handleProductoCommand(chatId, command.args);
   }
 
   if (command?.name === 'finanzas') {
@@ -581,6 +599,60 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       ].filter(Boolean).join('\n\n'));
     }
 
+    // Comprobantes/tickets/facturas: se procesan antes del recibo de sueldo para evitar que queden como item narrativo.
+    const shouldTryComprobante = media.kind === 'photo' || looksLikeComprobanteFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption);
+    if (shouldTryComprobante) {
+      try {
+        await sendMessage(chatId, 'Reviso si es ticket/factura/comprobante de compra...');
+        const compResult = await importComprobanteFromFile({
+          buffer: downloaded.buffer,
+          fileName: media.fileName || `${media.kind}-${msg.message_id}`,
+          mimeType: media.mimeType || downloaded.mimeType || 'application/octet-stream',
+          caption,
+          chatId,
+          archivoId: null,
+          force: looksLikeComprobanteFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption)
+        });
+
+        if (compResult.recognized) {
+          const archivo = await saveArchivo({
+            item_id: null,
+            tipo_archivo: media.kind,
+            nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
+            mime_type: media.mimeType || downloaded.mimeType || null,
+            storage_url: stored.storageRef,
+            transcripcion: null,
+            descripcion_ia: 'Comprobante/ticket/factura importado.'
+          });
+          if (compResult.comprobante?.id) {
+            await supabase.from('finanzas_comprobantes').update({ archivo_id: archivo.id, updated_at: new Date().toISOString() }).eq('id', compResult.comprobante.id);
+          }
+          try { await createNotionArchivoPage(archivo); } catch (error) { console.error('No se pudo sincronizar comprobante a Notion:', error); }
+          return sendMessage(chatId, [
+            formatComprobanteImportResult(compResult),
+            stored.signedUrl ? `\nArchivo: ${stored.signedUrl}` : ''
+          ].filter(Boolean).join('\n'));
+        }
+      } catch (error: any) {
+        console.error('No pude revisar/importar comprobante:', error);
+        const msgText = String(error?.message || '');
+        const compHint = looksLikeComprobanteFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption) || /ticket|factura|comprobante|coto|arredo|gallo/i.test(caption || '');
+        const geminiQuota = /gemini sin cuota|quota|rate limit|resource_exhausted|429/i.test(msgText);
+        if (geminiQuota || compHint) {
+          return sendMessage(chatId, [
+            'Guardé el archivo, pero no pude extraer el ticket/factura automáticamente.',
+            msgText ? `Detalle: ${msgText.slice(0, 300)}` : '',
+            '',
+            'Revisá la rotación con:',
+            '/gemini estado',
+            '/gemini probar',
+            '',
+            'Si es urgente, cargá el gasto manual y después vinculamos el comprobante.'
+          ].filter(Boolean).join('\n'));
+        }
+      }
+    }
+
     const shouldTrySalary = media.kind === 'photo' || looksLikeSalaryFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption);
     if (shouldTrySalary) {
       try {
@@ -872,6 +944,12 @@ function introText() {
     '/finanzas',
     '/gastos visa',
     '/importaciones',
+    '/comprobantes',
+    '/comprobante ultimo',
+    '/comprobante items ultimo',
+    '/productos coto',
+    '/producto gasto sensodyne 2026',
+    '/clasificar producto sensodyne como Higiene personal guardar regla',
     '/sueldos',
     '/sueldo ultimo',
     '/sueldo conceptos ultimo',
@@ -1253,6 +1331,79 @@ async function handleIgnorarImportadoCommand(chatId: number, args: string) {
   }
 }
 
+
+
+async function handleComprobantesCommand(chatId: number, args: string) {
+  try {
+    const rows = await listComprobantes(args || '', 12);
+    return sendMessage(chatId, formatComprobantes(rows));
+  } catch (error: any) {
+    console.error('No pude listar comprobantes:', error);
+    return sendMessage(chatId, `No pude listar comprobantes: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/comprobantes.sql.`);
+  }
+}
+
+async function handleComprobanteCommand(chatId: number, args: string) {
+  const a = removeAccents(String(args || '').trim().toLowerCase());
+  try {
+    if (!a || a.includes('ultimo') || a.includes('ultima') || a.includes('último') || a.includes('última')) {
+      if (a.includes('item') || a.includes('items') || a.includes('producto')) {
+        const payload = await getComprobanteItems(null, 80);
+        return sendMessage(chatId, formatComprobanteItems(payload));
+      }
+      const last = await getLastComprobante();
+      return sendMessage(chatId, formatComprobanteDetail(last));
+    }
+
+    if (a.includes('items') || a.includes('productos')) {
+      const payload = await getComprobanteItems(null, 80);
+      return sendMessage(chatId, formatComprobanteItems(payload));
+    }
+
+    return sendMessage(chatId, 'Usá: /comprobante ultimo o /comprobante items ultimo');
+  } catch (error: any) {
+    console.error('No pude obtener comprobante:', error);
+    return sendMessage(chatId, `No pude obtener comprobante: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/comprobantes.sql.`);
+  }
+}
+
+async function handleProductosCommand(chatId: number, args: string) {
+  try {
+    const rows = await listProducts(args || '', 30);
+    return sendMessage(chatId, formatProducts(rows));
+  } catch (error: any) {
+    console.error('No pude listar productos:', error);
+    return sendMessage(chatId, `No pude listar productos: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/comprobantes.sql.`);
+  }
+}
+
+async function handleProductoCommand(chatId: number, args: string) {
+  const text = String(args || '').trim();
+  if (!text) return sendMessage(chatId, 'Usá: /producto sensodyne o /producto gasto sensodyne 2026');
+  if (/clasificar|guardar\s+regla|como/i.test(text)) {
+    try {
+      const result = await saveProductRuleFromText(text.startsWith('clasificar') ? text : `producto ${text}`);
+      return sendMessage(chatId, formatProductRuleResult(result));
+    } catch (error: any) {
+      console.error('No pude guardar regla de producto:', error);
+      return sendMessage(chatId, `No pude guardar regla de producto: ${error?.message || 'error desconocido'}`);
+    }
+  }
+  if (/gasto|gaste|gasté|cuanto|cuánto|año|ano|20\d{2}/i.test(text)) {
+    return handleProductSpendingCommand(chatId, text);
+  }
+  return handleProductosCommand(chatId, text);
+}
+
+async function handleProductSpendingCommand(chatId: number, text: string) {
+  try {
+    const result = await summarizeProductSpending(text);
+    return sendMessage(chatId, formatProductSpendingReport(result));
+  } catch (error: any) {
+    console.error('No pude calcular reporte de producto:', error);
+    return sendMessage(chatId, `No pude calcular reporte de producto: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/comprobantes.sql.`);
+  }
+}
 
 
 async function handleGeminiCommand(chatId: number, args: string) {
