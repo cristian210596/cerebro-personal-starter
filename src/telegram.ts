@@ -35,6 +35,7 @@ import { formatMaintenanceRunResult, formatMaintenanceStatus, getMaintenanceStat
 import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, formatDuplicateCleanup, formatLastSaved, formatPeriodSummary, formatUnifiedSearch, getLastSavedSnapshot, looksLikeLastSavedQuestion, looksLikeUniversalCorrection, unifiedSearch } from './chatPro.js';
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
+import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -244,6 +245,39 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (command?.name === 'fusionar') {
     return handleMergeEntityCommand(chatId, command.args);
+  }
+
+  const conversationalRoute = routeConversationalText(text);
+  if (conversationalRoute) {
+    switch (conversationalRoute.kind) {
+      case 'help':
+        return sendMessage(chatId, introText());
+      case 'status':
+        return handleEstadoCommand(chatId);
+      case 'diagnostics':
+        return handleDiagnosticoCommand(chatId);
+      case 'backup_status':
+        return handleBackupEstadoCommand(chatId);
+      case 'last':
+        return handleUltimoCommand(chatId);
+      case 'pending_list':
+        return handlePendientesCommand(chatId, conversationalRoute.query);
+      case 'done':
+        return handleHechoCommand(chatId, conversationalRoute.query);
+      case 'search':
+        return handleUnifiedSearchCommand(chatId, conversationalRoute.query);
+      case 'summary':
+        return handleResumenCommand(chatId, conversationalRoute.period);
+      case 'review':
+        return handleRevisionCommand(chatId, conversationalRoute.period);
+      case 'delete':
+        if (!conversationalRoute.confirm) return sendMessage(chatId, formatNaturalDeletePrompt(conversationalRoute));
+        return handleBorrarCommand(chatId, naturalDeleteArgs(conversationalRoute));
+      case 'do_not_save':
+        return sendMessage(chatId, 'No lo guardé como item. Si querés borrar el último registro, mandá: /borrar ultimo confirmar');
+      case 'clarify_correction':
+        return sendMessage(chatId, formatClarifyCorrection());
+    }
   }
 
   if (looksLikeLastSavedQuestion(text)) {
