@@ -32,6 +32,7 @@ import { formatFinanceSaved, formatFinanceSummary, getFinanceSummary, looksLikeF
 import { correctLastFinanceMovement, deleteLastFinanceMovement, deleteLastItem, formatBudgetSaved, formatBudgets, formatCardSummary, formatDebts, formatFinanceCorrection, formatMovements, getCardSummary, listBudgets, listFinanceDebts, listFinanceMovements, looksLikeBudgetText, looksLikeFinanceProText, markDebtPaidFromText, payCardFromText, saveBudgetFromText, saveCardStatementFromText } from './financePro.js';
 import { deleteLastPending, formatPendingDone, formatPendingSaved, formatPendientes, listPendientes, looksLikePendingText, markPendingDone, savePendingFromText } from './pending.js';
 import { formatMaintenanceRunResult, formatMaintenanceStatus, getMaintenanceStatus, rememberTelegramChat, runScheduledMaintenance } from './maintenance.js';
+import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, formatDuplicateCleanup, formatLastSaved, formatPeriodSummary, formatUnifiedSearch, getLastSavedSnapshot, looksLikeLastSavedQuestion, looksLikeUniversalCorrection, unifiedSearch } from './chatPro.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -120,7 +121,19 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (command?.name === 'buscar') {
     const q = command.args;
     if (!q) return sendMessage(chatId, 'Usá: /buscar hplc lampara d2');
-    return handleSmartSearchCommand(chatId, q);
+    return handleUnifiedSearchCommand(chatId, q);
+  }
+
+  if (command?.name === 'resumen') {
+    return handleResumenCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'ultimo' || command?.name === 'último') {
+    return handleUltimoCommand(chatId);
+  }
+
+  if (command?.name === 'limpiar') {
+    return handleLimpiarCommand(chatId, command.args);
   }
 
   if (command?.name === 'indexar') {
@@ -215,6 +228,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return handleMergeEntityCommand(chatId, command.args);
   }
 
+  if (looksLikeLastSavedQuestion(text)) {
+    return handleUltimoCommand(chatId);
+  }
+
   if (looksLikeBudgetText(text)) {
     return handlePresupuestoCommand(chatId, text.replace(/^\/presupuesto\s*/i, '').replace(/^presupuesto\s*/i, ''));
   }
@@ -224,7 +241,9 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     if (handled) return;
   }
 
-  if (isEditCommand(text)) {
+  if (isEditCommand(text) || looksLikeUniversalCorrection(text)) {
+    const universal = await applyUniversalCorrection(text, String(chatId));
+    if (universal.handled) return sendMessage(chatId, universal.message);
     return handleEditCommand(chatId, text);
   }
 
@@ -567,6 +586,10 @@ function introText() {
     '',
     'Comandos:',
     '/buscar hplc lampara d2',
+    '/resumen semana',
+    '/resumen mes',
+    '/ultimo',
+    '/limpiar duplicados',
     '/archivos dni',
     '/archivo ultimo',
     '/ultimos',
@@ -665,6 +688,51 @@ function formatStats(stats: any) {
   ].join('\n');
 }
 
+
+
+async function handleUnifiedSearchCommand(chatId: number, query: string) {
+  await sendMessage(chatId, 'Buscando en todo el cerebro...');
+  try {
+    const result = await unifiedSearch(query);
+    return sendMessage(chatId, formatUnifiedSearch(result));
+  } catch (error: any) {
+    console.error('No pude hacer búsqueda unificada:', error);
+    return sendMessage(chatId, `No pude buscar: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleResumenCommand(chatId: number, args: string) {
+  await sendMessage(chatId, 'Armando resumen...');
+  try {
+    const summary = await buildPeriodSummary(args || 'semana');
+    return sendMessage(chatId, formatPeriodSummary(summary));
+  } catch (error: any) {
+    console.error('No pude armar resumen:', error);
+    return sendMessage(chatId, `No pude armar resumen: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleUltimoCommand(chatId: number) {
+  try {
+    const snapshot = await getLastSavedSnapshot(String(chatId));
+    return sendMessage(chatId, formatLastSaved(snapshot));
+  } catch (error: any) {
+    console.error('No pude consultar último guardado:', error);
+    return sendMessage(chatId, `No pude consultar último guardado: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleLimpiarCommand(chatId: number, args: string) {
+  const a = removeAccents(args || '').toLowerCase();
+  if (!a.includes('duplicados')) return sendMessage(chatId, 'Usá: /limpiar duplicados o /limpiar duplicados confirmar');
+  try {
+    const result = await cleanupDuplicates(a.includes('confirmar'));
+    return sendMessage(chatId, formatDuplicateCleanup(result));
+  } catch (error: any) {
+    console.error('No pude limpiar duplicados:', error);
+    return sendMessage(chatId, `No pude limpiar duplicados: ${error?.message || 'error desconocido'}`);
+  }
+}
 
 async function handleSmartSearchCommand(chatId: number, query: string) {
   await sendMessage(chatId, 'Buscando...');
