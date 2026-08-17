@@ -18,7 +18,8 @@
     "@supabase/supabase-js": "latest",
     "dotenv": "latest",
     "jszip": "^3.10.1",
-    "postgres": "latest"
+    "postgres": "latest",
+    "pdf-parse": "1.1.1"
   },
   "devDependencies": {
     "@types/node": "22.15.30",

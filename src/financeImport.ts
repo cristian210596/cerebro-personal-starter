@@ -144,6 +144,16 @@ export async function importFinanceFile(input: {
   let parsed: ParsedFinanceDocument | null = null;
   if (isCsvLike(fileName, mimeType)) {
     parsed = parseCsvFinance(input.buffer.toString('utf8'), fileName);
+  } else if (isPdfLike(fileName, mimeType)) {
+    const pdfText = await tryExtractPdfText(input.buffer, fileName, mimeType);
+    if (pdfText && pdfText.length > 120) {
+      parsed = parseVisaGaliciaPdfText(pdfText, fileName);
+      if (!parsed?.movimientos?.length) {
+        parsed = await extractFinanceTextWithGemini(pdfText, fileName, input.caption || '');
+      }
+    } else {
+      parsed = await extractFinanceDocumentWithGemini(input.buffer, mimeType, fileName, input.caption || '');
+    }
   } else {
     parsed = await extractFinanceDocumentWithGemini(input.buffer, mimeType, fileName, input.caption || '');
   }
@@ -200,6 +210,167 @@ async function extractFinanceDocumentWithGemini(buffer: Buffer, mimeType: string
   const raw = response.text;
   if (!raw) throw new Error('Gemini no devolvió extracción financiera');
   return normalizeParsedDocument(JSON.parse(raw));
+}
+
+async function extractFinanceTextWithGemini(text: string, fileName: string, caption: string): Promise<ParsedFinanceDocument> {
+  const limitedText = text.slice(0, 55000);
+  const response = await ai.models.generateContent({
+    model: config.geminiModel(),
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: `${EXTRACT_PROMPT}\nArchivo: ${fileName}\nComentario del usuario: ${caption || '-'}\n\nTexto extraído del PDF/archivo:\n${limitedText}` }
+        ]
+      }
+    ],
+    config: {
+      responseMimeType: 'application/json',
+      responseSchema: documentSchema
+    }
+  });
+
+  const raw = response.text;
+  if (!raw) throw new Error('Gemini no devolvió extracción financiera desde texto');
+  return normalizeParsedDocument(JSON.parse(raw));
+}
+
+async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: string) {
+  if (!isPdfLike(fileName, mimeType)) return null;
+  try {
+    const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
+    const mod = await dynamicImport('pdf-parse');
+    const pdfParse = mod.default || mod;
+    const result = await pdfParse(buffer);
+    const text = clean(result?.text || '');
+    return text.length ? text : null;
+  } catch (error) {
+    console.error('No pude extraer texto del PDF con pdf-parse; uso fallback Gemini:', error);
+    return null;
+  }
+}
+
+function parseVisaGaliciaPdfText(text: string, fileName: string): ParsedFinanceDocument | null {
+  const normalized = text.replace(/\r/g, '\n');
+  const lower = norm(normalized);
+  if (!/detalle del consumo/.test(lower) || !/(visa|mastercard|master card)/.test(lower)) return null;
+
+  const tarjeta = /master\s*card|mastercard/i.test(normalized) ? 'Mastercard' : /visa/i.test(normalized) ? 'Visa' : null;
+  const proveedor = /galicia/i.test(normalized) || /cuenta:\s*\d+/i.test(normalized) ? 'Banco Galicia' : null;
+  const cuenta = clean(normalized.match(/N[°º]?\s*Cuenta:\s*([0-9]+)/i)?.[1]) || null;
+  const topDates = [...normalized.matchAll(/\b(\d{1,2})-([A-Za-zÁÉÍÓÚáéíóúÑñ]{3})-(\d{2})\b/g)].map(m => m[0]);
+  const fechaCierre = normalizeDateFromStatement(topDates[2] || topDates[topDates.length - 2] || null, null);
+  const fechaVencimiento = normalizeDateFromStatement(topDates[3] || topDates[topDates.length - 1] || null, fechaCierre);
+  const periodo = normalizePeriod(null, fechaCierre, fechaVencimiento);
+
+  const totalLine = normalized.match(/TOTAL\s+A\s+PAGAR[^\n\d-]*([\d.]+,\d{2})(?:\s+([\d.]+,\d{2}))?/i);
+  const totalPesos = totalLine ? parseAmountLoose(totalLine[1]) : firstLargeAmount(normalized);
+  const totalDolares = totalLine?.[2] ? parseAmountLoose(totalLine[2]) : null;
+  const pagoMinimo = parsePagoMinimo(normalized);
+  const movimientos = parseVisaDetailRows(normalized, fechaCierre || fechaVencimiento);
+
+  if (movimientos.length < 3) return null;
+  return normalizeParsedDocument({
+    es_resumen_financiero: true,
+    tipo_fuente: 'resumen_tarjeta_pdf',
+    proveedor,
+    cuenta,
+    tarjeta,
+    periodo,
+    fecha_cierre: fechaCierre,
+    fecha_vencimiento: fechaVencimiento,
+    total_pesos: totalPesos,
+    total_dolares: totalDolares,
+    pago_minimo: pagoMinimo,
+    movimientos
+  });
+}
+
+function parseVisaDetailRows(text: string, referenceDate: string | null): ImportedMovement[] {
+  const lines = text.split(/\n+/).map(l => l.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const out: ImportedMovement[] = [];
+  const rowRe = /^(\d{1,2}-\d{1,2}-\d{2})\s+(.+?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{6})\s+(-?[\d.]+,\d{2})(?:\s+(-?[\d.]+,\d{2}))?$/;
+
+  for (const line of lines) {
+    const m = line.match(rowRe);
+    if (!m) continue;
+    let desc = clean(m[2]);
+    if (/saldo anterior|total consumos|total a pagar|pago minimo|pago mínimo/i.test(desc)) continue;
+    if (/^\*\s*$/.test(desc) || /^K\s*$/i.test(desc)) continue;
+
+    const cuota = parseInstallment(m[3] || '');
+    const comprobante = m[4];
+    const amountA = parseAmountLoose(m[5]);
+    const amountB = m[6] ? parseAmountLoose(m[6]) : null;
+    const isUsd = /\bUSD\b|U\$S|D[ÓO]LAR/i.test(desc) || amountB !== null;
+    const amount = isUsd && amountB !== null ? amountB : amountA;
+    const moneda = isUsd ? 'USD' : 'ARS';
+    if (amount === null) continue;
+
+    desc = desc.replace(/^\*\s*/, '').replace(/^K\s+/i, 'K ').replace(/\s+USD\s+[\d.,]+/i, '').trim();
+    const fecha = normalizeDateFromStatement(m[1], referenceDate);
+    const categoriaRule = builtInRuleFor({ descripcion_original: desc, comercio: guessCommerce(desc), fecha, comprobante, monto: amount, moneda, tipo: 'gasto', cuota_actual: cuota.current, cuotas_totales: cuota.total, categoria_sugerida: null, subcategoria_sugerida: null, confianza: 0.55, raw: { line } });
+
+    out.push({
+      fecha,
+      descripcion_original: desc,
+      comercio: categoriaRule?.comercio || guessCommerce(desc),
+      comprobante,
+      monto: amount,
+      moneda,
+      tipo: normalizeMovementType('', desc),
+      cuota_actual: cuota.current,
+      cuotas_totales: cuota.total,
+      categoria_sugerida: categoriaRule?.categoria || null,
+      subcategoria_sugerida: categoriaRule?.subcategoria || null,
+      confianza: categoriaRule?.confianza || 0.55,
+      raw: { line, parser: 'visa_galicia_pdf_text' }
+    });
+  }
+
+  return out;
+}
+
+function normalizeDateFromStatement(value: string | null, referenceDate: string | null) {
+  if (!value) return null;
+  const s = clean(value);
+  const monthNames: Record<string, string> = {
+    ene: '01', jan: '01', feb: '02', mar: '03', abr: '04', apr: '04', may: '05', jun: '06', jul: '07', ago: '08', aug: '08', sep: '09', set: '09', oct: '10', nov: '11', dic: '12', dec: '12'
+  };
+  const named = s.match(/^(\d{1,2})-([A-Za-zÁÉÍÓÚáéíóúÑñ]{3})-(\d{2})$/);
+  if (named) {
+    const month = monthNames[norm(named[2]).slice(0, 3)] || null;
+    if (!month) return null;
+    return `20${named[3]}-${month}-${pad2(named[1])}`;
+  }
+  const numeric = s.match(/^(\d{1,2})-(\d{1,2})-(\d{2})$/);
+  if (numeric) {
+    const day = pad2(numeric[1]);
+    const month = pad2(numeric[2]);
+    let year = 2000 + Number(numeric[3]);
+    if (referenceDate) {
+      const refYear = Number(referenceDate.slice(0, 4));
+      const refMonth = Number(referenceDate.slice(5, 7));
+      const rowMonth = Number(month);
+      year = refYear;
+      if (refMonth <= 2 && rowMonth >= 11) year = refYear - 1;
+    }
+    return `${year}-${month}-${day}`;
+  }
+  return normalizeDate(s);
+}
+
+function firstLargeAmount(text: string) {
+  const m = text.match(/(\d{1,3}(?:\.\d{3})+,\d{2})/);
+  return m ? parseAmountLoose(m[1]) : null;
+}
+
+function parsePagoMinimo(text: string) {
+  const idx = norm(text).indexOf('pago minimo');
+  if (idx < 0) return null;
+  const slice = text.slice(idx, idx + 700);
+  const m = slice.match(/\$\s*([\d.]+,\d{2})/);
+  return m ? parseAmountLoose(m[1]) : null;
 }
 
 function parseCsvFinance(text: string, fileName: string): ParsedFinanceDocument {
@@ -916,6 +1087,10 @@ function findDateInText(text: string) {
 
 function isCsvLike(fileName: string, mimeType: string) {
   return /\.csv$|\.txt$/i.test(fileName) || /csv|text\/plain|excel|spreadsheet/i.test(mimeType);
+}
+
+function isPdfLike(fileName: string, mimeType: string) {
+  return /\.pdf$/i.test(fileName) || /application\/pdf/i.test(mimeType);
 }
 
 function normalizeMovementType(type: any, desc: string) {
