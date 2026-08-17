@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { supabase } from './supabaseClient.js';
+import { config } from './config.js';
+import { withGemini } from './geminiPool.js';
 
 
 export type ImportedMovement = {
@@ -82,13 +84,32 @@ export async function importFinanceFile(input: {
     const pdfText = await tryExtractPdfText(input.buffer, fileName, mimeType);
     if (pdfText && pdfText.length > 120) {
       parsed = parseVisaGaliciaPdfText(pdfText, fileName);
+      console.log(`Importador financiero PDF: texto local ${pdfText.length} chars; movimientos locales ${parsed?.movimientos?.length || 0}`);
+    } else {
+      console.log('Importador financiero PDF: no se pudo extraer texto local usable. Intento fallback Gemini.');
+    }
+
+    // Último recurso: si los extractores locales fallan o el parser no ve movimientos,
+    // usamos Gemini SOLO para convertir el resumen a JSON estructurado.
+    // Esto queda después de pdf-parse/pdf2json/pdfjs y usa el pool de keys con rotación.
+    if (!parsed?.movimientos?.length) {
+      parsed = await tryParseFinancePdfWithGemini(input.buffer, fileName, mimeType, input.caption || '');
+      if (parsed?.movimientos?.length) {
+        console.log(`Importador financiero PDF: fallback Gemini extrajo ${parsed.movimientos.length} movimientos.`);
+      }
     }
   } else {
     parsed = null;
   }
 
   if (!parsed?.es_resumen_financiero || !Array.isArray(parsed.movimientos) || !parsed.movimientos.length) {
-    return { recognized: false as const, duplicate: false };
+    return {
+      recognized: false as const,
+      duplicate: false,
+      reason: isPdfLike(fileName, mimeType)
+        ? 'No pude extraer movimientos del PDF con parser local ni con fallback Gemini. Subí el PDF exportado original o CSV/Excel del banco.'
+        : 'Formato financiero no reconocido.'
+    };
   }
 
   const importacion = await createImportation(parsed, {
@@ -484,7 +505,7 @@ function parseVisaDetailRows(text: string, referenceDate: string | null): Import
   const lines = text.split(/\n+/).map(l => l.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
 
   const arsRowRe = /^(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(.+?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{5,8})\s+(-?[\d.]+,\d{2})$/;
-  const usdRowRe = /^(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(.+?\bUSD)\s+(-?[\d.]+,\d{2})\s+(\d{5,8})\s+(-?[\d.]+,\d{2})$/i;
+  const usdRowRe = /^(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(.+?USD)\s+(-?[\d.]+,\d{2})\s+(\d{5,8})\s+(-?[\d.]+,\d{2})$/i;
 
   for (const line of lines) {
     const usd = line.match(usdRowRe);
@@ -511,7 +532,7 @@ function parseVisaDetailRows(text: string, referenceDate: string | null): Import
   const globalRe = /(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(?!SU\s+PAGO|TRANSFERENCIA|SALDO|TOTAL)(.{4,160}?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{5,8})\s+(-?\d{1,3}(?:\.\d{3})*,\d{2}|-?\d+,\d{2})(?=\s+\d{1,2}[-\/]\d{1,2}[-\/]\d{2}\s+|\s+TARJETA\s+\d+\s+Total|\s+TOTAL\s+A\s+PAGAR|$)/gi;
   for (const m of compact.matchAll(globalRe)) {
     const before = m[2] || '';
-    const usd = before.match(/(.+?\bUSD)\s+(-?[\d.]+,\d{2})\s*$/i);
+    const usd = before.match(/(.+?USD)\s+(-?[\d.]+,\d{2})\s*$/i);
     if (usd) {
       build(m[1], `${usd[1]} ${usd[2]}`, m[3] || '', m[4], m[5], 'USD', { text: m[0], parser: 'visa_galicia_global_usd' });
     } else {
@@ -533,7 +554,7 @@ function normalizeDateFromStatement(value: string | null, referenceDate: string 
     if (!month) return null;
     return `20${named[3]}-${month}-${pad2(named[1])}`;
   }
-  const numeric = s.match(/^(\d{1,2})-(\d{1,2})-(\d{2})$/);
+  const numeric = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2})$/);
   if (numeric) {
     const day = pad2(numeric[1]);
     const month = pad2(numeric[2]);
@@ -561,6 +582,88 @@ function parsePagoMinimo(text: string) {
   const slice = text.slice(idx, idx + 700);
   const m = slice.match(/\$\s*([\d.]+,\d{2})/);
   return m ? parseAmountLoose(m[1]) : null;
+}
+
+async function tryParseFinancePdfWithGemini(buffer: Buffer, fileName: string, mimeType: string, caption: string): Promise<ParsedFinanceDocument | null> {
+  if (!process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEYS && !process.env.GEMINI_API_KEY_2) return null;
+  if (buffer.length > 15 * 1024 * 1024) return null;
+
+  const prompt = [
+    'Extraé movimientos de este resumen de tarjeta o documento financiero.',
+    'Devolvé SOLO JSON válido. No uses markdown.',
+    'Estructura exacta:',
+    '{',
+    '  "es_resumen_financiero": true,',
+    '  "tipo_fuente": "resumen_tarjeta_pdf",',
+    '  "proveedor": "Banco Galicia" | null,',
+    '  "cuenta": string | null,',
+    '  "tarjeta": "Visa" | "Mastercard" | null,',
+    '  "periodo": "YYYY-MM" | null,',
+    '  "fecha_cierre": "YYYY-MM-DD" | null,',
+    '  "fecha_vencimiento": "YYYY-MM-DD" | null,',
+    '  "total_pesos": number | null,',
+    '  "total_dolares": number | null,',
+    '  "pago_minimo": number | null,',
+    '  "movimientos": [',
+    '    {',
+    '      "fecha": "YYYY-MM-DD",',
+    '      "descripcion_original": string,',
+    '      "comercio": string | null,',
+    '      "comprobante": string | null,',
+    '      "monto": number,',
+    '      "moneda": "ARS" | "USD",',
+    '      "tipo": "gasto" | "devolucion" | "impuesto" | "pago" | "movimiento",',
+    '      "cuota_actual": number | null,',
+    '      "cuotas_totales": number | null,',
+    '      "categoria_sugerida": string | null,',
+    '      "subcategoria_sugerida": string | null,',
+    '      "confianza": number',
+    '    }',
+    '  ]',
+    '}',
+    'Reglas:',
+    '- Extraé solo DETALLE DEL CONSUMO y cargos/impuestos relevantes del resumen, no textos legales.',
+    '- No incluyas SALDO ANTERIOR ni pagos de la tarjeta como gastos personales, salvo impuestos/cargos del resumen.',
+    '- Conservá consumos en USD como moneda USD y monto USD, no los conviertas a pesos.',
+    '- Si aparece OPENAI *CHATGPT, clasificalo como Suscripciones / Herramientas IA.',
+    '- Si aparece ANTHROPIC/CLAUDE, clasificalo como Suscripciones / Herramientas IA.',
+    '- Si hay cuota 02/09, cuota_actual=2 y cuotas_totales=9.',
+    caption ? `Caption del usuario: ${caption}` : '',
+    `Nombre de archivo: ${fileName}`
+  ].filter(Boolean).join('\n');
+
+  try {
+    const response = await withGemini(ai => ai.models.generateContent({
+      model: config.geminiModel(),
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: mimeType || 'application/pdf', data: buffer.toString('base64') } }
+          ]
+        }
+      ]
+    }), { operationName: 'importación financiera PDF' });
+
+    const jsonText = extractJsonObject(response.text || '');
+    if (!jsonText) return null;
+    const parsed = JSON.parse(jsonText);
+    const normalized = normalizeParsedDocument(parsed);
+    if (!normalized.movimientos.length) return null;
+    return normalized;
+  } catch (error: any) {
+    console.error('Fallback Gemini para importación financiera falló:', error?.message || error);
+    return null;
+  }
+}
+
+function extractJsonObject(text: string) {
+  const raw = String(text || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  return raw.slice(start, end + 1);
 }
 
 function parseCsvFinance(text: string, fileName: string): ParsedFinanceDocument {

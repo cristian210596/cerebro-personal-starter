@@ -554,10 +554,11 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       });
 
       const financeImportMessage = formatImportResult(financeImport);
+      const importReason = !financeImport.recognized && 'reason' in financeImport ? String((financeImport as any).reason || '') : '';
       return sendMessage(chatId, [
         financeImport.recognized ? 'Documento financiero importado.' : 'Documento financiero guardado, pero no pude extraer movimientos automáticamente.',
         stored.signedUrl ? `Archivo: ${stored.signedUrl}` : '',
-        financeImportMessage || 'No usé Gemini. Para este formato necesito parser específico o CSV/Excel exportado.'
+        financeImportMessage || importReason || 'No pude extraer movimientos de este formato. Probá con PDF exportado original o CSV/Excel.'
       ].filter(Boolean).join('\n\n'));
     }
 
