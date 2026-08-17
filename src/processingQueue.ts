@@ -136,6 +136,32 @@ async function processOneTask(task: any) {
         chatId: Number(task.chat_id || 0),
         archivoId: task.archivo_id || null
       });
+    } else if (task.tipo === 'media' || task.tipo === 'otro') {
+      // Documento/foto de tipo desconocido: primero intentamos sueldo, después comprobante.
+      // Esto evita que un recibo de haberes quede trabado como ticket/factura cuando Gemini está sin cuota.
+      const salary = await importSalaryReceiptFromFile({
+        buffer,
+        fileName: task.nombre_archivo,
+        mimeType: task.mime_type,
+        caption: task.caption || '',
+        chatId: Number(task.chat_id || 0),
+        archivoId: task.archivo_id || null,
+        force: false
+      });
+      if (salary?.recognized) {
+        result = { ...salary, routed_as: 'sueldo' };
+      } else {
+        const comprobante = await importComprobanteFromFile({
+          buffer,
+          fileName: task.nombre_archivo,
+          mimeType: task.mime_type,
+          caption: task.caption || '',
+          chatId: Number(task.chat_id || 0),
+          archivoId: task.archivo_id || null,
+          force: false
+        });
+        result = comprobante?.recognized ? { ...comprobante, routed_as: 'comprobante' } : { recognized: false, reason: 'No pude clasificar el archivo como sueldo ni comprobante.' };
+      }
     } else {
       throw new Error(`Tipo de cola no soportado: ${task.tipo}`);
     }

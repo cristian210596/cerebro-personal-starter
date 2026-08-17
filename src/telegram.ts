@@ -643,7 +643,7 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
     const shouldTryComprobante = media.kind === 'photo' || looksLikeComprobanteFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption);
     if (shouldTryComprobante) {
       try {
-        await sendMessage(chatId, 'Reviso si es ticket/factura/comprobante de compra...');
+        await sendMessage(chatId, media.kind === 'photo' ? 'Reviso si es recibo/ticket/factura/comprobante...' : 'Reviso si es ticket/factura/comprobante de compra...');
         const compResult = await importComprobanteFromFile({
           buffer: downloaded.buffer,
           fileName: media.fileName || `${media.kind}-${msg.message_id}`,
@@ -679,15 +679,43 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
         const compHint = looksLikeComprobanteFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption) || /ticket|factura|comprobante|coto|arredo|gallo/i.test(caption || '');
         const geminiQuota = /gemini sin cuota|quota|rate limit|resource_exhausted|429/i.test(msgText);
         if (geminiQuota || compHint) {
+          const queuedKind = compHint ? 'comprobante' : 'media';
+          const archivo = await saveArchivo({
+            item_id: null,
+            tipo_archivo: media.kind,
+            nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
+            mime_type: media.mimeType || downloaded.mimeType || null,
+            storage_url: stored.storageRef,
+            transcripcion: null,
+            descripcion_ia: queuedKind === 'media'
+              ? 'Archivo pendiente: no pude determinar si es sueldo/ticket/factura por cuota de Gemini.'
+              : 'Comprobante/ticket/factura pendiente de reprocesamiento por cuota de Gemini.'
+          });
+          try { await createNotionArchivoPage(archivo); } catch (error) { console.error('No se pudo sincronizar archivo en cola a Notion:', error); }
+          await enqueueProcessingTask({
+            kind: queuedKind as any,
+            chatId,
+            archivoId: archivo.id,
+            storageRef: stored.storageRef,
+            fileName: media.fileName || `${media.kind}-${msg.message_id}`,
+            mimeType: media.mimeType || downloaded.mimeType || 'application/octet-stream',
+            caption,
+            reason: 'gemini_cuota',
+            runAfterMinutes: 10,
+            payload: { origen: 'telegram_media', etapa: 'comprobante_check', generic_media: queuedKind === 'media' }
+          });
           return sendMessage(chatId, [
-            'Guardé el archivo, pero no pude extraer el ticket/factura automáticamente.',
+            queuedKind === 'media'
+              ? 'Guardé el archivo y lo dejé en cola porque Gemini está sin cuota. Todavía no lo marqué como ticket ni como recibo de sueldo.'
+              : 'Guardé el archivo y dejé el comprobante/ticket/factura en cola porque Gemini está sin cuota.',
             msgText ? `Detalle: ${msgText.slice(0, 300)}` : '',
             '',
-            'Revisá la rotación con:',
-            '/gemini estado',
-            '/gemini probar',
+            'Cuando se libere la cuota, procesalo con:',
+            '/cola procesar',
             '',
-            'Si es urgente, cargá el gasto manual y después vinculamos el comprobante.'
+            'Para revisar estado:',
+            '/cola',
+            '/gemini estado'
           ].filter(Boolean).join('\n'));
         }
       }
@@ -736,15 +764,41 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
         // NO seguimos al flujo genérico de "describir imagen". Eso consumía otra llamada Gemini
         // y devolvía un error confuso de "descripción de imagen".
         if (geminiQuota || salaryHint || media.kind === 'photo') {
+          const queuedKind = salaryHint ? 'sueldo' : 'media';
+          const archivo = await saveArchivo({
+            item_id: null,
+            tipo_archivo: media.kind,
+            nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
+            mime_type: media.mimeType || downloaded.mimeType || null,
+            storage_url: stored.storageRef,
+            transcripcion: null,
+            descripcion_ia: queuedKind === 'media'
+              ? 'Archivo pendiente: no pude determinar si es sueldo/ticket/factura por cuota de Gemini.'
+              : 'Recibo de sueldo pendiente de reprocesamiento por cuota de Gemini.'
+          });
+          try { await createNotionArchivoPage(archivo); } catch (error) { console.error('No se pudo sincronizar archivo de sueldo en cola a Notion:', error); }
+          await enqueueProcessingTask({
+            kind: queuedKind as any,
+            chatId,
+            archivoId: archivo.id,
+            storageRef: stored.storageRef,
+            fileName: media.fileName || `${media.kind}-${msg.message_id}`,
+            mimeType: media.mimeType || downloaded.mimeType || 'application/octet-stream',
+            caption,
+            reason: 'gemini_cuota',
+            runAfterMinutes: 10,
+            payload: { origen: 'telegram_media', etapa: 'salary_check', generic_media: queuedKind === 'media' }
+          });
           return sendMessage(chatId, [
-            'Guardé el archivo, pero no pude extraer el recibo de sueldo automáticamente.',
+            queuedKind === 'media'
+              ? 'Guardé el archivo y lo dejé en cola porque Gemini está sin cuota. Todavía no lo marqué como ticket ni como recibo de sueldo.'
+              : 'Guardé el archivo y dejé el recibo de sueldo en cola porque Gemini está sin cuota.',
             msgText ? `Detalle: ${msgText.slice(0, 300)}` : '',
             '',
-            'Revisá la rotación con:',
-            '/gemini estado',
-            '/gemini probar',
+            'Cuando se libere la cuota, procesalo con:',
+            '/cola procesar',
             '',
-            'Carga manual alternativa:',
+            'Carga manual alternativa si es urgente:',
             '/sueldo cargar periodo 2026-02 neto 3744369 bruto 4667076 empresa Dr Gray fecha 2026-03-05'
           ].filter(Boolean).join('\n'));
         }
