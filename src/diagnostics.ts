@@ -18,6 +18,8 @@ const EXPECTED_TABLES = [
   'finanzas_movimientos_importados',
   'finanzas_reglas_comercios',
   'finanzas_conciliaciones',
+  'sueldos_recibos',
+  'sueldos_conceptos',
   'pendientes'
 ];
 

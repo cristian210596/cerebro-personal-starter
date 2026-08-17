@@ -16,6 +16,8 @@ const BACKUP_TABLES_FOR_PING = [
   'finanzas_movimientos_importados',
   'finanzas_reglas_comercios',
   'finanzas_conciliaciones',
+  'sueldos_recibos',
+  'sueldos_conceptos',
   'pendientes'
 ];
 

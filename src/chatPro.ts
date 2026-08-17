@@ -13,13 +13,14 @@ export function looksLikeUniversalCorrection(text: string) {
 }
 
 export async function getLastSavedSnapshot(chatId?: string) {
-  const [items, archivos, pendientes, movimientos, deudas, memorias] = await Promise.all([
+  const [items, archivos, pendientes, movimientos, deudas, memorias, sueldos] = await Promise.all([
     queryLatest('items', chatId ? { telegram_chat_id: chatId } : undefined),
     queryLatest('archivos'),
     queryLatest('pendientes'),
     queryLatest('finanzas_movimientos'),
     queryLatest('finanzas_deudas'),
-    queryLatest('memorias')
+    queryLatest('memorias'),
+    queryLatest('sueldos_recibos')
   ]);
 
   const candidates = [
@@ -28,7 +29,8 @@ export async function getLastSavedSnapshot(chatId?: string) {
     pendientes ? { kind: 'pendiente', created_at: pendientes.created_at, row: pendientes } : null,
     movimientos ? { kind: 'movimiento financiero', created_at: movimientos.created_at, row: movimientos } : null,
     deudas ? { kind: 'deuda', created_at: deudas.created_at, row: deudas } : null,
-    memorias ? { kind: 'memoria', created_at: memorias.created_at, row: memorias } : null
+    memorias ? { kind: 'memoria', created_at: memorias.created_at, row: memorias } : null,
+    sueldos ? { kind: 'recibo de sueldo', created_at: sueldos.created_at, row: sueldos } : null
   ].filter(Boolean) as Array<{ kind: string; created_at: string; row: any }>;
 
   candidates.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
@@ -83,6 +85,11 @@ export function formatLastSaved(snapshot: Awaited<ReturnType<typeof getLastSaved
     lines.push('Dónde: Supabase/memorias');
     lines.push(`Categoría: ${row.categoria || '-'}`);
     lines.push(`Vigente: ${row.vigente ? 'sí' : 'no'}`);
+  } else if (kind === 'recibo de sueldo') {
+    lines.push(`Empresa: ${row.empresa || '-'}`);
+    lines.push('Dónde: Supabase/sueldos_recibos + finanzas_movimientos');
+    lines.push(`Período: ${row.periodo || '-'}`);
+    lines.push(`Neto: ${money(row.total_neto)}`);
   }
 
   lines.push('', 'Últimos registros por área:');
@@ -99,14 +106,15 @@ function shortLabel(row: any) {
 export async function unifiedSearch(query: string) {
   const q = norm(query);
   const tokens = q.split(/\s+/).filter(Boolean);
-  const [items, archivos, pendientes, movimientos, deudas, presupuestos, memorias] = await Promise.all([
+  const [items, archivos, pendientes, movimientos, deudas, presupuestos, memorias, sueldos] = await Promise.all([
     load('items', 80),
     load('archivos', 80, '*, items(titulo,categoria_principal,resumen,tags)'),
     load('pendientes', 80),
     load('finanzas_movimientos', 120),
     load('finanzas_deudas', 80),
     load('finanzas_presupuestos', 80),
-    load('memorias', 80)
+    load('memorias', 80),
+    load('sueldos_recibos', 80)
   ]);
 
   return {
@@ -117,7 +125,8 @@ export async function unifiedSearch(query: string) {
     movimientos: filterRows(movimientos, tokens, r => [r.descripcion, r.comercio, r.categoria_financiera, r.subcategoria_financiera, r.medio_pago, r.tarjeta, r.tipo, r.estado, r.fecha_movimiento]).slice(0, 5),
     deudas: filterRows(deudas, tokens, r => [r.persona, r.concepto, r.tipo, r.estado]).slice(0, 5),
     presupuestos: filterRows(presupuestos, tokens, r => [r.categoria_financiera, r.periodo, r.frecuencia, r.notas]).slice(0, 5),
-    memorias: filterRows(memorias, tokens, r => [r.afirmacion, r.categoria, r.confianza]).slice(0, 5)
+    memorias: filterRows(memorias, tokens, r => [r.afirmacion, r.categoria, r.confianza]).slice(0, 5),
+    sueldos: filterRows(sueldos, tokens, r => [r.empresa, r.empleado, r.periodo, r.estado, r.fecha_pago]).slice(0, 5)
   };
 }
 
@@ -144,6 +153,7 @@ export function formatUnifiedSearch(result: Awaited<ReturnType<typeof unifiedSea
   addSection(lines, 'Archivos', result.archivos, r => [`• ${r.nombre_archivo || '-'}`, `  ${r.tipo_archivo || '-'}${r.items?.titulo ? ` / ${r.items.titulo}` : ''}`]);
   addSection(lines, 'Presupuestos', result.presupuestos, r => [`• ${r.categoria_financiera || '-'} — ${money(r.monto_presupuestado)}`, `  ${r.periodo || '-'} / ${r.frecuencia || '-'}`]);
   addSection(lines, 'Memorias', result.memorias, r => [`• ${r.afirmacion || '-'}`, `  ${r.categoria || '-'} / ${r.confianza || '-'}`]);
+  addSection(lines, 'Sueldos', result.sueldos, r => [`• ${r.periodo || '-'} — ${r.empresa || '-'} — ${money(r.total_neto)}`, `  Bruto ${money(r.total_bruto)} / ${r.estado || '-'}`]);
 
   if (lines.length <= 2) return `Búsqueda unificada: ${result.query}\n\nSin resultados.`;
   return lines.join('\n').slice(0, 3900);

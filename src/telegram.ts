@@ -37,6 +37,7 @@ import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSyste
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
 import { classifyImportedMovementByIndex, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
+import { confirmLastSalaryReceipt, correctLastSalaryReceiptFromText, createManualSalaryReceiptFromText, formatSalaryConcepts, formatSalaryImportResult, formatSalaryList, formatSalaryReceipt, formatSalarySummary, getLastSalaryReceipt, getSalaryConcepts, importSalaryReceiptFromFile, listSalaryReceipts, looksLikeSalaryFile, looksLikeSalaryQueryText, summarizeSalaryFromText } from './salary.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -198,6 +199,14 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return handleReporteFinancieroCommand(chatId, command.args);
   }
 
+  if (command?.name === 'sueldos') {
+    return handleSueldosCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'sueldo') {
+    return handleSueldoCommand(chatId, command.args);
+  }
+
   if (command?.name === 'buscar') {
     const q = command.args;
     if (!q) return sendMessage(chatId, 'Usá: /buscar hplc lampara d2');
@@ -352,6 +361,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (looksLikeImportCommand(text)) {
     const handled = await handleImportNaturalText(chatId, text);
     if (handled) return;
+  }
+
+  if (looksLikeSalaryQueryText(text)) {
+    return handleSalaryReportCommand(chatId, text);
   }
 
   if (looksLikeFinanceAnalyticsText(text)) {
@@ -560,6 +573,54 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
         stored.signedUrl ? `Archivo: ${stored.signedUrl}` : '',
         financeImportMessage || importReason || 'No pude extraer movimientos de este formato. Probá con PDF exportado original o CSV/Excel.'
       ].filter(Boolean).join('\n\n'));
+    }
+
+    const shouldTrySalary = media.kind === 'photo' || looksLikeSalaryFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption);
+    if (shouldTrySalary) {
+      try {
+        await sendMessage(chatId, 'Reviso si es un recibo de sueldo...');
+        const salaryResult = await importSalaryReceiptFromFile({
+          buffer: downloaded.buffer,
+          fileName: media.fileName || `${media.kind}-${msg.message_id}`,
+          mimeType: media.mimeType || downloaded.mimeType || 'application/octet-stream',
+          caption,
+          chatId,
+          archivoId: null,
+          force: looksLikeSalaryFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption)
+        });
+
+        if (salaryResult.recognized) {
+          const archivo = await saveArchivo({
+            item_id: null,
+            tipo_archivo: media.kind,
+            nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
+            mime_type: media.mimeType || downloaded.mimeType || null,
+            storage_url: stored.storageRef,
+            transcripcion: null,
+            descripcion_ia: 'Recibo de sueldo importado.'
+          });
+          if (salaryResult.recibo?.id) {
+            await supabase.from('sueldos_recibos').update({ archivo_id: archivo.id, updated_at: new Date().toISOString() }).eq('id', salaryResult.recibo.id);
+          }
+          try { await createNotionArchivoPage(archivo); } catch (error) { console.error('No se pudo sincronizar archivo de sueldo a Notion:', error); }
+          return sendMessage(chatId, [
+            formatSalaryImportResult(salaryResult),
+            stored.signedUrl ? `\nArchivo: ${stored.signedUrl}` : ''
+          ].filter(Boolean).join('\n'));
+        }
+      } catch (error: any) {
+        console.error('No pude revisar/importar recibo de sueldo:', error);
+        const msgText = String(error?.message || '');
+        if (looksLikeSalaryFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption) || caption) {
+          return sendMessage(chatId, [
+            'Guardé el archivo, pero no pude extraer el recibo de sueldo automáticamente.',
+            msgText ? `Detalle: ${msgText.slice(0, 300)}` : '',
+            '',
+            'Carga manual alternativa:',
+            '/sueldo cargar periodo 2026-02 neto 3744369 bruto 4667076 empresa Dr Gray fecha 2026-03-05'
+          ].filter(Boolean).join('\n'));
+        }
+      }
     }
 
     if (media.kind === 'voice' || media.kind === 'audio') {
@@ -795,9 +856,13 @@ function introText() {
     '/finanzas',
     '/gastos visa',
     '/importaciones',
+    '/sueldos',
+    '/sueldo ultimo',
+    '/sueldo conceptos ultimo',
     '/importacion revisar',
     '/clasificar 1 Suscripciones guardar regla',
     '/reporte gasto chatgpt 2026',
+    'cuánto cobré este año',
     '/deudas',
     '/tarjetas',
     '/presupuesto supermercado 250000 mensual',
@@ -1172,6 +1237,70 @@ async function handleIgnorarImportadoCommand(chatId: number, args: string) {
   }
 }
 
+
+async function handleSueldosCommand(chatId: number, args: string) {
+  try {
+    const rows = await listSalaryReceipts(args || '', 20);
+    return sendMessage(chatId, formatSalaryList(rows, args ? `Sueldos: ${args}` : 'Sueldos cargados'));
+  } catch (error: any) {
+    console.error('No pude listar sueldos:', error);
+    return sendMessage(chatId, `No pude listar sueldos: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/salary_receipts.sql.`);
+  }
+}
+
+async function handleSueldoCommand(chatId: number, args: string) {
+  const a = removeAccents(String(args || '').trim().toLowerCase());
+  try {
+    if (!a || a.includes('ultimo') || a.includes('último')) {
+      if (a.includes('concepto')) {
+        const result = await getSalaryConcepts(args || 'ultimo');
+        return sendMessage(chatId, formatSalaryConcepts(result));
+      }
+      const row = await getLastSalaryReceipt();
+      return sendMessage(chatId, formatSalaryReceipt(row));
+    }
+
+    if (a.startsWith('conceptos') || a.includes('conceptos')) {
+      const result = await getSalaryConcepts(args);
+      return sendMessage(chatId, formatSalaryConcepts(result));
+    }
+
+    if (a.startsWith('confirmar')) {
+      const result = await confirmLastSalaryReceipt();
+      if (!result.ok) return sendMessage(chatId, result.message);
+      return sendMessage(chatId, `Recibo confirmado: ${result.recibo.periodo || '-'} — neto $${Number(result.recibo.total_neto || 0).toLocaleString('es-AR')}`);
+    }
+
+    if (a.startsWith('corregir')) {
+      const result = await correctLastSalaryReceiptFromText(args);
+      if (!result.ok) return sendMessage(chatId, result.message);
+      return sendMessage(chatId, `Recibo corregido: ${result.recibo.periodo || '-'} — neto $${Number(result.recibo.total_neto || 0).toLocaleString('es-AR')}`);
+    }
+
+    if (a.startsWith('cargar')) {
+      const result = await createManualSalaryReceiptFromText(chatId, args);
+      if (!result.ok) return sendMessage(chatId, result.message);
+      return sendMessage(chatId, formatSalaryImportResult(result.result));
+    }
+
+    return handleSalaryReportCommand(chatId, args);
+  } catch (error: any) {
+    console.error('No pude procesar comando sueldo:', error);
+    return sendMessage(chatId, `No pude procesar sueldo: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/salary_receipts.sql.`);
+  }
+}
+
+async function handleSalaryReportCommand(chatId: number, args: string) {
+  await sendMessage(chatId, 'Calculando reporte de sueldos...');
+  try {
+    const result = await summarizeSalaryFromText(args || 'este año');
+    return sendMessage(chatId, formatSalarySummary(result));
+  } catch (error: any) {
+    console.error('No pude calcular reporte de sueldos:', error);
+    return sendMessage(chatId, `No pude calcular reporte de sueldos: ${error?.message || 'error desconocido'}. Si acabás de instalar el parche, ejecutá supabase/salary_receipts.sql.`);
+  }
+}
+
 async function handleReporteFinancieroCommand(chatId: number, args: string) {
   const query = String(args || '').replace(/^gasto[s]?\s*/i, '').trim() || 'gastos';
   await sendMessage(chatId, 'Calculando reporte financiero...');
@@ -1199,7 +1328,7 @@ async function handleImportNaturalText(chatId: number, text: string) {
 
 async function handleEstadoCommand(chatId: number) {
   try {
-    const tables = ['items', 'entidades', 'memorias', 'archivos', 'finanzas_movimientos', 'finanzas_deudas', 'finanzas_particiones', 'finanzas_cierres', 'finanzas_presupuestos', 'finanzas_importaciones', 'finanzas_movimientos_importados', 'finanzas_reglas_comercios', 'finanzas_conciliaciones', 'pendientes'];
+    const tables = ['items', 'entidades', 'memorias', 'archivos', 'finanzas_movimientos', 'finanzas_deudas', 'finanzas_particiones', 'finanzas_cierres', 'finanzas_presupuestos', 'finanzas_importaciones', 'finanzas_movimientos_importados', 'finanzas_reglas_comercios', 'finanzas_conciliaciones', 'sueldos_recibos', 'sueldos_conceptos', 'pendientes'];
     const lines = ['Estado del cerebro', ''];
     for (const table of tables) {
       try {
@@ -1215,7 +1344,7 @@ async function handleEstadoCommand(chatId: number) {
     lines.push(`Supabase: activo`);
     lines.push(`Notion: ${config.notionToken() ? 'configurado' : 'sin token'}`);
     lines.push(`Gemini: ${config.geminiApiKey() ? 'configurado' : 'sin key'}`);
-    lines.push('', 'Comandos útiles: /backup, /buscar, /archivos, /finanzas, /gastos, /deudas, /tarjetas');
+    lines.push('', 'Comandos útiles: /backup, /buscar, /archivos, /finanzas, /gastos, /deudas, /tarjetas, /sueldos');
     return sendMessage(chatId, lines.join('\n'));
   } catch (error: any) {
     console.error('No pude generar estado:', error);
