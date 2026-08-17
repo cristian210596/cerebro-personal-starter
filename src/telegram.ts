@@ -33,6 +33,8 @@ import { correctLastFinanceMovement, deleteLastFinanceMovement, deleteLastItem, 
 import { deleteLastPending, formatPendingDone, formatPendingSaved, formatPendientes, listPendientes, looksLikePendingText, markPendingDone, savePendingFromText } from './pending.js';
 import { formatMaintenanceRunResult, formatMaintenanceStatus, getMaintenanceStatus, rememberTelegramChat, runScheduledMaintenance } from './maintenance.js';
 import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, formatDuplicateCleanup, formatLastSaved, formatPeriodSummary, formatUnifiedSearch, getLastSavedSnapshot, looksLikeLastSavedQuestion, looksLikeUniversalCorrection, unifiedSearch } from './chatPro.js';
+import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
+import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -104,6 +106,22 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (command?.name === 'estado') {
     return handleEstadoCommand(chatId);
+  }
+
+  if (command?.name === 'diagnostico' || command?.name === 'diagnóstico') {
+    return handleDiagnosticoCommand(chatId);
+  }
+
+  if (command?.name === 'test' && removeAccents(command.args || '').toLowerCase().includes('sistema')) {
+    return handleTestSistemaCommand(chatId);
+  }
+
+  if (command?.name === 'logs') {
+    return handleLogsCommand(chatId);
+  }
+
+  if (command?.name === 'revision' || command?.name === 'revisión') {
+    return handleRevisionCommand(chatId, command.args);
   }
 
   if (command?.name === 'supervivencia') {
@@ -230,6 +248,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (looksLikeLastSavedQuestion(text)) {
     return handleUltimoCommand(chatId);
+  }
+
+  if (looksLikeReviewRequest(text)) {
+    return handleRevisionCommand(chatId, text.replace(/^revisi[oó]n\s*/i, ''));
   }
 
   if (looksLikeBudgetText(text)) {
@@ -599,6 +621,11 @@ function introText() {
     '/entidades',
     '/entidad hplc',
     '/estado',
+    '/diagnostico',
+    '/test sistema',
+    '/logs',
+    '/revision hoy',
+    '/revision semana',
     '/stats',
     '/finanzas',
     '/gastos visa',
@@ -689,6 +716,50 @@ function formatStats(stats: any) {
 }
 
 
+
+
+async function handleDiagnosticoCommand(chatId: number) {
+  await sendMessage(chatId, 'Ejecutando diagnóstico...');
+  try {
+    const result = await buildDiagnostics();
+    return sendMessage(chatId, formatDiagnostics(result));
+  } catch (error: any) {
+    console.error('No pude ejecutar diagnóstico:', error);
+    return sendMessage(chatId, `No pude ejecutar diagnóstico: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleTestSistemaCommand(chatId: number) {
+  await sendMessage(chatId, 'Ejecutando autotest. Creo registros temporales y después los borro...');
+  try {
+    const result = await runSystemAutotest(chatId);
+    return sendMessage(chatId, formatSystemAutotest(result));
+  } catch (error: any) {
+    console.error('No pude ejecutar autotest:', error);
+    return sendMessage(chatId, `No pude ejecutar autotest: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleLogsCommand(chatId: number) {
+  try {
+    const logs = await getOperationalLogs();
+    return sendMessage(chatId, formatOperationalLogs(logs));
+  } catch (error: any) {
+    console.error('No pude obtener logs operativos:', error);
+    return sendMessage(chatId, `No pude obtener logs: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleRevisionCommand(chatId: number, args: string) {
+  await sendMessage(chatId, 'Armando revisión operativa...');
+  try {
+    const review = await buildOperationalReview(args || 'hoy');
+    return sendMessage(chatId, formatOperationalReview(review));
+  } catch (error: any) {
+    console.error('No pude armar revisión:', error);
+    return sendMessage(chatId, `No pude armar revisión: ${error?.message || 'error desconocido'}`);
+  }
+}
 
 async function handleUnifiedSearchCommand(chatId: number, query: string) {
   await sendMessage(chatId, 'Buscando en todo el cerebro...');
