@@ -36,6 +36,7 @@ import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, format
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
+import { classifyImportedMovementByIndex, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, summarizeFinanceAnalytics } from './financeImport.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -175,6 +176,26 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (command?.name === 'archivo') {
     return handleArchivoCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'importaciones') {
+    return handleImportacionesCommand(chatId);
+  }
+
+  if (command?.name === 'importacion' || command?.name === 'importación') {
+    return handleImportacionCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'clasificar') {
+    return handleClasificarImportadoCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'ignorar') {
+    return handleIgnorarImportadoCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'reporte') {
+    return handleReporteFinancieroCommand(chatId, command.args);
   }
 
   if (command?.name === 'buscar') {
@@ -326,6 +347,15 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (looksLikeReviewRequest(text)) {
     return handleRevisionCommand(chatId, text.replace(/^revisi[oó]n\s*/i, ''));
+  }
+
+  if (looksLikeImportCommand(text)) {
+    const handled = await handleImportNaturalText(chatId, text);
+    if (handled) return;
+  }
+
+  if (looksLikeFinanceAnalyticsText(text)) {
+    return handleReporteFinancieroCommand(chatId, text);
   }
 
   if (looksLikeBudgetText(text)) {
@@ -537,6 +567,26 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       console.error('No se pudo sincronizar archivo a Notion:', error);
     }
 
+    let financeImportMessage = '';
+    if (media.kind === 'document' && looksLikeFinanceFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption)) {
+      try {
+        await sendMessage(chatId, 'Parece un resumen/movimiento financiero. Importando y conciliando...');
+        const financeImport = await importFinanceFile({
+          buffer: downloaded.buffer,
+          fileName: media.fileName || `${media.kind}-${msg.message_id}`,
+          mimeType: media.mimeType || downloaded.mimeType || 'application/octet-stream',
+          caption,
+          chatId,
+          itemId: result.item.id,
+          archivoId: archivo.id
+        });
+        financeImportMessage = formatImportResult(financeImport);
+      } catch (error: any) {
+        console.error('No pude importar finanzas desde archivo:', error);
+        financeImportMessage = `No pude importar movimientos financieros: ${error?.message || 'error desconocido'}`;
+      }
+    }
+
     return sendMessage(chatId, [
       media.kind === 'voice' || media.kind === 'audio' ? 'Audio guardado.' : media.kind === 'photo' ? 'Foto guardada.' : 'Documento guardado.',
       '',
@@ -545,7 +595,8 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       `Tipo: ${result.clasificacion.tipo_item}`,
       `Tags: ${(result.clasificacion.tags || []).join(', ') || '-'}`,
       stored.signedUrl ? `Archivo: ${stored.signedUrl}` : '',
-      transcripcion ? `\nTranscripción: ${transcripcion.slice(0, 900)}` : ''
+      transcripcion ? `\nTranscripción: ${transcripcion.slice(0, 900)}` : '',
+      financeImportMessage ? `\n${financeImportMessage}` : ''
     ].filter(Boolean).join('\n'));
   } catch (error: any) {
     console.error('No se pudo procesar archivo Telegram:', error);
@@ -703,6 +754,10 @@ function introText() {
     '/stats',
     '/finanzas',
     '/gastos visa',
+    '/importaciones',
+    '/importacion revisar',
+    '/clasificar 1 Suscripciones guardar regla',
+    '/reporte gasto chatgpt 2026',
     '/deudas',
     '/tarjetas',
     '/presupuesto supermercado 250000 mensual',
@@ -998,9 +1053,104 @@ async function loadArchivosByItem(itemIds: string[]) {
 
 
 
+
+async function handleImportacionesCommand(chatId: number) {
+  try {
+    const rows = await listFinanceImports(10);
+    return sendMessage(chatId, formatImports(rows));
+  } catch (error: any) {
+    console.error('No pude listar importaciones:', error);
+    return sendMessage(chatId, `No pude listar importaciones: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleImportacionCommand(chatId: number, args: string) {
+  const a = removeAccents(args || '').toLowerCase();
+  try {
+    if (!a || a.includes('ultima') || a.includes('última')) {
+      const imp = await latestFinanceImport();
+      if (!imp) return sendMessage(chatId, 'No hay importaciones financieras todavía.');
+      const stats = await import('./financeImport.js').then(m => m.buildImportStats(imp.id));
+      const pending = await getPendingImportedMovements(5);
+      return sendMessage(chatId, [
+        'Última importación financiera',
+        '',
+        `Fuente: ${imp.proveedor || imp.tipo_fuente || '-'}`,
+        `Tarjeta: ${imp.tarjeta || '-'}`,
+        `Periodo: ${imp.periodo || '-'}`,
+        `Estado: ${imp.estado || '-'}`,
+        `Movimientos: ${stats.total || 0}`,
+        `Pendientes: ${stats.pendiente_revision || 0}`,
+        '',
+        pending.length ? formatPendingImported(pending.slice(0, 5)) : 'Sin pendientes de clasificación.'
+      ].join('\n'));
+    }
+    if (a.includes('revisar') || a.includes('pendiente')) {
+      const rows = await getPendingImportedMovements(12);
+      return sendMessage(chatId, formatPendingImported(rows));
+    }
+    return sendMessage(chatId, 'Usá: /importacion ultima o /importacion revisar');
+  } catch (error: any) {
+    console.error('No pude revisar importación:', error);
+    return sendMessage(chatId, `No pude revisar importación: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleClasificarImportadoCommand(chatId: number, args: string) {
+  const match = String(args || '').trim().match(/^(\d+)\s+(.+)$/);
+  if (!match) return sendMessage(chatId, 'Usá: /clasificar 1 Suscripciones guardar regla');
+  const index = Number(match[1]);
+  const text = match[2];
+  const saveRule = /guardar regla|siempre|recordar/i.test(text);
+  try {
+    const result = await classifyImportedMovementByIndex(index, text, saveRule);
+    return sendMessage(chatId, formatClassifyImportedResult(result));
+  } catch (error: any) {
+    console.error('No pude clasificar importado:', error);
+    return sendMessage(chatId, `No pude clasificar movimiento importado: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleIgnorarImportadoCommand(chatId: number, args: string) {
+  const match = String(args || '').trim().match(/^(?:importado\s+)?(\d+)$/i);
+  if (!match) return sendMessage(chatId, 'Usá: /ignorar importado 1');
+  try {
+    const result = await ignoreImportedMovementByIndex(Number(match[1]));
+    return sendMessage(chatId, formatIgnoreImportedResult(result));
+  } catch (error: any) {
+    console.error('No pude ignorar importado:', error);
+    return sendMessage(chatId, `No pude ignorar movimiento importado: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleReporteFinancieroCommand(chatId: number, args: string) {
+  const query = String(args || '').replace(/^gasto[s]?\s*/i, '').trim() || 'gastos';
+  await sendMessage(chatId, 'Calculando reporte financiero...');
+  try {
+    const report = await summarizeFinanceAnalytics(query);
+    return sendMessage(chatId, formatFinanceAnalyticsReport(report));
+  } catch (error: any) {
+    console.error('No pude calcular reporte financiero:', error);
+    return sendMessage(chatId, `No pude calcular reporte financiero: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleImportNaturalText(chatId: number, text: string) {
+  const t = removeAccents(text).toLowerCase();
+  if (t.includes('revisar') || t.includes('pendiente')) {
+    await handleImportacionCommand(chatId, 'revisar');
+    return true;
+  }
+  if (t.startsWith('/clasificar') || t.startsWith('clasificar ')) {
+    await handleClasificarImportadoCommand(chatId, text.replace(/^\/?clasificar\s*/i, ''));
+    return true;
+  }
+  return false;
+}
+
 async function handleEstadoCommand(chatId: number) {
   try {
-    const tables = ['items', 'entidades', 'memorias', 'archivos', 'finanzas_movimientos', 'finanzas_deudas', 'finanzas_particiones', 'finanzas_cierres', 'finanzas_presupuestos', 'pendientes'];
+    const tables = ['items', 'entidades', 'memorias', 'archivos', 'finanzas_movimientos', 'finanzas_deudas', 'finanzas_particiones', 'finanzas_cierres', 'finanzas_presupuestos', 'finanzas_importaciones', 'finanzas_movimientos_importados', 'finanzas_reglas_comercios', 'finanzas_conciliaciones', 'pendientes'];
     const lines = ['Estado del cerebro', ''];
     for (const table of tables) {
       try {

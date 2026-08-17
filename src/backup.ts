@@ -13,6 +13,10 @@ const TABLES = [
   'finanzas_particiones',
   'finanzas_cierres',
   'finanzas_presupuestos',
+  'finanzas_importaciones',
+  'finanzas_movimientos_importados',
+  'finanzas_reglas_comercios',
+  'finanzas_conciliaciones',
   'pendientes'
 ];
 
