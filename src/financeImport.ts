@@ -121,14 +121,37 @@ export async function importFinanceFile(input: {
 async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: string) {
   if (!isPdfLike(fileName, mimeType)) return null;
 
-  // 1) Camino más estable en Vercel: pdf-parse interno.
-  // Importar "pdf-parse" a secas puede disparar código de test en algunos entornos.
-  const parseText = await tryExtractPdfTextWithPdfParse(buffer);
-  if (parseText && parseText.length > 80) return parseText;
+  // Importante: esto NO usa Gemini. Son extractores locales en Node/Vercel.
+  // Se prueban varios motores porque los resúmenes bancarios suelen romper uno u otro
+  // según cómo esté generado el PDF.
+  const attempts: Array<[string, () => Promise<string | null>]> = [
+    ['pdf-parse', () => tryExtractPdfTextWithPdfParse(buffer)],
+    ['pdf2json-layout', () => tryExtractPdfTextWithPdf2Json(buffer)],
+    ['pdfjs-layout', () => tryExtractPdfTextWithPdfJs(buffer)]
+  ];
 
-  // 2) Fallback: PDF.js con layout. Útil cuando pdf-parse mezcla columnas.
-  const pdfjsText = await tryExtractPdfTextWithPdfJs(buffer);
-  if (pdfjsText && pdfjsText.length > 80) return pdfjsText;
+  let best: string | null = null;
+  for (const [name, fn] of attempts) {
+    try {
+      const text = await fn();
+      if (!text || text.length < 60) continue;
+      const cleaned = cleanPdfText(text);
+      if (!best || cleaned.length > best.length) best = cleaned;
+
+      // Si ya parece resumen de tarjeta, no seguimos: priorizamos velocidad.
+      if (/detalle\s+del\s+consumo/i.test(cleaned) && /(visa|master\s*card|mastercard|galicia)/i.test(cleaned)) {
+        console.log(`PDF financiero: texto extraído con ${name}. Caracteres: ${cleaned.length}`);
+        return cleaned;
+      }
+    } catch (error: any) {
+      console.error(`Extractor PDF ${name} falló:`, error?.message || error);
+    }
+  }
+
+  if (best && best.length > 120) {
+    console.log(`PDF financiero: uso mejor extracción disponible. Caracteres: ${best.length}`);
+    return best;
+  }
 
   return null;
 }
@@ -138,6 +161,8 @@ async function tryExtractPdfTextWithPdfParse(buffer: Buffer) {
     const require = createRequire(import.meta.url);
     let pdfParse: any = null;
 
+    // pdf-parse 1.1.1 expone este archivo interno estable. Si no existe,
+    // usamos el entrypoint normal. Todo queda en try/catch para no bloquear.
     try {
       pdfParse = require('pdf-parse/lib/pdf-parse.js');
     } catch (_) {
@@ -153,16 +178,139 @@ async function tryExtractPdfTextWithPdfParse(buffer: Buffer) {
     const text = cleanPdfText(result?.text || '');
     return text.length ? text : null;
   } catch (error: any) {
-    console.error('No pude extraer texto del PDF con pdf-parse interno; sigo con fallback:', error?.message || error);
+    console.error('No pude extraer texto del PDF con pdf-parse; sigo con fallback:', error?.message || error);
     return null;
   }
 }
+
+async function tryExtractPdfTextWithPdf2Json(buffer: Buffer) {
+  try {
+    const require = createRequire(import.meta.url);
+    let mod: any = null;
+    try {
+      mod = require('pdf2json');
+    } catch (_) {
+      mod = null;
+    }
+    if (!mod) return null;
+
+    const PDFParser = mod.PDFParser || mod.default || mod;
+    if (!PDFParser) return null;
+
+    const text = await new Promise<string | null>((resolve) => {
+      let done = false;
+      const finish = (value: string | null) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish(null), 18_000);
+
+      try {
+        const parser = new PDFParser(null, 1);
+        parser.on('pdfParser_dataError', (errData: any) => {
+          console.error('pdf2json error:', errData?.parserError || errData);
+          finish(null);
+        });
+        parser.on('pdfParser_dataReady', (pdfData: any) => {
+          const pages = pdfData?.Pages || pdfData?.formImage?.Pages || [];
+          const pageTexts = Array.isArray(pages) ? pages.map((page: any) => layoutPdf2JsonTexts(page?.Texts || [])).filter(Boolean) : [];
+          finish(cleanPdfText(pageTexts.join('\n\f\n')) || null);
+        });
+        parser.parseBuffer(buffer);
+      } catch (error: any) {
+        console.error('pdf2json parseBuffer falló:', error?.message || error);
+        finish(null);
+      }
+    });
+
+    return text && text.length ? text : null;
+  } catch (error: any) {
+    console.error('No pude extraer texto del PDF con pdf2json:', error?.message || error);
+    return null;
+  }
+}
+
+function layoutPdf2JsonTexts(texts: any[]) {
+  const items = (Array.isArray(texts) ? texts : [])
+    .map((item: any) => {
+      const str = (Array.isArray(item?.R) ? item.R : [])
+        .map((r: any) => decodePdf2JsonText(r?.T || ''))
+        .join('')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return {
+        x: Number(item?.x || 0),
+        y: Number(item?.y || 0),
+        str,
+        width: Number(item?.w || item?.sw || 0)
+      };
+    })
+    .filter((item: any) => item.str);
+
+  items.sort((a: any, b: any) => Math.abs(a.y - b.y) > 0.35 ? a.y - b.y : a.x - b.x);
+
+  const rows: any[][] = [];
+  for (const item of items) {
+    let row = rows.find(r => Math.abs(r[0].y - item.y) <= 0.32);
+    if (!row) {
+      row = [];
+      rows.push(row);
+    }
+    row.push(item);
+  }
+
+  return rows.map(row => {
+    row.sort((a, b) => a.x - b.x);
+    let line = '';
+    let prevRight: number | null = null;
+    for (const item of row) {
+      if (!line) {
+        line = item.str;
+      } else {
+        const gap = prevRight === null ? 0 : item.x - prevRight;
+        const spaces = gap > 7 ? '     ' : gap > 3.5 ? '   ' : ' ';
+        line += spaces + item.str;
+      }
+      prevRight = item.x + Math.max(item.width || 0, item.str.length * 0.22);
+    }
+    return line.replace(/\s+$/g, '');
+  }).filter(Boolean).join('\n');
+}
+
+function decodePdf2JsonText(value: string) {
+  const raw = String(value || '');
+  try {
+    return decodeURIComponent(raw);
+  } catch (_) {
+    try {
+      return decodeURIComponent(raw.replace(/%(?![0-9A-Fa-f]{2})/g, '%25'));
+    } catch (__){
+      return raw;
+    }
+  }
+}
+
 async function tryExtractPdfTextWithPdfJs(buffer: Buffer) {
   try {
-    const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
-    const pdfjsLib = await dynamicImport('pdfjs-dist/legacy/build/pdf.mjs');
+    const require = createRequire(import.meta.url);
+    let pdfjsLib: any = null;
 
-    // Evita worker externo en Vercel/serverless.
+    // pdfjs-dist v3: CommonJS estable para Node/Vercel.
+    try {
+      pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+    } catch (_) {
+      // pdfjs-dist v4+: ESM.
+      try {
+        const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
+        pdfjsLib = await dynamicImport('pdfjs-dist/legacy/build/pdf.mjs');
+      } catch (__){
+        pdfjsLib = null;
+      }
+    }
+
+    if (!pdfjsLib) return null;
     if (pdfjsLib.GlobalWorkerOptions) {
       pdfjsLib.GlobalWorkerOptions.workerSrc = '';
     }

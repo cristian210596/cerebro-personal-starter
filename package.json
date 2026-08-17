@@ -20,7 +20,8 @@
     "jszip": "^3.10.1",
     "postgres": "latest",
     "pdf-parse": "1.1.1",
-    "pdfjs-dist": "4.10.38"
+    "pdfjs-dist": "3.11.174",
+    "pdf2json": "3.1.6"
   },
   "devDependencies": {
     "@types/node": "22.15.30",
