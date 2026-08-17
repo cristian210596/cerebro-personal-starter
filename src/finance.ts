@@ -1,9 +1,9 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { Type } from '@google/genai';
 import { config } from './config.js';
+import { withGemini } from './geminiPool.js';
 import { supabase, saveItem } from './supabaseClient.js';
 import type { Clasificacion, EntidadClasificada, ItemInsert } from './types.js';
 
-const ai = new GoogleGenAI({ apiKey: config.geminiApiKey() });
 
 export type FinanceParse = {
   es_finanza: boolean;
@@ -136,14 +136,14 @@ export function looksLikeFinanceText(text: string) {
 }
 
 export async function parseFinanceText(text: string): Promise<FinanceParse> {
-  const response = await ai.models.generateContent({
+  const response = await withGemini(ai => ai.models.generateContent({
     model: config.geminiModel(),
     contents: `${FINANCE_PROMPT}\n\nMensaje:\n${text}`,
     config: {
       responseMimeType: 'application/json',
       responseSchema: financeSchema
     }
-  });
+  }), { operationName: 'parser financiero' });
 
   const raw = response.text;
   if (!raw) throw new Error('Gemini no devolvió texto financiero');

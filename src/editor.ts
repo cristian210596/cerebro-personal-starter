@@ -1,8 +1,8 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { Type } from '@google/genai';
 import { config } from './config.js';
+import { withGemini } from './geminiPool.js';
 import type { EntidadClasificada } from './types.js';
 
-const ai = new GoogleGenAI({ apiKey: config.geminiApiKey() });
 
 export type ItemEditChanges = {
   titulo?: string | null;
@@ -104,7 +104,7 @@ export async function parseEditInstruction(instruction: string, currentItem: any
 
   let raw = '';
   try {
-    const response = await ai.models.generateContent({
+    const response = await withGemini(ai => ai.models.generateContent({
       model: config.geminiModel(),
       contents: `${editPrompt}
 
@@ -117,7 +117,7 @@ ${instruction}`,
         responseMimeType: 'application/json',
         responseSchema: editSchema
       }
-    });
+    }), { operationName: 'edición' });
     raw = response.text || '';
   } catch (error: any) {
     if (String(error?.message || '').includes('429') || String(error?.status || '') === '429') {

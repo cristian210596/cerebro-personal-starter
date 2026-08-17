@@ -1,8 +1,8 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { Type } from '@google/genai';
 import { config } from './config.js';
+import { withGemini } from './geminiPool.js';
 import type { Clasificacion } from './types.js';
 
-const ai = new GoogleGenAI({ apiKey: config.geminiApiKey() });
 
 const schema = {
   type: Type.OBJECT,
@@ -87,14 +87,14 @@ Equipo; Código de equipo; Marca; Modelo; Componente; Persona; Empresa; Producto
 `;
 
 export async function classifyText(text: string): Promise<Clasificacion> {
-  const response = await ai.models.generateContent({
+  const response = await withGemini(ai => ai.models.generateContent({
     model: config.geminiModel(),
     contents: `${systemPrompt}\n\nMensaje a clasificar:\n${text}`,
     config: {
       responseMimeType: 'application/json',
       responseSchema: schema
     }
-  });
+  }), { operationName: 'clasificación' });
 
   const raw = response.text;
   if (!raw) throw new Error('Gemini no devolvió texto');

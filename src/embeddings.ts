@@ -1,16 +1,14 @@
-import { GoogleGenAI } from '@google/genai';
 import { config } from './config.js';
-
-const ai = new GoogleGenAI({ apiKey: config.geminiApiKey() });
+import { withGemini } from './geminiPool.js';
 
 export async function embedText(text: string): Promise<number[]> {
   const clean = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 6000);
   if (!clean) return [];
 
-  const response: any = await ai.models.embedContent({
+  const response: any = await withGemini(ai => ai.models.embedContent({
     model: config.geminiEmbeddingModel(),
     contents: clean
-  } as any);
+  } as any), { operationName: 'embeddings' });
 
   const values = response?.embeddings?.[0]?.values || response?.embedding?.values || response?.values || [];
   return Array.isArray(values) ? values.map(Number).filter(Number.isFinite) : [];

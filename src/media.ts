@@ -1,7 +1,5 @@
-import { GoogleGenAI } from '@google/genai';
 import { config } from './config.js';
-
-const ai = new GoogleGenAI({ apiKey: config.geminiApiKey() });
+import { withGemini } from './geminiPool.js';
 
 export type TelegramFileInfo = {
   fileId: string;
@@ -13,7 +11,7 @@ export type TelegramFileInfo = {
 };
 
 export async function transcribeAudio(buffer: Buffer, mimeType = 'audio/ogg') {
-  const response = await ai.models.generateContent({
+  const response = await withGemini(ai => ai.models.generateContent({
     model: config.geminiModel(),
     contents: [
       {
@@ -24,13 +22,13 @@ export async function transcribeAudio(buffer: Buffer, mimeType = 'audio/ogg') {
         ]
       }
     ]
-  });
+  }), { operationName: 'transcripción de audio' });
 
   return (response.text || '').trim();
 }
 
 export async function describeImage(buffer: Buffer, mimeType = 'image/jpeg', caption = '') {
-  const response = await ai.models.generateContent({
+  const response = await withGemini(ai => ai.models.generateContent({
     model: config.geminiModel(),
     contents: [
       {
@@ -46,7 +44,7 @@ export async function describeImage(buffer: Buffer, mimeType = 'image/jpeg', cap
         ]
       }
     ]
-  });
+  }), { operationName: 'descripción de imagen' });
 
   return (response.text || '').trim();
 }
