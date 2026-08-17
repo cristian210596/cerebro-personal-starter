@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { supabase } from './supabaseClient.js';
 
 
@@ -120,25 +121,42 @@ export async function importFinanceFile(input: {
 async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: string) {
   if (!isPdfLike(fileName, mimeType)) return null;
 
-  // 1) PDF.js con layout: es el camino principal para resúmenes de tarjeta.
-  // pdf-parse suele mezclar columnas y puede romper filas de Visa/Galicia.
-  const pdfjsText = await tryExtractPdfTextWithPdfJs(buffer);
-  if (pdfjsText && pdfjsText.length > 120) return pdfjsText;
+  // 1) Camino más estable en Vercel: pdf-parse interno.
+  // Importar "pdf-parse" a secas puede disparar código de test en algunos entornos.
+  const parseText = await tryExtractPdfTextWithPdfParse(buffer);
+  if (parseText && parseText.length > 80) return parseText;
 
-  // 2) Fallback a pdf-parse si PDF.js no está disponible. No usa Gemini.
+  // 2) Fallback: PDF.js con layout. Útil cuando pdf-parse mezcla columnas.
+  const pdfjsText = await tryExtractPdfTextWithPdfJs(buffer);
+  if (pdfjsText && pdfjsText.length > 80) return pdfjsText;
+
+  return null;
+}
+
+async function tryExtractPdfTextWithPdfParse(buffer: Buffer) {
   try {
-    const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
-    const mod = await dynamicImport('pdf-parse');
-    const pdfParse = mod.default || mod;
-    const result = await pdfParse(buffer);
+    const require = createRequire(import.meta.url);
+    let pdfParse: any = null;
+
+    try {
+      pdfParse = require('pdf-parse/lib/pdf-parse.js');
+    } catch (_) {
+      try {
+        pdfParse = require('pdf-parse');
+      } catch (__){
+        pdfParse = null;
+      }
+    }
+
+    if (!pdfParse) return null;
+    const result = await pdfParse(buffer, { max: 0 });
     const text = cleanPdfText(result?.text || '');
     return text.length ? text : null;
   } catch (error: any) {
-    console.error('No pude extraer texto del PDF con pdf-parse; no se usa Gemini para importaciones:', error?.message || error);
+    console.error('No pude extraer texto del PDF con pdf-parse interno; sigo con fallback:', error?.message || error);
     return null;
   }
 }
-
 async function tryExtractPdfTextWithPdfJs(buffer: Buffer) {
   try {
     const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
@@ -262,81 +280,99 @@ function parseVisaGaliciaPdfText(text: string, fileName: string): ParsedFinanceD
 }
 
 function parseVisaDetailRows(text: string, referenceDate: string | null): ImportedMovement[] {
-  const lines = text.split(/\n+/).map(l => l.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
   const out: ImportedMovement[] = [];
+  const seen = new Set<string>();
 
-  // Fila típica ARS:
-  // 10-06-25 * BAZAR AVENIDA_CS 07/12 003947 67.833,78
-  const arsRowRe = /^(\d{1,2}-\d{1,2}-\d{2})\s+(.+?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{6})\s+(-?[\d.]+,\d{2})$/;
+  const push = (m: ImportedMovement) => {
+    if (!m.descripcion_original || m.monto === null) return;
+    const d = norm(m.descripcion_original);
+    if (/saldo anterior|total consumos|total a pagar|pago minimo|pago mínimo|transferencia deuda|su pago en pesos|limites|l[ií]mites|tasas|consolidado/.test(d)) return;
+    const key = [m.fecha || '', m.comprobante || '', Math.round(Number(m.monto || 0) * 100), m.moneda, normalizeMerchantText(m.descripcion_original)].join('|');
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(m);
+  };
 
-  // Fila típica USD en Galicia/Visa: aparece un importe USD antes del comprobante y otro en columna dólares.
-  // 27-12-25 K OPENAI *CHATGPT ... USD 20,00 586455 20,00
-  const usdRowRe = /^(\d{1,2}-\d{1,2}-\d{2})\s+(.+?\bUSD)\s+(-?[\d.]+,\d{2})\s+(\d{6})\s+(-?[\d.]+,\d{2})$/i;
-
-  for (const line of lines) {
-    let parsed: null | { dateRaw: string; descRaw: string; cuotaRaw: string; comprobante: string; amount: number | null; moneda: string } = null;
-
-    const usd = line.match(usdRowRe);
-    if (usd) {
-      parsed = {
-        dateRaw: usd[1],
-        descRaw: clean(`${usd[2]} ${usd[3]}`),
-        cuotaRaw: '',
-        comprobante: usd[4],
-        amount: parseAmountLoose(usd[5]),
-        moneda: 'USD'
-      };
-    } else {
-      const ars = line.match(arsRowRe);
-      if (ars) {
-        parsed = {
-          dateRaw: ars[1],
-          descRaw: clean(ars[2]),
-          cuotaRaw: ars[3] || '',
-          comprobante: ars[4],
-          amount: parseAmountLoose(ars[5]),
-          moneda: 'ARS'
-        };
-      }
-    }
-
-    if (!parsed) continue;
-    let desc = clean(parsed.descRaw);
-    if (/saldo anterior|total consumos|total a pagar|pago minimo|pago mínimo|transferencia deuda|su pago en pesos/i.test(desc)) continue;
-    if (/^\*\s*$/.test(desc) || /^K\s*$/i.test(desc)) continue;
-    if (parsed.amount === null) continue;
-
-    const cuota = parseInstallment(parsed.cuotaRaw || '');
+  const build = (dateRaw: string, descRaw: string, cuotaRaw: string, comprobante: string, amountRaw: string, moneda: string, raw: any) => {
+    let desc = clean(descRaw);
+    if (/^\*\s*$/.test(desc) || /^K\s*$/i.test(desc)) return;
+    const cuota = parseInstallment(cuotaRaw || '');
     desc = desc
       .replace(/^\*\s*/, '')
       .replace(/^K\s+/i, 'K ')
       .replace(/\s+USD\s+[\d.,]+$/i, '')
       .replace(/\s+/g, ' ')
       .trim();
+    const fecha = normalizeDateFromStatement(dateRaw, referenceDate);
+    const monto = parseAmountLoose(amountRaw);
+    if (monto === null) return;
 
-    const fecha = normalizeDateFromStatement(parsed.dateRaw, referenceDate);
-    const categoriaRule = builtInRuleFor({ descripcion_original: desc, comercio: guessCommerce(desc), fecha, comprobante: parsed.comprobante, monto: parsed.amount, moneda: parsed.moneda, tipo: 'gasto', cuota_actual: cuota.current, cuotas_totales: cuota.total, categoria_sugerida: null, subcategoria_sugerida: null, confianza: 0.55, raw: { line } });
-
-    out.push({
+    const base: ImportedMovement = {
       fecha,
       descripcion_original: desc,
-      comercio: categoriaRule?.comercio || guessCommerce(desc),
-      comprobante: parsed.comprobante,
-      monto: parsed.amount,
-      moneda: parsed.moneda,
+      comercio: guessCommerce(desc),
+      comprobante: clean(comprobante) || null,
+      monto,
+      moneda,
       tipo: normalizeMovementType('', desc),
       cuota_actual: cuota.current,
       cuotas_totales: cuota.total,
-      categoria_sugerida: categoriaRule?.categoria || null,
-      subcategoria_sugerida: categoriaRule?.subcategoria || null,
-      confianza: categoriaRule?.confianza || 0.55,
-      raw: { line, parser: 'visa_galicia_pdf_text_layout' }
+      categoria_sugerida: null,
+      subcategoria_sugerida: null,
+      confianza: 0.55,
+      raw
+    };
+    const rule = builtInRuleFor(base);
+    push({
+      ...base,
+      comercio: rule?.comercio || base.comercio,
+      categoria_sugerida: rule?.categoria || null,
+      subcategoria_sugerida: rule?.subcategoria || null,
+      confianza: rule?.confianza || base.confianza
     });
+  };
+
+  // Parser por línea para textos bien extraídos.
+  const lines = text.split(/\n+/).map(l => l.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
+
+  const arsRowRe = /^(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(.+?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{5,8})\s+(-?[\d.]+,\d{2})$/;
+  const usdRowRe = /^(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(.+?\bUSD)\s+(-?[\d.]+,\d{2})\s+(\d{5,8})\s+(-?[\d.]+,\d{2})$/i;
+
+  for (const line of lines) {
+    const usd = line.match(usdRowRe);
+    if (usd) {
+      build(usd[1], `${usd[2]} ${usd[3]}`, '', usd[4], usd[5], 'USD', { line, parser: 'visa_galicia_line_usd' });
+      continue;
+    }
+    const ars = line.match(arsRowRe);
+    if (ars) {
+      build(ars[1], ars[2], ars[3] || '', ars[4], ars[5], 'ARS', { line, parser: 'visa_galicia_line_ars' });
+    }
+  }
+
+  // Parser global tolerante: funciona aunque el extractor inserte saltos de línea entre columnas.
+  // Acota el bloque de detalle para no leer textos legales o totales.
+  const lower = norm(text);
+  const startIdx = lower.indexOf('detalle del consumo');
+  let detail = startIdx >= 0 ? text.slice(startIdx) : text;
+  const endMarkers = ['tarjeta 1425 total consumos', 'total consumos de', 'total a pagar', 'plan v:'];
+  const endPositions = endMarkers.map(m => norm(detail).indexOf(m)).filter(i => i > 0);
+  if (endPositions.length) detail = detail.slice(0, Math.min(...endPositions));
+
+  const compact = detail.replace(/\r/g, '\n').replace(/[ \t]+/g, ' ').replace(/\n+/g, ' ');
+  const globalRe = /(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(?!SU\s+PAGO|TRANSFERENCIA|SALDO|TOTAL)(.{4,160}?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{5,8})\s+(-?\d{1,3}(?:\.\d{3})*,\d{2}|-?\d+,\d{2})(?=\s+\d{1,2}[-\/]\d{1,2}[-\/]\d{2}\s+|\s+TARJETA\s+\d+\s+Total|\s+TOTAL\s+A\s+PAGAR|$)/gi;
+  for (const m of compact.matchAll(globalRe)) {
+    const before = m[2] || '';
+    const usd = before.match(/(.+?\bUSD)\s+(-?[\d.]+,\d{2})\s*$/i);
+    if (usd) {
+      build(m[1], `${usd[1]} ${usd[2]}`, m[3] || '', m[4], m[5], 'USD', { text: m[0], parser: 'visa_galicia_global_usd' });
+    } else {
+      build(m[1], before, m[3] || '', m[4], m[5], 'ARS', { text: m[0], parser: 'visa_galicia_global_ars' });
+    }
   }
 
   return out;
 }
-
 function normalizeDateFromStatement(value: string | null, referenceDate: string | null) {
   if (!value) return null;
   const s = clean(value);
@@ -367,7 +403,7 @@ function normalizeDateFromStatement(value: string | null, referenceDate: string 
 }
 
 function firstLargeAmount(text: string) {
-  const m = text.match(/(\d{1,3}(?:\.\d{3})+,\d{2})/);
+  const m = text.match(/\b(\d{1,3}(?:\.\d{3})+,\d{2})\b/);
   return m ? parseAmountLoose(m[1]) : null;
 }
 
