@@ -24,6 +24,7 @@ import {
 } from './supabaseClient.js';
 import { createNotionArchivoPage, createNotionItemPage, syncNotionDerivedForItem, syncNotionFinanceResult, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
+import { getGeminiPoolStatus, testGeminiPoolOnce } from './geminiPool.js';
 import { parseEditInstruction } from './editor.js';
 import { generateBackupZip } from './backup.js';
 import { buildDocumentText, describeImage, transcribeAudio, type TelegramFileInfo } from './media.js';
@@ -145,6 +146,11 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (command?.name === 'router') {
     await sendMessage(chatId, 'Router antibasura activo v2. Frases como "Qué puedo hacer?", "Eliminar ese último" y "No guardes eso" no deben guardarse como items.');
     return;
+  }
+
+
+  if (command?.name === 'gemini') {
+    return handleGeminiCommand(chatId, command.args);
   }
 
   if (command?.name === 'estado') {
@@ -611,10 +617,20 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       } catch (error: any) {
         console.error('No pude revisar/importar recibo de sueldo:', error);
         const msgText = String(error?.message || '');
-        if (looksLikeSalaryFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption) || caption) {
+        const salaryHint = looksLikeSalaryFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption) || /recibo|haberes|sueldo|liquidaci[oó]n/i.test(caption || '');
+        const geminiQuota = /gemini sin cuota|quota|rate limit|resource_exhausted|429/i.test(msgText);
+
+        // Importante: si ya intentamos procesar una foto como posible recibo y falló por cuota,
+        // NO seguimos al flujo genérico de "describir imagen". Eso consumía otra llamada Gemini
+        // y devolvía un error confuso de "descripción de imagen".
+        if (geminiQuota || salaryHint || media.kind === 'photo') {
           return sendMessage(chatId, [
             'Guardé el archivo, pero no pude extraer el recibo de sueldo automáticamente.',
             msgText ? `Detalle: ${msgText.slice(0, 300)}` : '',
+            '',
+            'Revisá la rotación con:',
+            '/gemini estado',
+            '/gemini probar',
             '',
             'Carga manual alternativa:',
             '/sueldo cargar periodo 2026-02 neto 3744369 bruto 4667076 empresa Dr Gray fecha 2026-03-05'
@@ -1237,6 +1253,46 @@ async function handleIgnorarImportadoCommand(chatId: number, args: string) {
   }
 }
 
+
+
+async function handleGeminiCommand(chatId: number, args: string) {
+  const a = removeAccents(String(args || '').trim().toLowerCase());
+
+  if (!a || a.includes('estado')) {
+    const status = getGeminiPoolStatus();
+    const lines = ['Gemini / rotación de API keys', ''];
+    lines.push(`Keys detectadas: ${status.length}`);
+    if (!status.length) {
+      lines.push('No hay keys configuradas. Falta GEMINI_API_KEY.');
+      return sendMessage(chatId, lines.join('\n'));
+    }
+    for (const s of status) {
+      lines.push([
+        `${s.label}: ${s.available ? 'disponible' : `cooldown ${s.cooldownSeconds}s`}`,
+        `fallos: ${s.failures}`,
+        s.lastError ? `último error: ${s.lastError}` : '',
+        s.lastUsedAt ? `último uso: ${s.lastUsedAt}` : ''
+      ].filter(Boolean).join(' | '));
+    }
+    lines.push('', 'Si Keys detectadas = 1, Vercel no está leyendo GEMINI_API_KEY_2. Agregala en Environment Variables y redeploy.');
+    return sendMessage(chatId, lines.join('\n'));
+  }
+
+  if (a.includes('probar') || a.includes('test')) {
+    await sendMessage(chatId, 'Probando Gemini con el pool de keys...');
+    const result = await testGeminiPoolOnce();
+    const lines = ['Prueba Gemini'];
+    lines.push(result.ok ? `OK con ${result.keyLabel}` : `Falló: ${result.error || 'error desconocido'}`);
+    lines.push('');
+    lines.push('Estado actual:');
+    for (const s of result.status) {
+      lines.push(`${s.label}: ${s.available ? 'disponible' : `cooldown ${s.cooldownSeconds}s`} | fallos ${s.failures}${s.lastError ? ` | ${s.lastError}` : ''}`);
+    }
+    return sendMessage(chatId, lines.join('\n'));
+  }
+
+  return sendMessage(chatId, 'Usá: /gemini estado o /gemini probar');
+}
 
 async function handleSueldosCommand(chatId: number, args: string) {
   try {

@@ -190,3 +190,36 @@ export function getGeminiPoolStatus() {
     lastUsedAt: entry.lastUsedAt || null
   }));
 }
+
+
+export function getGeminiConfiguredKeyCount() {
+  initializePool();
+  return state.clients.length;
+}
+
+export async function testGeminiPoolOnce(): Promise<{ ok: boolean; keyLabel?: string; keyIndex?: number; text?: string; error?: string; status: ReturnType<typeof getGeminiPoolStatus> }> {
+  try {
+    const result: any = await withGemini((ai, meta) => ai.models.generateContent({
+      model: config.geminiModel(),
+      contents: [{ role: 'user', parts: [{ text: 'Respondé solamente: OK' }] }]
+    }).then((response: any) => ({
+      text: String(response?.text || '').trim(),
+      keyLabel: meta.keyLabel,
+      keyIndex: meta.keyIndex
+    })), { operationName: 'prueba gemini', cooldownMs: 60 * 1000 });
+
+    return {
+      ok: true,
+      keyLabel: result.keyLabel,
+      keyIndex: result.keyIndex,
+      text: result.text || 'OK',
+      status: getGeminiPoolStatus()
+    };
+  } catch (error: any) {
+    return {
+      ok: false,
+      error: String(error?.message || error),
+      status: getGeminiPoolStatus()
+    };
+  }
+}
