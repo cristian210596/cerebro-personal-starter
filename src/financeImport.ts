@@ -119,17 +119,110 @@ export async function importFinanceFile(input: {
 
 async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: string) {
   if (!isPdfLike(fileName, mimeType)) return null;
+
+  // 1) PDF.js con layout: es el camino principal para resúmenes de tarjeta.
+  // pdf-parse suele mezclar columnas y puede romper filas de Visa/Galicia.
+  const pdfjsText = await tryExtractPdfTextWithPdfJs(buffer);
+  if (pdfjsText && pdfjsText.length > 120) return pdfjsText;
+
+  // 2) Fallback a pdf-parse si PDF.js no está disponible. No usa Gemini.
   try {
     const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
     const mod = await dynamicImport('pdf-parse');
     const pdfParse = mod.default || mod;
     const result = await pdfParse(buffer);
-    const text = clean(result?.text || '');
+    const text = cleanPdfText(result?.text || '');
     return text.length ? text : null;
-  } catch (error) {
-    console.error('No pude extraer texto del PDF con pdf-parse; no se usa Gemini para importaciones:', error);
+  } catch (error: any) {
+    console.error('No pude extraer texto del PDF con pdf-parse; no se usa Gemini para importaciones:', error?.message || error);
     return null;
   }
+}
+
+async function tryExtractPdfTextWithPdfJs(buffer: Buffer) {
+  try {
+    const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
+    const pdfjsLib = await dynamicImport('pdfjs-dist/legacy/build/pdf.mjs');
+
+    // Evita worker externo en Vercel/serverless.
+    if (pdfjsLib.GlobalWorkerOptions) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = '';
+    }
+
+    const loadingTask = pdfjsLib.getDocument({
+      data: new Uint8Array(buffer),
+      disableWorker: true,
+      useSystemFonts: true,
+      disableFontFace: true,
+      verbosity: 0
+    });
+    const pdf = await loadingTask.promise;
+    const pages: string[] = [];
+
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      const page = await pdf.getPage(pageNum);
+      const content = await page.getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false });
+      pages.push(layoutTextItems(content.items || []));
+    }
+
+    const text = cleanPdfText(pages.join('\n\f\n'));
+    return text.length ? text : null;
+  } catch (error: any) {
+    console.error('No pude extraer texto del PDF con pdfjs-dist; no se usa Gemini para importaciones:', error?.message || error);
+    return null;
+  }
+}
+
+function layoutTextItems(items: any[]) {
+  const normalized = items
+    .map((item: any) => {
+      const transform = item?.transform || [];
+      const x = Number(transform[4] || 0);
+      const y = Number(transform[5] || 0);
+      const str = String(item?.str || '').replace(/\s+/g, ' ').trim();
+      const width = Number(item?.width || 0);
+      return { x, y, str, width };
+    })
+    .filter((item: any) => item.str);
+
+  normalized.sort((a, b) => Math.abs(b.y - a.y) > 2 ? b.y - a.y : a.x - b.x);
+
+  const rows: any[][] = [];
+  for (const item of normalized) {
+    let row = rows.find(r => Math.abs(r[0].y - item.y) <= 2.2);
+    if (!row) {
+      row = [];
+      rows.push(row);
+    }
+    row.push(item);
+  }
+
+  return rows.map(row => {
+    row.sort((a, b) => a.x - b.x);
+    let line = '';
+    let prevRight: number | null = null;
+    for (const item of row) {
+      if (!line) {
+        line = item.str;
+      } else {
+        const gap = prevRight === null ? 0 : item.x - prevRight;
+        const spaces = gap > 55 ? '     ' : gap > 24 ? '   ' : ' ';
+        line += spaces + item.str;
+      }
+      prevRight = item.x + Math.max(item.width || 0, item.str.length * 4.5);
+    }
+    return line.replace(/\s+$/g, '');
+  }).filter(Boolean).join('\n');
+}
+
+function cleanPdfText(value: string) {
+  return String(value || '')
+    .replace(/\r/g, '\n')
+    .replace(/\u0000/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function parseVisaGaliciaPdfText(text: string, fileName: string): ParsedFinanceDocument | null {
@@ -171,42 +264,73 @@ function parseVisaGaliciaPdfText(text: string, fileName: string): ParsedFinanceD
 function parseVisaDetailRows(text: string, referenceDate: string | null): ImportedMovement[] {
   const lines = text.split(/\n+/).map(l => l.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
   const out: ImportedMovement[] = [];
-  const rowRe = /^(\d{1,2}-\d{1,2}-\d{2})\s+(.+?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{6})\s+(-?[\d.]+,\d{2})(?:\s+(-?[\d.]+,\d{2}))?$/;
+
+  // Fila típica ARS:
+  // 10-06-25 * BAZAR AVENIDA_CS 07/12 003947 67.833,78
+  const arsRowRe = /^(\d{1,2}-\d{1,2}-\d{2})\s+(.+?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{6})\s+(-?[\d.]+,\d{2})$/;
+
+  // Fila típica USD en Galicia/Visa: aparece un importe USD antes del comprobante y otro en columna dólares.
+  // 27-12-25 K OPENAI *CHATGPT ... USD 20,00 586455 20,00
+  const usdRowRe = /^(\d{1,2}-\d{1,2}-\d{2})\s+(.+?\bUSD)\s+(-?[\d.]+,\d{2})\s+(\d{6})\s+(-?[\d.]+,\d{2})$/i;
 
   for (const line of lines) {
-    const m = line.match(rowRe);
-    if (!m) continue;
-    let desc = clean(m[2]);
-    if (/saldo anterior|total consumos|total a pagar|pago minimo|pago mínimo/i.test(desc)) continue;
+    let parsed: null | { dateRaw: string; descRaw: string; cuotaRaw: string; comprobante: string; amount: number | null; moneda: string } = null;
+
+    const usd = line.match(usdRowRe);
+    if (usd) {
+      parsed = {
+        dateRaw: usd[1],
+        descRaw: clean(`${usd[2]} ${usd[3]}`),
+        cuotaRaw: '',
+        comprobante: usd[4],
+        amount: parseAmountLoose(usd[5]),
+        moneda: 'USD'
+      };
+    } else {
+      const ars = line.match(arsRowRe);
+      if (ars) {
+        parsed = {
+          dateRaw: ars[1],
+          descRaw: clean(ars[2]),
+          cuotaRaw: ars[3] || '',
+          comprobante: ars[4],
+          amount: parseAmountLoose(ars[5]),
+          moneda: 'ARS'
+        };
+      }
+    }
+
+    if (!parsed) continue;
+    let desc = clean(parsed.descRaw);
+    if (/saldo anterior|total consumos|total a pagar|pago minimo|pago mínimo|transferencia deuda|su pago en pesos/i.test(desc)) continue;
     if (/^\*\s*$/.test(desc) || /^K\s*$/i.test(desc)) continue;
+    if (parsed.amount === null) continue;
 
-    const cuota = parseInstallment(m[3] || '');
-    const comprobante = m[4];
-    const amountA = parseAmountLoose(m[5]);
-    const amountB = m[6] ? parseAmountLoose(m[6]) : null;
-    const isUsd = /\bUSD\b|U\$S|D[ÓO]LAR/i.test(desc) || amountB !== null;
-    const amount = isUsd && amountB !== null ? amountB : amountA;
-    const moneda = isUsd ? 'USD' : 'ARS';
-    if (amount === null) continue;
+    const cuota = parseInstallment(parsed.cuotaRaw || '');
+    desc = desc
+      .replace(/^\*\s*/, '')
+      .replace(/^K\s+/i, 'K ')
+      .replace(/\s+USD\s+[\d.,]+$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
 
-    desc = desc.replace(/^\*\s*/, '').replace(/^K\s+/i, 'K ').replace(/\s+USD\s+[\d.,]+/i, '').trim();
-    const fecha = normalizeDateFromStatement(m[1], referenceDate);
-    const categoriaRule = builtInRuleFor({ descripcion_original: desc, comercio: guessCommerce(desc), fecha, comprobante, monto: amount, moneda, tipo: 'gasto', cuota_actual: cuota.current, cuotas_totales: cuota.total, categoria_sugerida: null, subcategoria_sugerida: null, confianza: 0.55, raw: { line } });
+    const fecha = normalizeDateFromStatement(parsed.dateRaw, referenceDate);
+    const categoriaRule = builtInRuleFor({ descripcion_original: desc, comercio: guessCommerce(desc), fecha, comprobante: parsed.comprobante, monto: parsed.amount, moneda: parsed.moneda, tipo: 'gasto', cuota_actual: cuota.current, cuotas_totales: cuota.total, categoria_sugerida: null, subcategoria_sugerida: null, confianza: 0.55, raw: { line } });
 
     out.push({
       fecha,
       descripcion_original: desc,
       comercio: categoriaRule?.comercio || guessCommerce(desc),
-      comprobante,
-      monto: amount,
-      moneda,
+      comprobante: parsed.comprobante,
+      monto: parsed.amount,
+      moneda: parsed.moneda,
       tipo: normalizeMovementType('', desc),
       cuota_actual: cuota.current,
       cuotas_totales: cuota.total,
       categoria_sugerida: categoriaRule?.categoria || null,
       subcategoria_sugerida: categoriaRule?.subcategoria || null,
       confianza: categoriaRule?.confianza || 0.55,
-      raw: { line, parser: 'visa_galicia_pdf_text' }
+      raw: { line, parser: 'visa_galicia_pdf_text_layout' }
     });
   }
 
