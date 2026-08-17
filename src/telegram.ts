@@ -31,6 +31,7 @@ import { createSignedFileUrl, uploadTelegramFileToStorage } from './storage.js';
 import { formatFinanceSaved, formatFinanceSummary, getFinanceSummary, looksLikeFinanceText, saveFinanceFromText } from './finance.js';
 import { correctLastFinanceMovement, deleteLastFinanceMovement, deleteLastItem, formatBudgetSaved, formatBudgets, formatCardSummary, formatDebts, formatFinanceCorrection, formatMovements, getCardSummary, listBudgets, listFinanceDebts, listFinanceMovements, looksLikeBudgetText, looksLikeFinanceProText, markDebtPaidFromText, payCardFromText, saveBudgetFromText, saveCardStatementFromText } from './financePro.js';
 import { deleteLastPending, formatPendingDone, formatPendingSaved, formatPendientes, listPendientes, looksLikePendingText, markPendingDone, savePendingFromText } from './pending.js';
+import { formatMaintenanceRunResult, formatMaintenanceStatus, getMaintenanceStatus, rememberTelegramChat, runScheduledMaintenance } from './maintenance.js';
 
 type TelegramUpdate = {
   update_id: number;
@@ -81,6 +82,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (!msg) return;
 
   const chatId = msg.chat.id;
+  await rememberTelegramChat(chatId);
   const text = msg.text?.trim();
 
   if (!text && hasTelegramMedia(msg)) {
@@ -101,6 +103,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (command?.name === 'estado') {
     return handleEstadoCommand(chatId);
+  }
+
+  if (command?.name === 'supervivencia') {
+    return handleSupervivenciaCommand(chatId);
   }
 
   if (command?.name === 'archivos') {
@@ -191,6 +197,9 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   }
 
   if (command?.name === 'backup') {
+    const args = removeAccents(command.args || '').toLowerCase();
+    if (args.includes('estado')) return handleBackupEstadoCommand(chatId);
+    if (args.includes('auto') || args.includes('probar') || args.includes('prueba')) return handleBackupAutoTestCommand(chatId);
     return handleBackupCommand(chatId);
   }
 
@@ -519,6 +528,37 @@ async function handleBackupCommand(chatId: number) {
   }
 }
 
+async function handleBackupEstadoCommand(chatId: number) {
+  try {
+    const status = await getMaintenanceStatus();
+    return sendMessage(chatId, formatMaintenanceStatus(status));
+  } catch (error: any) {
+    console.error('No pude obtener estado de backup automático:', error);
+    return sendMessage(chatId, `No pude obtener estado: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleBackupAutoTestCommand(chatId: number) {
+  await sendMessage(chatId, 'Ejecutando mantenimiento y backup automático de prueba...');
+  try {
+    const result = await runScheduledMaintenance({ forceBackup: true, manualChatId: chatId });
+    return sendMessage(chatId, formatMaintenanceRunResult(result));
+  } catch (error: any) {
+    console.error('No pude probar backup automático:', error);
+    return sendMessage(chatId, `No pude probar backup automático: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+async function handleSupervivenciaCommand(chatId: number) {
+  try {
+    const status = await getMaintenanceStatus();
+    return sendMessage(chatId, formatMaintenanceStatus(status));
+  } catch (error: any) {
+    console.error('No pude obtener supervivencia:', error);
+    return sendMessage(chatId, `No pude obtener supervivencia: ${error?.message || 'error desconocido'}`);
+  }
+}
+
 function introText() {
   return [
     'Cerebro personal activo.',
@@ -547,6 +587,9 @@ function introText() {
     '/borrar gasto ultimo confirmar',
     '/borrar archivo ultimo confirmar',
     '/backup',
+    '/backup estado',
+    '/backup auto probar',
+    '/supervivencia',
     '/normalizar'
   ].join('\n');
 }
