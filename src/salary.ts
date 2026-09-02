@@ -643,6 +643,7 @@ function extractConceptTarget(text: string) {
   // Ahora: si la pregunta menciona otro concepto (presentismo, adicional, vacaciones, etc.),
   // se usa como termino de busqueda generico contra el nombre real del concepto en el recibo.
   const cleaned = t
+    .replace(/[¿?¡!.,;:]+/g, ' ')
     .replace(/^\/?sueldo\s*/, '')
     .replace(/\b(cu[aá]nto|cuanto|gan[eé]|gane|cobr[eé]|cobro|me pagaron|total|neto|bruto|recibo|de|del|los|las|el|la|en|mi|mis|este|esta|ano|año|mes|meses|ultimos?|últimos?)\b/g, ' ')
     .replace(/\d+/g, ' ')

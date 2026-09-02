@@ -1620,7 +1620,9 @@ function parseCategoryAndSubcategory(text: string) {
 }
 
 function extractAnalyticsTarget(text: string) {
-  const t = norm(text);
+  // Saco signos de pregunta/exclamacion/puntuacion antes de todo: si no, "uber?" queda
+  // como termino de busqueda y nunca matchea el comercio real "uber" guardado en la base.
+  const t = norm(text).replace(/[¿?¡!.,;:]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (/chat\s*gpt|chatgpt|openai/.test(t)) return { label: 'ChatGPT / OpenAI', terms: ['openai', 'chatgpt', 'chat gpt'] };
   const cleaned = t
     .replace(/^\/?reporte gastos?\s*/g, '')
