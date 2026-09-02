@@ -50,7 +50,23 @@ export function looksLikeImportCommand(text: string) {
 export function looksLikeFinanceAnalyticsText(text: string) {
   const t = norm(text);
   if (/^\/?reporte gasto/.test(t) || /^\/?gasto anual/.test(t) || /^\/?gastos anuales/.test(t)) return true;
-  return /(cu[aá]nto|cuanto|total|gast[eé]|gaste|gastaste|vengo gastando|llevo gastado).*(chat\s*gpt|chatgpt|openai|spotify|netflix|youtube|suscripci[oó]n|suscripciones|visa|master|mercado pago)/.test(t);
+
+  // Antes: solo reconocia la pregunta si el comercio/servicio estaba en una lista fija
+  // (chatgpt, spotify, netflix, visa, etc.). Cualquier otro comercio (uber, cabify, farmacia,
+  // lo que sea) caia al clasificador general y se guardaba como item nuevo en vez de responder.
+  // Ahora: cualquier pregunta con intencion de consulta de gasto (sin un importe explicito,
+  // porque eso seria un gasto nuevo a cargar, no una consulta) se manda al reporte financiero.
+  const hasExplicitAmount = /\$\s*\d/.test(text) || /\b\d+[.,]\d{2}\b/.test(t);
+  if (hasExplicitAmount) return false;
+
+  const hasQueryIntent = /(cu[aá]nto|cuanto|total|gast[eé]|gaste|gastaste|vengo gastando|llevo gastado)/.test(t);
+  if (!hasQueryIntent) return false;
+
+  // Evita falsos positivos con "cuanto" suelto sin ningun target (comercio/categoria/medio de pago).
+  const hasTarget = /\b(en|de|del|para|con)\b/.test(t) ||
+    /(chat\s*gpt|chatgpt|openai|spotify|netflix|youtube|suscripci[oó]n|suscripciones|visa|master|mercado pago)/.test(t);
+
+  return hasTarget;
 }
 
 export async function importFinanceFile(input: {

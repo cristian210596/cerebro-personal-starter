@@ -486,12 +486,18 @@ export function formatSalarySummary(summary: Awaited<ReturnType<typeof summarize
   lines.push(`Total retenciones: ${money(totalRet)}`);
 
   if (summary.targetConcept) {
-    const totalConcept = summary.concepts.reduce((a: number, c: any) => a + Number(c.importe || 0), 0);
     lines.push('', `Concepto consultado: ${summary.targetConcept}`);
-    lines.push(`Total concepto: ${money(totalConcept)}`);
-    for (const c of summary.concepts.slice(0, 12)) {
-      const periodo = c.sueldos_recibos?.periodo || '-';
-      lines.push(`• ${periodo}: ${c.concepto} — ${money(c.importe)}`);
+    if (!summary.concepts.length) {
+      // Antes: con 0 coincidencias igual mostraba "Total concepto: $0.00", indistinguible
+      // de un concepto real en $0. Ahora se avisa explicitamente que no hubo coincidencias.
+      lines.push('No encontre ese concepto en los recibos de este periodo (puede que el recibo lo nombre distinto, o que no lo haya tenido).');
+    } else {
+      const totalConcept = summary.concepts.reduce((a: number, c: any) => a + Number(c.importe || 0), 0);
+      lines.push(`Total concepto: ${money(totalConcept)}`);
+      for (const c of summary.concepts.slice(0, 12)) {
+        const periodo = c.sueldos_recibos?.periodo || '-';
+        lines.push(`• ${periodo}: ${c.concepto} — ${money(c.importe)}`);
+      }
     }
   } else {
     lines.push('', 'Por período:');
@@ -589,6 +595,10 @@ function normalizeConceptType(value: any): SalaryConceptType {
   return 'otro';
 }
 
+function periodLabel(d: Date) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
 function extractSalaryPeriodRange(text: string) {
   const t = norm(text);
   const now = new Date();
@@ -596,9 +606,27 @@ function extractSalaryPeriodRange(text: string) {
   const year = yearMatch ? Number(yearMatch[1]) : now.getFullYear();
   const singlePeriod = extractPeriodFromText(text);
   if (singlePeriod) return { startPeriod: singlePeriod, endPeriod: singlePeriod };
+
+  // "ultimos/ultimos N meses": ventana relativa real, contando hacia atras desde el mes actual.
+  // Antes "ultimos" (sin leer el numero) devolvia siempre un rango fijo de ~24 meses.
+  const monthsBackMatch = t.match(/(?:ultimos?|últimos?)\s+(\d{1,2})\s*mes(?:es)?/);
+  if (monthsBackMatch) {
+    const n = Math.max(1, Math.min(60, Number(monthsBackMatch[1])));
+    const endPeriod = periodLabel(now);
+    const startPeriod = periodLabel(new Date(now.getFullYear(), now.getMonth() - (n - 1), 1));
+    return { startPeriod, endPeriod };
+  }
+
   if (t.includes('este ano') || t.includes('este año')) return { startPeriod: `${year}-01`, endPeriod: `${year}-12` };
   if (t.includes('ano') || t.includes('año')) return { startPeriod: `${year}-01`, endPeriod: `${year}-12` };
-  if (t.includes('ultimos') || t.includes('últimos')) return { startPeriod: `${year - 1}-01`, endPeriod: `${year}-12` };
+
+  // "ultimos/ultimos" suelto sin numero: antes ~24 meses fijos; ahora 12 meses reales desde hoy.
+  if (t.includes('ultimos') || t.includes('últimos')) {
+    const endPeriod = periodLabel(now);
+    const startPeriod = periodLabel(new Date(now.getFullYear(), now.getMonth() - 11, 1));
+    return { startPeriod, endPeriod };
+  }
+
   return { startPeriod: `${year}-01`, endPeriod: `${year}-12` };
 }
 
@@ -609,7 +637,18 @@ function extractConceptTarget(text: string) {
   if (t.includes('obra social')) return 'obra social';
   if (t.includes('jubilatorio') || t.includes('jubilacion') || t.includes('jubilación')) return 'jubilatorio';
   if (t.includes('antiguedad') || t.includes('antigüedad')) return 'antiguedad';
-  return null;
+
+  // Antes: cualquier concepto fuera de esta lista de 5 devolvia null y el reporte mostraba
+  // el total neto/bruto general sin avisar que no encontro el concepto pedido.
+  // Ahora: si la pregunta menciona otro concepto (presentismo, adicional, vacaciones, etc.),
+  // se usa como termino de busqueda generico contra el nombre real del concepto en el recibo.
+  const cleaned = t
+    .replace(/^\/?sueldo\s*/, '')
+    .replace(/\b(cu[aá]nto|cuanto|gan[eé]|gane|cobr[eé]|cobro|me pagaron|total|neto|bruto|recibo|de|del|los|las|el|la|en|mi|mis|este|esta|ano|año|mes|meses|ultimos?|últimos?)\b/g, ' ')
+    .replace(/\d+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned.length > 2 ? cleaned : null;
 }
 
 function extractPeriodFromText(text: string) {

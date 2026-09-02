@@ -1658,7 +1658,11 @@ async function handleSueldosCommand(chatId: number, args: string) {
 async function handleSueldoCommand(chatId: number, args: string) {
   const a = removeAccents(String(args || '').trim().toLowerCase());
   try {
-    if (!a || a.includes('ultimo') || a.includes('último')) {
+    // OJO: antes usaba a.includes('ultimo'), que tambien hace match dentro de "ultimos"
+    // (plural). Eso hacia que "/sueldo horas extras ultimos 3 meses" se interpretara como
+    // "mostrame el ultimo recibo" en vez de correr el reporte. \bultimo\b exige la palabra
+    // exacta "ultimo" y no matchea "ultimos".
+    if (!a || /\bultimo\b/.test(a)) {
       if (a.includes('concepto')) {
         const result = await getSalaryConcepts(args || 'ultimo');
         return sendMessage(chatId, formatSalaryConcepts(result));
