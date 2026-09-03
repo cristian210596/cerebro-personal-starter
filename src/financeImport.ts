@@ -165,6 +165,145 @@ export async function importFinanceFile(input: {
   };
 }
 
+export async function importPaymentScreenshotFile(input: {
+  buffer: Buffer;
+  fileName?: string | null;
+  mimeType?: string | null;
+  caption?: string | null;
+  chatId: number;
+  itemId?: string | null;
+  archivoId?: string | null;
+}) {
+  const fileName = input.fileName || 'captura-pago';
+  const mimeType = input.mimeType || 'image/jpeg';
+  const hash = sha256(input.buffer);
+
+  const existing = await findExistingImport(hash);
+  if (existing) {
+    const processed = await processFinanceImportation(existing.id);
+    return {
+      recognized: true as const,
+      duplicate: true,
+      importacion: existing,
+      processed,
+      stats: await buildImportStats(existing.id),
+      nextPending: await getNextPendingImportedMovement(existing.id),
+      pendingList: await getPendingImportedMovements(8, existing.id)
+    };
+  }
+
+  const parsed = await extractPaymentScreenshotWithGemini(input.buffer, mimeType, fileName, input.caption || '');
+  if (!parsed?.es_resumen_financiero || !Array.isArray(parsed.movimientos) || !parsed.movimientos.length) {
+    return { recognized: false as const, duplicate: false, reason: 'No parece una captura de pago/transferencia.' };
+  }
+
+  const importacion = await createImportation(parsed, {
+    fileName,
+    mimeType,
+    hash,
+    chatId: input.chatId,
+    itemId: input.itemId || null,
+    archivoId: input.archivoId || null
+  });
+
+  const rows = normalizeImportedMovements(parsed, importacion.id);
+  const inserted = await insertImportedRows(rows);
+  const processed = await autoProcessImportedRowsWithRules(inserted);
+  const stats = await buildImportStats(importacion.id);
+  const nextPending = await getNextPendingImportedMovement(importacion.id);
+  const pendingList = await getPendingImportedMovements(8, importacion.id);
+
+  await updateImportationState(importacion.id);
+
+  return {
+    recognized: true as const,
+    duplicate: false,
+    importacion,
+    processed,
+    stats,
+    nextPending,
+    pendingList
+  };
+}
+
+// Clasifica con Gemini si una imagen es una captura de pago/transferencia/cobro
+// (Mercado Pago, home banking, billetera virtual, QR) en vez de un ticket
+// itemizado o un recibo de sueldo. confianza siempre queda baja salvo que el
+// destinatario sea una marca reconocible, para que si no hay certeza quede
+// pendiente de clasificar y se dispare la pregunta proactiva al usuario.
+async function extractPaymentScreenshotWithGemini(buffer: Buffer, mimeType: string, fileName: string, caption: string): Promise<ParsedFinanceDocument | null> {
+  if (!process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEYS && !process.env.GEMINI_API_KEY_2) return null;
+
+  const prompt = [
+    'Analizá esta imagen para un sistema personal de finanzas.',
+    'Puede ser una captura de pantalla de un pago, transferencia o cobro: Mercado Pago, home banking, billetera virtual (Ualá, Brubank, etc.), QR, etc.',
+    'NO es esto: un ticket/factura de compra con lista de productos (eso se procesa aparte), ni un recibo de sueldo.',
+    'Si la imagen NO muestra un pago/transferencia/cobro de dinero, devolvé es_resumen_financiero=false y movimientos=[].',
+    'No inventes datos: si un dato no se ve con claridad, usá null.',
+    'Devolvé SOLO JSON válido, sin markdown. Estructura exacta:',
+    '{',
+    '  "es_resumen_financiero": true|false,',
+    '  "tipo_fuente": "captura_pago",',
+    '  "proveedor": string|null,',
+    '  "cuenta": null,',
+    '  "tarjeta": null,',
+    '  "periodo": null,',
+    '  "fecha_cierre": null,',
+    '  "fecha_vencimiento": null,',
+    '  "total_pesos": null,',
+    '  "total_dolares": null,',
+    '  "pago_minimo": null,',
+    '  "movimientos": [',
+    '    {',
+    '      "fecha": "YYYY-MM-DD"|null,',
+    '      "descripcion_original": string,',
+    '      "comercio": string|null,',
+    '      "comprobante": string|null,',
+    '      "monto": number,',
+    '      "moneda": "ARS"|"USD",',
+    '      "tipo": "gasto"|"transferencia",',
+    '      "cuota_actual": null,',
+    '      "cuotas_totales": null,',
+    '      "categoria_sugerida": null,',
+    '      "subcategoria_sugerida": null,',
+    '      "confianza": number',
+    '    }',
+    '  ]',
+    '}',
+    'Reglas:',
+    '- "descripcion_original": texto tal cual aparece (ej: nombre del destinatario/comercio, "Pago con QR", etc.).',
+    '- "comercio": nombre de la persona/comercio que recibió o envió el dinero, tal cual se ve en la captura. No lo inventes ni lo generalices.',
+    '- "proveedor": el medio/app usado (ej: "Mercado Pago", "Banco Galicia", "Ualá"), si se identifica.',
+    '- "confianza": siempre bajo (0.2 a 0.4) salvo que el destinatario sea una marca/comercio claramente reconocible (ej: Uber, Cabify, YPF); en ese caso podés usar hasta 0.6. categoria_sugerida siempre null, la categoría se define aparte.',
+    caption ? `Caption del usuario: ${caption}` : '',
+    `Nombre de archivo: ${fileName}`
+  ].filter(Boolean).join('\n');
+
+  try {
+    const response: any = await withGemini(ai => ai.models.generateContent({
+      model: config.geminiModel(),
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: mimeType || 'image/jpeg', data: buffer.toString('base64') } }
+          ]
+        }
+      ]
+    }), { operationName: 'detección captura de pago' });
+
+    const jsonText = extractJsonObject(response.text || '');
+    if (!jsonText) return null;
+    const parsed = JSON.parse(jsonText);
+    if (!parsed?.es_resumen_financiero) return null;
+    return normalizeParsedDocument(parsed);
+  } catch (error: any) {
+    console.error('No pude analizar posible captura de pago con Gemini:', error?.message || error);
+    return null;
+  }
+}
+
 async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: string) {
   if (!isPdfLike(fileName, mimeType)) return null;
 
@@ -1199,7 +1338,7 @@ export async function classifyImportedMovementByIndex(index: number, categoryTex
   return { ok: true as const, imported: updated, movement, rule, action, nextPending: await getNextPendingImportedMovement() };
 }
 
-async function interpretPendingAnswerWithGemini(row: any, answerText: string) {
+export async function interpretPendingAnswerWithGemini(row: any, answerText: string) {
   if (!process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEYS && !process.env.GEMINI_API_KEY_2) return null;
   const prompt = [
     'Un movimiento de un resumen de tarjeta no se pudo clasificar automáticamente y el usuario explicó qué es.',
@@ -1248,6 +1387,56 @@ export async function classifyImportedMovementFromAnswer(index: number, answerTe
   const categoryText = [categoria, subcategoria].filter(Boolean).join(' / ');
 
   return classifyImportedMovementByIndex(index, categoryText, false, interpreted?.entidad_nombre || null);
+}
+
+// Corrige el último finanzas_movimientos YA consolidado (no un pendiente de
+// importación) a partir de una respuesta en lenguaje natural: "es panadería".
+// Aprende el alias (comercio/descripción original -> entidad) igual que el
+// flujo de pendientes, para que la próxima vez se reconozca solo.
+export async function correctLastFinanceMovementFromText(answerText: string) {
+  const { data: current, error } = await supabase
+    .from('finanzas_movimientos')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (!current) return null;
+
+  const interpreted = await interpretPendingAnswerWithGemini({
+    descripcion_original: current.descripcion || current.comercio,
+    monto: current.monto,
+    moneda: current.moneda,
+    fecha_movimiento: current.fecha_movimiento
+  }, answerText);
+  const fallback = parseCategoryAndSubcategory(answerText);
+  const categoria = interpreted?.categoria || fallback.category || current.categoria_financiera || 'Otros';
+  const subcategoria = interpreted?.subcategoria || fallback.subcategory || current.subcategoria_financiera || null;
+
+  let comercio = current.comercio;
+  if (interpreted?.entidad_nombre) {
+    try {
+      const master = await upsertMasterEntity({ nombre: interpreted.entidad_nombre, categoria, subcategoria });
+      await upsertEntityAlias(master.id, current.comercio || current.descripcion || '', 'correccion_usuario');
+      comercio = master.nombre;
+    } catch (entityError) {
+      console.error('No pude registrar la entidad de la corrección de gasto:', entityError);
+    }
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from('finanzas_movimientos')
+    .update({
+      categoria_financiera: categoria,
+      subcategoria_financiera: subcategoria,
+      comercio,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', current.id)
+    .select()
+    .single();
+  if (updateError) throw updateError;
+  return updated;
 }
 
 async function saveCommerceRuleFromImported(row: any, category: string, subcategory: string | null) {

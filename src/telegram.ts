@@ -38,7 +38,7 @@ import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, format
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
-import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, getUnsyncedImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
+import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, correctLastFinanceMovementFromText, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, getUnsyncedImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, importPaymentScreenshotFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
 import { formatComprobanteDetail, formatComprobanteImportResult, formatComprobanteItems, formatComprobantes, formatProductRuleResult, formatProductSpendingReport, formatProducts, getComprobanteItems, getLastComprobante, importComprobanteFromFile, listComprobantes, listProducts, looksLikeComprobanteFile, looksLikeProductQueryText, saveProductRuleFromText, summarizeProductSpending } from './comprobantes.js';
 import { confirmLastSalaryReceipt, correctLastSalaryReceiptFromText, createManualSalaryReceiptFromText, formatSalaryConcepts, formatSalaryImportResult, formatSalaryList, formatSalaryReceipt, formatSalarySummary, getLastSalaryReceipt, getSalaryConcepts, importSalaryReceiptFromFile, listSalaryReceipts, looksLikeSalaryFile, looksLikeSalaryQueryText, summarizeSalaryFromText } from './salary.js';
 import { enqueueProcessingTask, cleanupQueueCompleted, formatQueue, formatQueueProcessResults, listQueue, processQueue, retryLastQueued } from './processingQueue.js';
@@ -433,6 +433,18 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     if (handled) return;
   }
 
+  // "Modificar/corregir el último gasto. Es panadería" (o "movimiento"/"consumo"/"pago").
+  // Antes esto no matcheaba ningún handler de finanzas y terminaba creando un item
+  // genérico random vía el clasificador de texto libre. Si hay un pendiente de
+  // clasificar reciente, se responde igual que "1 es panadería"; si no hay ningún
+  // pendiente (el gasto ya había quedado consolidado solo, con categoría genérica),
+  // corrige directamente el último finanzas_movimientos.
+  const lastFinanceCorrectionMatch = text.trim().match(/^(?:modificar|modifica|corregir|corregi|arreglar|arregla|cambiar|cambia|edita|editar)\s+(?:el\s+)?(?:[uú]ltimo|ultimo)\s+(?:gasto|movimiento|consumo|pago)s?\b[.,:]?\s*(.*)$/i);
+  if (lastFinanceCorrectionMatch) {
+    const handled = await handleLastFinanceMovementCorrection(chatId, lastFinanceCorrectionMatch[1]);
+    if (handled) return;
+  }
+
   if (looksLikeImportCommand(text)) {
     const handled = await handleImportNaturalText(chatId, text);
     if (handled) return;
@@ -819,6 +831,50 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
             '/sueldo cargar periodo 2026-02 neto 3744369 bruto 4667076 empresa Dr Gray fecha 2026-03-05'
           ].filter(Boolean).join('\n'));
         }
+      }
+    }
+
+    // Captura de pago/transferencia (Mercado Pago, home banking, QR) que no es
+    // ticket itemizado ni recibo de sueldo. Antes esto no tenía ningún camino:
+    // caía directo al clasificador genérico de items sin pasar por finanzas ni
+    // preguntar nada. Reusa el mismo staging que el importador de PDF, así que
+    // si no hay certeza queda pendiente y dispara la pregunta proactiva.
+    if (media.kind === 'photo') {
+      try {
+        await sendMessage(chatId, 'Reviso si es un pago o transferencia (Mercado Pago, banco, QR)...');
+        const paymentImport = await importPaymentScreenshotFile({
+          buffer: downloaded.buffer,
+          fileName: media.fileName || `${media.kind}-${msg.message_id}`,
+          mimeType: media.mimeType || downloaded.mimeType || 'image/jpeg',
+          caption,
+          chatId,
+          itemId: null,
+          archivoId: null
+        });
+
+        if (paymentImport.recognized) {
+          const archivo = await saveArchivo({
+            item_id: null,
+            tipo_archivo: media.kind,
+            nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
+            mime_type: media.mimeType || downloaded.mimeType || null,
+            storage_url: stored.storageRef,
+            transcripcion: null,
+            descripcion_ia: 'Captura de pago/transferencia importada.'
+          });
+          try { await createNotionArchivoPage(archivo); } catch (error) { console.error('No se pudo sincronizar captura de pago a Notion:', error); }
+          const notionSyncLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
+          return sendMessage(chatId, [
+            paymentImport.duplicate ? 'Esta captura ya la había importado.' : 'Pago/transferencia detectado e importado.',
+            stored.signedUrl ? `Archivo: ${stored.signedUrl}` : '',
+            formatImportResult(paymentImport),
+            notionSyncLine
+          ].filter(Boolean).join('\n\n'));
+        }
+      } catch (error: any) {
+        console.error('No pude revisar/importar captura de pago:', error);
+        // No es un error fatal: si no se pudo determinar, seguimos con el flujo
+        // genérico de foto en vez de cortar el mensaje con un error confuso.
       }
     }
 
@@ -1467,6 +1523,60 @@ function formatNotionSyncLine(sync: { ok: boolean; synced: number; total: number
   if (!sync.ok) return `Notion: no pude sincronizar (${sync.error || 'error desconocido'}).`;
   if (!sync.total) return '';
   return `Notion: sincronizados ${sync.synced} de ${sync.total} movimientos pendientes.`;
+}
+
+// "Modificar/corregir el último gasto. Es X": primero intenta como respuesta al
+// pendiente de clasificar más reciente (igual que "1 es X"); si no hay ningún
+// pendiente, corrige directamente el último finanzas_movimientos ya consolidado.
+async function handleLastFinanceMovementCorrection(chatId: number, answerTextRaw: string): Promise<boolean> {
+  const answerText = String(answerTextRaw || '').trim();
+  try {
+    const pending = await getPendingImportedMovements(30);
+    if (pending.length) {
+      const handled = await handlePendingImportedAnswer(chatId, pending.length, answerText || 'sin detalle adicional');
+      if (handled) return true;
+    }
+
+    if (!answerText) {
+      await sendMessage(chatId, 'Decime qué corrijo del último gasto. Ejemplo: "Modificar el último gasto. Es panadería".');
+      return true;
+    }
+
+    const updated = await correctLastFinanceMovementFromText(answerText);
+    if (!updated) {
+      await sendMessage(chatId, 'No encontré ningún gasto reciente para corregir.');
+      return true;
+    }
+
+    const notionLine = formatNotionSyncLine(await syncSingleMovementToNotion(updated));
+    await sendMessage(chatId, [formatCorrectedMovement(updated), notionLine].filter(Boolean).join('\n\n'));
+    return true;
+  } catch (error: any) {
+    console.error('No pude corregir el último gasto:', error);
+    return false;
+  }
+}
+
+async function syncSingleMovementToNotion(movement: any): Promise<{ ok: boolean; synced: number; total: number; error?: string }> {
+  try {
+    if (!getNotionClient()) return { ok: false, synced: 0, total: 1, error: 'NOTION_TOKEN no configurado' };
+    const result = await syncNotionImportedMovements([movement]);
+    return { ok: true, synced: result.movimientos, total: 1 };
+  } catch (error: any) {
+    console.error('No se pudo sincronizar corrección de gasto a Notion:', error);
+    return { ok: false, synced: 0, total: 0, error: error?.message || 'error desconocido' };
+  }
+}
+
+function formatCorrectedMovement(row: any) {
+  return [
+    'Gasto corregido.',
+    '',
+    `Comercio: ${row.comercio || '-'}`,
+    `Categoría: ${row.categoria_financiera || '-'}${row.subcategoria_financiera ? ` / ${row.subcategoria_financiera}` : ''}`,
+    `Monto: $${Number(row.monto || 0).toLocaleString('es-AR')}`,
+    `Fecha: ${row.fecha_movimiento || '-'}`
+  ].join('\n');
 }
 
 // Responder en lenguaje natural a un pendiente de clasificación: "1 es mercado pago,
