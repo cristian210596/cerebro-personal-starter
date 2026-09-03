@@ -22,7 +22,7 @@ import {
   syncItemDerivedData,
   updateItemFields
 } from './supabaseClient.js';
-import { createNotionArchivoPage, createNotionItemPage, syncNotionDerivedForItem, syncNotionFinanceResult, syncNotionImportedMovements, updateNotionItemPage } from './notion.js';
+import { createNotionArchivoPage, createNotionItemPage, getNotionClient, syncNotionDerivedForItem, syncNotionFinanceResult, syncNotionImportedMovements, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
 import { getGeminiPoolStatus, testGeminiPoolOnce } from './geminiPool.js';
 import { getCerebrasPoolStatus, testCerebrasPoolOnce, getCerebrasConfiguredKeyCount } from './cerebrasPool.js';
@@ -641,8 +641,9 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
         archivoId: archivo.id
       });
 
+      let notionSyncLine = '';
       if (financeImport.recognized) {
-        await syncPendingImportedMovementsToNotion();
+        notionSyncLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
       }
 
       const financeImportMessage = formatImportResult(financeImport);
@@ -650,7 +651,8 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       return sendMessage(chatId, [
         financeImport.recognized ? 'Documento financiero importado.' : 'Documento financiero guardado, pero no pude extraer movimientos automáticamente.',
         stored.signedUrl ? `Archivo: ${stored.signedUrl}` : '',
-        financeImportMessage || importReason || 'No pude extraer movimientos de este formato. Probá con PDF exportado original o CSV/Excel.'
+        financeImportMessage || importReason || 'No pude extraer movimientos de este formato. Probá con PDF exportado original o CSV/Excel.',
+        notionSyncLine
       ].filter(Boolean).join('\n\n'));
     }
 
@@ -879,9 +881,12 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
           archivoId: archivo.id
         });
         if (financeImport.recognized) {
-          await syncPendingImportedMovementsToNotion();
+          const notionSync = await syncPendingImportedMovementsToNotion();
+          const notionLine = formatNotionSyncLine(notionSync);
+          financeImportMessage = [formatImportResult(financeImport), notionLine].filter(Boolean).join('\n\n');
+        } else {
+          financeImportMessage = formatImportResult(financeImport);
         }
-        financeImportMessage = formatImportResult(financeImport);
       } catch (error: any) {
         console.error('No pude importar finanzas desde archivo:', error);
         financeImportMessage = `No pude importar movimientos financieros: ${error?.message || 'error desconocido'}`;
@@ -1387,8 +1392,8 @@ async function handleImportacionCommand(chatId: number, args: string) {
   try {
     if (a.includes('procesar') || a.includes('consolidar')) {
       const result = await processFinanceImportation();
-      await syncPendingImportedMovementsToNotion();
-      return sendMessage(chatId, formatProcessImportResult(result));
+      const notionLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
+      return sendMessage(chatId, [formatProcessImportResult(result), notionLine].filter(Boolean).join('\n\n'));
     }
 
     if (!a || a.includes('ultima') || a.includes('última')) {
@@ -1432,8 +1437,8 @@ async function handleClasificarImportadoCommand(chatId: number, args: string) {
   const saveRule = /guardar regla|siempre|recordar/i.test(text);
   try {
     const result = await classifyImportedMovementByIndex(index, text, saveRule);
-    if (result.ok) await syncPendingImportedMovementsToNotion();
-    return sendMessage(chatId, formatClassifyImportedResult(result));
+    const notionLine = result.ok ? formatNotionSyncLine(await syncPendingImportedMovementsToNotion()) : '';
+    return sendMessage(chatId, [formatClassifyImportedResult(result), notionLine].filter(Boolean).join('\n\n'));
   } catch (error: any) {
     console.error('No pude clasificar importado:', error);
     return sendMessage(chatId, `No pude clasificar movimiento importado: ${error?.message || 'error desconocido'}`);
@@ -1443,13 +1448,25 @@ async function handleClasificarImportadoCommand(chatId: number, args: string) {
 // Sincroniza a Notion CUALQUIER movimiento importado que todavia no tenga
 // página de Notion asociada, sin importar si se creó ahora o en una importación
 // anterior (incluye datos de pruebas viejas hechas antes de este fix).
-async function syncPendingImportedMovementsToNotion() {
+// Devuelve el resultado (en vez de tragarse el error en silencio) para poder
+// mostrarlo en el mensaje del bot y diagnosticar sin depender de logs de Vercel.
+async function syncPendingImportedMovementsToNotion(): Promise<{ ok: boolean; synced: number; total: number; error?: string }> {
   try {
     const pending = await getUnsyncedImportedMovements();
-    if (pending.length) await syncNotionImportedMovements(pending);
-  } catch (error) {
+    if (!pending.length) return { ok: true, synced: 0, total: 0 };
+    if (!getNotionClient()) return { ok: false, synced: 0, total: pending.length, error: 'NOTION_TOKEN no configurado' };
+    const result = await syncNotionImportedMovements(pending);
+    return { ok: true, synced: result.movimientos, total: pending.length };
+  } catch (error: any) {
     console.error('No se pudo sincronizar movimientos importados pendientes a Notion:', error);
+    return { ok: false, synced: 0, total: 0, error: error?.message || 'error desconocido' };
   }
+}
+
+function formatNotionSyncLine(sync: { ok: boolean; synced: number; total: number; error?: string }) {
+  if (!sync.ok) return `Notion: no pude sincronizar (${sync.error || 'error desconocido'}).`;
+  if (!sync.total) return '';
+  return `Notion: sincronizados ${sync.synced} de ${sync.total} movimientos pendientes.`;
 }
 
 // Responder en lenguaje natural a un pendiente de clasificación: "1 es mercado pago,
@@ -1467,8 +1484,8 @@ async function handlePendingImportedAnswer(chatId: number, index: number, answer
       await sendMessage(chatId, result.message);
       return true;
     }
-    await syncPendingImportedMovementsToNotion();
-    await sendMessage(chatId, formatClassifyImportedResult(result));
+    const notionLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
+    await sendMessage(chatId, [formatClassifyImportedResult(result), notionLine].filter(Boolean).join('\n\n'));
     return true;
   } catch (error: any) {
     console.error('No pude interpretar respuesta a pendiente de clasificación:', error);
