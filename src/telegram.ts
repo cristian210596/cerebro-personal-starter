@@ -25,6 +25,7 @@ import {
 import { createNotionArchivoPage, createNotionItemPage, syncNotionDerivedForItem, syncNotionFinanceResult, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
 import { getGeminiPoolStatus, testGeminiPoolOnce } from './geminiPool.js';
+import { getCerebrasPoolStatus, testCerebrasPoolOnce, getCerebrasConfiguredKeyCount } from './cerebrasPool.js';
 import { parseEditInstruction } from './editor.js';
 import { generateBackupZip } from './backup.js';
 import { buildDocumentText, describeImage, transcribeAudio, type TelegramFileInfo } from './media.js';
@@ -184,6 +185,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (command?.name === 'gemini') {
     return handleGeminiCommand(chatId, command.args);
+  }
+
+  if (command?.name === 'cerebras') {
+    return handleCerebrasCommand(chatId, command.args);
   }
 
   if (command?.name === 'estado') {
@@ -1645,6 +1650,50 @@ async function handleGeminiCommand(chatId: number, args: string) {
   return sendMessage(chatId, 'Usá: /gemini estado o /gemini probar');
 }
 
+async function handleCerebrasCommand(chatId: number, args: string) {
+  const a = removeAccents(String(args || '').trim().toLowerCase());
+
+  if (!a || a.includes('estado')) {
+    const configured = getCerebrasConfiguredKeyCount();
+    const lines = ['Cerebras / clasificación de texto (opcional)', ''];
+    lines.push(`Keys detectadas: ${configured}`);
+    if (!configured) {
+      lines.push('No hay keys configuradas. La clasificación de texto sigue usando solo Gemini.');
+      lines.push('Para activarlo: agregá CEREBRAS_API_KEY en las variables de entorno y redeploy.');
+      return sendMessage(chatId, lines.join('\n'));
+    }
+    const status = getCerebrasPoolStatus();
+    for (const s of status) {
+      lines.push([
+        `${s.label}: ${s.available ? 'disponible' : `cooldown ${s.cooldownSeconds}s`}`,
+        `fallos: ${s.failures}`,
+        s.lastError ? `último error: ${s.lastError}` : '',
+        s.lastUsedAt ? `último uso: ${s.lastUsedAt}` : ''
+      ].filter(Boolean).join(' | '));
+    }
+    lines.push('', 'Se usa para clasificar texto y parsear gastos en lenguaje natural. Si falla, cae automáticamente a Gemini.');
+    return sendMessage(chatId, lines.join('\n'));
+  }
+
+  if (a.includes('probar') || a.includes('test')) {
+    if (!getCerebrasConfiguredKeyCount()) {
+      return sendMessage(chatId, 'No hay CEREBRAS_API_KEY configurada. Agregala en las variables de entorno y redeploy.');
+    }
+    await sendMessage(chatId, 'Probando Cerebras con el pool de keys...');
+    const result = await testCerebrasPoolOnce();
+    const lines = ['Prueba Cerebras'];
+    lines.push(result.ok ? `OK con ${result.keyLabel} — respuesta: ${result.text}` : `Falló: ${result.error || 'error desconocido'}`);
+    lines.push('');
+    lines.push('Estado actual:');
+    for (const s of result.status) {
+      lines.push(`${s.label}: ${s.available ? 'disponible' : `cooldown ${s.cooldownSeconds}s`} | fallos ${s.failures}${s.lastError ? ` | ${s.lastError}` : ''}`);
+    }
+    return sendMessage(chatId, lines.join('\n'));
+  }
+
+  return sendMessage(chatId, 'Usá: /cerebras estado o /cerebras probar');
+}
+
 async function handleSueldosCommand(chatId: number, args: string) {
   try {
     const rows = await listSalaryReceipts(args || '', 20);
@@ -1755,6 +1804,7 @@ async function handleEstadoCommand(chatId: number) {
     lines.push(`Supabase: activo`);
     lines.push(`Notion: ${config.notionToken() ? 'configurado' : 'sin token'}`);
     lines.push(`Gemini: ${config.geminiApiKey() ? 'configurado' : 'sin key'}`);
+    lines.push(`Cerebras: ${getCerebrasConfiguredKeyCount() ? `configurado (${getCerebrasConfiguredKeyCount()} key/s), clasificación de texto` : 'sin key (clasificación usa solo Gemini)'}`);
     lines.push('', 'Comandos útiles: /backup, /buscar, /archivos, /finanzas, /gastos, /deudas, /tarjetas, /sueldos');
     return sendMessage(chatId, lines.join('\n'));
   } catch (error: any) {

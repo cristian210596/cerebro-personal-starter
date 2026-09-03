@@ -1,6 +1,7 @@
 import { Type } from '@google/genai';
 import { config } from './config.js';
 import { withGemini } from './geminiPool.js';
+import { isCerebrasConfigured, withCerebras } from './cerebrasPool.js';
 import type { Clasificacion } from './types.js';
 
 
@@ -86,7 +87,63 @@ Tipos de entidades frecuentes:
 Equipo; Código de equipo; Marca; Modelo; Componente; Persona; Empresa; Producto; Ingrediente; Materia; Norma; Lugar; App / herramienta; Tema.
 `;
 
+// Cerebras JSON Schema equivalente al "schema" de arriba (formato Gemini). Se usa solo si
+// CEREBRAS_API_KEY esta configurada; si falla por cualquier motivo, cae a Gemini sin romper nada.
+const cerebrasSchema = {
+  type: 'object',
+  properties: {
+    titulo: { type: 'string' },
+    resumen: { type: 'string' },
+    categoria_principal: { type: 'string' },
+    subcategorias: { type: 'array', items: { type: 'string' } },
+    tipo_item: { type: 'string' },
+    estado: { type: ['string', 'null'] },
+    valoracion: { type: ['string', 'null'] },
+    importancia: { type: 'string' },
+    accion_futura: { type: ['string', 'null'] },
+    tags: { type: 'array', items: { type: 'string' } },
+    entidades: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { tipo: { type: 'string' }, nombre: { type: 'string' } },
+        required: ['tipo', 'nombre'],
+        additionalProperties: false
+      }
+    },
+    memorias_sugeridas: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          afirmacion: { type: 'string' },
+          categoria: { type: 'string' },
+          confianza: { type: 'string' }
+        },
+        required: ['afirmacion', 'categoria', 'confianza'],
+        additionalProperties: false
+      }
+    }
+  },
+  required: [
+    'titulo', 'resumen', 'categoria_principal', 'subcategorias', 'tipo_item', 'estado',
+    'valoracion', 'importancia', 'accion_futura', 'tags', 'entidades', 'memorias_sugeridas'
+  ],
+  additionalProperties: false
+};
+
 export async function classifyText(text: string): Promise<Clasificacion> {
+  if (isCerebrasConfigured()) {
+    try {
+      return await classifyTextWithCerebras(text);
+    } catch (error: any) {
+      console.error('Cerebras fallo clasificando, uso Gemini como respaldo:', error?.message || error);
+    }
+  }
+  return classifyTextWithGemini(text);
+}
+
+async function classifyTextWithGemini(text: string): Promise<Clasificacion> {
   const response = await withGemini(ai => ai.models.generateContent({
     model: config.geminiModel(),
     contents: `${systemPrompt}\n\nMensaje a clasificar:\n${text}`,
@@ -101,6 +158,28 @@ export async function classifyText(text: string): Promise<Clasificacion> {
 
   const parsed = JSON.parse(raw) as Clasificacion;
   return normalizeClassification(parsed);
+}
+
+async function classifyTextWithCerebras(text: string): Promise<Clasificacion> {
+  const parsed = await withCerebras(async call => {
+    const response = await call({
+      model: config.cerebrasModel(),
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Mensaje a clasificar:\n${text}` }
+      ],
+      temperature: 0.2,
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'clasificacion', strict: true, schema: cerebrasSchema }
+      }
+    });
+    const raw = response?.choices?.[0]?.message?.content;
+    if (!raw) throw new Error('Cerebras no devolvió texto');
+    return JSON.parse(raw);
+  }, { operationName: 'clasificación (cerebras)' });
+
+  return normalizeClassification(parsed as Clasificacion);
 }
 
 function normalizeClassification(c: Clasificacion): Clasificacion {

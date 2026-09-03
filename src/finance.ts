@@ -1,6 +1,7 @@
 import { Type } from '@google/genai';
 import { config } from './config.js';
 import { withGemini } from './geminiPool.js';
+import { isCerebrasConfigured, withCerebras } from './cerebrasPool.js';
 import { supabase, saveItem } from './supabaseClient.js';
 import type { Clasificacion, EntidadClasificada, ItemInsert } from './types.js';
 
@@ -135,7 +136,67 @@ export function looksLikeFinanceText(text: string) {
   return false;
 }
 
+// Cerebras JSON Schema equivalente a financeSchema (formato Gemini). Solo se usa si
+// CEREBRAS_API_KEY esta configurada; si falla, cae a Gemini automaticamente.
+const cerebrasFinanceSchema = {
+  type: 'object',
+  properties: {
+    es_finanza: { type: 'boolean' },
+    intencion: { type: 'string' },
+    titulo: { type: 'string' },
+    resumen: { type: 'string' },
+    tipo_movimiento: { type: ['string', 'null'] },
+    monto: { type: ['number', 'null'] },
+    moneda: { type: ['string', 'null'] },
+    descripcion: { type: ['string', 'null'] },
+    categoria_financiera: { type: ['string', 'null'] },
+    subcategoria_financiera: { type: ['string', 'null'] },
+    medio_pago: { type: ['string', 'null'] },
+    tarjeta: { type: ['string', 'null'] },
+    banco_billetera: { type: ['string', 'null'] },
+    comercio: { type: ['string', 'null'] },
+    cuotas: { type: ['number', 'null'] },
+    estado: { type: ['string', 'null'] },
+    persona_deuda: { type: ['string', 'null'] },
+    tipo_deuda: { type: ['string', 'null'] },
+    concepto_deuda: { type: ['string', 'null'] },
+    pago_deuda_monto: { type: ['number', 'null'] },
+    participantes: { type: 'array', items: { type: 'string' } },
+    participantes_pagaron: { type: 'array', items: { type: 'string' } },
+    dividir_incluye_usuario: { type: 'boolean' },
+    fecha_movimiento: { type: ['string', 'null'] },
+    tags: { type: 'array', items: { type: 'string' } },
+    entidades: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { tipo: { type: 'string' }, nombre: { type: 'string' } },
+        required: ['tipo', 'nombre'],
+        additionalProperties: false
+      }
+    }
+  },
+  required: [
+    'es_finanza', 'intencion', 'titulo', 'resumen', 'tipo_movimiento', 'monto', 'moneda', 'descripcion',
+    'categoria_financiera', 'subcategoria_financiera', 'medio_pago', 'tarjeta', 'banco_billetera', 'comercio',
+    'cuotas', 'estado', 'persona_deuda', 'tipo_deuda', 'concepto_deuda', 'pago_deuda_monto', 'participantes',
+    'participantes_pagaron', 'dividir_incluye_usuario', 'fecha_movimiento', 'tags', 'entidades'
+  ],
+  additionalProperties: false
+};
+
 export async function parseFinanceText(text: string): Promise<FinanceParse> {
+  if (isCerebrasConfigured()) {
+    try {
+      return await parseFinanceTextWithCerebras(text);
+    } catch (error: any) {
+      console.error('Cerebras fallo en el parser financiero, uso Gemini como respaldo:', error?.message || error);
+    }
+  }
+  return parseFinanceTextWithGemini(text);
+}
+
+async function parseFinanceTextWithGemini(text: string): Promise<FinanceParse> {
   const response = await withGemini(ai => ai.models.generateContent({
     model: config.geminiModel(),
     contents: `${FINANCE_PROMPT}\n\nMensaje:\n${text}`,
@@ -148,6 +209,28 @@ export async function parseFinanceText(text: string): Promise<FinanceParse> {
   const raw = response.text;
   if (!raw) throw new Error('Gemini no devolvió texto financiero');
   return normalizeFinanceParse(JSON.parse(raw));
+}
+
+async function parseFinanceTextWithCerebras(text: string): Promise<FinanceParse> {
+  const parsed = await withCerebras(async call => {
+    const response = await call({
+      model: config.cerebrasModel(),
+      messages: [
+        { role: 'system', content: FINANCE_PROMPT },
+        { role: 'user', content: `Mensaje:\n${text}` }
+      ],
+      temperature: 0.1,
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'finanzas', strict: true, schema: cerebrasFinanceSchema }
+      }
+    });
+    const raw = response?.choices?.[0]?.message?.content;
+    if (!raw) throw new Error('Cerebras no devolvió texto financiero');
+    return JSON.parse(raw);
+  }, { operationName: 'parser financiero (cerebras)' });
+
+  return normalizeFinanceParse(parsed);
 }
 
 
