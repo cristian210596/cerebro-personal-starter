@@ -99,14 +99,46 @@ export async function resolveMasterEntity(text: string, tipo?: string | null) {
   for (const row of aliases || []) {
     const a = row.alias_normalizado || normalizeEntityKey(row.alias || '');
     const master = row.entidades_maestras;
+    if (!a || !master) continue;
     if (tipo && master?.tipo && normalizeEntityKey(master.tipo) !== normalizeEntityKey(tipo)) continue;
-    let score = 0;
-    if (q === a) score = 1;
-    else if (q.includes(a) || a.includes(q)) score = Math.min(a.length, q.length) / Math.max(a.length, q.length) * 0.9;
-    else if (a.split(' ').some((p: string) => p.length > 3 && q.includes(p))) score = 0.55;
+    const score = scoreAliasMatch(q, a);
     if (score > bestScore) { best = master; bestScore = score; }
   }
   return bestScore >= 0.55 ? { entidad: best, score: bestScore } : null;
+}
+
+// Los resumenes de tarjeta suelen pegarle un sufijo/codigo al comercio conocido
+// (ej: "UBERX25151", "MERPAGO*NEGOCIO123"). Antes esto perdia contra el umbral de
+// similitud porque el largo relativo entre alias y texto era muy chico. Ahora, si
+// el alias conocido aparece como PREFIJO (o el texto es prefijo del alias), se
+// considera una senal fuerte de que es la misma entidad aunque el texto sea mas largo.
+function scoreAliasMatch(q: string, a: string): number {
+  if (!q || !a) return 0;
+  if (q === a) return 1;
+  if (a.length >= 4 && (q.startsWith(a) || a.startsWith(q))) {
+    return Math.max(0.75, (Math.min(a.length, q.length) / Math.max(a.length, q.length)) * 0.9);
+  }
+  if (q.includes(a) || a.includes(q)) {
+    return (Math.min(a.length, q.length) / Math.max(a.length, q.length)) * 0.9;
+  }
+  if (a.split(' ').some((p) => p.length > 3 && q.includes(p))) return 0.55;
+  return 0;
+}
+
+// Resuelve una entidad a partir de un texto crudo (comercio o descripcion de un
+// movimiento) y, si el match fue por similitud (no exacto), aprende ese texto como
+// alias nuevo para que la proxima vez sea un match exacto y barato. Este es el punto
+// central de "que se de cuenta que uberx25151 y uber son lo mismo": la primera vez
+// matchea por similitud, de ahi en adelante matchea exacto.
+export async function resolveAndLearnEntity(rawText: string, tipo?: string | null) {
+  const text = clean(rawText);
+  if (!text) return null;
+  const match = await resolveMasterEntity(text, tipo);
+  if (!match || !match.entidad) return null;
+  if (match.score < 0.97) {
+    try { await upsertEntityAlias(match.entidad.id, text, 'auto_fuzzy'); } catch (_) { /* no bloquea el flujo principal */ }
+  }
+  return match.entidad as { id: string; nombre: string; tipo: string; categoria: string | null; subcategoria: string | null };
 }
 
 export async function listMasterEntities(query = '', limit = 30) {

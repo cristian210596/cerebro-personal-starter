@@ -4,7 +4,7 @@ import { normalizeEntityKey, resolveMasterEntity } from './entityBrain.js';
 export async function listConciliationCandidates(limit = 15) {
   const [manual, imported, comprobantes] = await Promise.all([
     supabase.from('finanzas_movimientos').select('*').order('created_at', { ascending: false }).limit(200),
-    supabase.from('finanzas_importados_movimientos').select('*').order('created_at', { ascending: false }).limit(200),
+    supabase.from('finanzas_movimientos_importados').select('*').order('created_at', { ascending: false }).limit(200),
     supabase.from('finanzas_comprobantes').select('*').order('created_at', { ascending: false }).limit(100)
   ]);
   if (manual.error) throw manual.error;
@@ -31,7 +31,7 @@ export async function confirmConciliationByIndex(index: number) {
   const cand = candidates[index - 1];
   if (!cand) throw new Error('No encontré esa conciliación pendiente.');
   if (cand.tipo === 'importado_vs_manual') {
-    await supabase.from('finanzas_importados_movimientos').update({ movimiento_id: cand.destino.id, estado: 'conciliado', updated_at: new Date().toISOString() }).eq('id', cand.origen.id);
+    await supabase.from('finanzas_movimientos_importados').update({ movimiento_id: cand.destino.id, estado: 'conciliado', updated_at: new Date().toISOString() }).eq('id', cand.origen.id);
     return cand;
   }
   if (cand.tipo === 'comprobante_vs_movimiento') {
@@ -54,7 +54,7 @@ export async function getFinancialSourcesForLastMovement() {
   if (error) throw error;
   if (!mov) return null;
   const [imps, comps] = await Promise.all([
-    supabase.from('finanzas_importados_movimientos').select('*').eq('movimiento_id', mov.id),
+    supabase.from('finanzas_movimientos_importados').select('*').eq('movimiento_id', mov.id),
     supabase.from('finanzas_comprobantes').select('*').eq('movimiento_financiero_id', mov.id)
   ]);
   return { movimiento: mov, importados: imps.data || [], comprobantes: comps.data || [] };
@@ -65,7 +65,7 @@ export async function buildInbox() {
     safeSelect('procesamiento_cola', 'id,tipo,estado,motivo,nombre_archivo,reintentar_desde', ['pendiente', 'reintentar', 'error']),
     safeSelect('finanzas_comprobantes', '*', ['pendiente_revision', 'pendiente_conciliacion']),
     safeSelect('sueldos_recibos', '*', ['pendiente_revision']),
-    safeSelect('finanzas_importados_movimientos', '*', ['pendiente_revision']),
+    safeSelect('finanzas_movimientos_importados', '*', ['pendiente_revision']),
     listConciliationCandidates(8).catch(() => []),
     safeProductsWithoutCategory()
   ]);

@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { supabase } from './supabaseClient.js';
 import { config } from './config.js';
 import { withGemini } from './geminiPool.js';
+import { resolveAndLearnEntity, upsertEntityAlias, upsertMasterEntity } from './entityBrain.js';
 
 
 export type ImportedMovement = {
@@ -95,7 +96,8 @@ export async function importFinanceFile(input: {
       importacion: existing,
       processed,
       stats: await buildImportStats(existing.id),
-      nextPending: await getNextPendingImportedMovement(existing.id)
+      nextPending: await getNextPendingImportedMovement(existing.id),
+      pendingList: await getPendingImportedMovements(8, existing.id)
     };
   }
 
@@ -148,6 +150,7 @@ export async function importFinanceFile(input: {
   const processed = await autoProcessImportedRowsWithRules(inserted);
   const stats = await buildImportStats(importacion.id);
   const nextPending = await getNextPendingImportedMovement(importacion.id);
+  const pendingList = await getPendingImportedMovements(8, importacion.id);
 
   await updateImportationState(importacion.id);
 
@@ -157,7 +160,8 @@ export async function importFinanceFile(input: {
     importacion,
     processed,
     stats,
-    nextPending
+    nextPending,
+    pendingList
   };
 }
 
@@ -896,7 +900,8 @@ async function insertImportedRows(rows: any[]) {
 }
 
 async function autoProcessImportedRows(rows: any[]) {
-  const stats = { autoInserted: 0, matchedManual: 0, pending: 0, ignored: 0 };
+  const stats: { autoInserted: number; matchedManual: number; pending: number; ignored: number; movements: any[] } =
+    { autoInserted: 0, matchedManual: 0, pending: 0, ignored: 0, movements: [] };
   for (const row of rows) {
     if (row.estado === 'ignorado' || row.movimiento_id) continue;
     if (row.estado === 'pendiente_revision') {
@@ -914,6 +919,7 @@ async function autoProcessImportedRows(rows: any[]) {
         updated_at: new Date().toISOString()
       }).eq('id', row.id);
       stats.autoInserted += 1;
+      stats.movements.push(alreadyConsolidated);
       continue;
     }
 
@@ -922,12 +928,14 @@ async function autoProcessImportedRows(rows: any[]) {
       const updated = await mergeImportedIntoMovement(row, match);
       await markImportedConciliated(row, updated, match.score, match.reason);
       stats.matchedManual += 1;
+      stats.movements.push(updated);
       continue;
     }
 
     const movement = await createMovementFromImported(row);
     await supabase.from('finanzas_movimientos_importados').update({ estado: 'importado', movimiento_id: movement.id, updated_at: new Date().toISOString() }).eq('id', row.id);
     stats.autoInserted += 1;
+    stats.movements.push(movement);
   }
   return stats;
 }
@@ -945,6 +953,15 @@ async function findMovementByExternalHash(externalHash: string | null) {
 }
 
 async function createMovementFromImported(row: any) {
+  // Antes el comercio quedaba tal cual lo escribio el resumen (ej: "PAYU*AR*UBER1234"),
+  // asi que "cuanto gaste en Uber" no encontraba nada si el texto cambiaba de un resumen
+  // a otro. Ahora se resuelve contra las entidades maestras conocidas: si hay match, el
+  // comercio se normaliza al nombre canonico y el texto crudo queda aprendido como alias.
+  const entity = await resolveAndLearnEntity(row.comercio_detectado || row.descripcion_original).catch(() => null);
+  const comercio = entity?.nombre || row.comercio_detectado || row.descripcion_original;
+  const categoria = row.categoria_confirmada || row.categoria_sugerida || entity?.categoria || 'Otros';
+  const subcategoria = row.subcategoria_confirmada || row.subcategoria_sugerida || entity?.subcategoria || null;
+
   const { data, error } = await supabase
     .from('finanzas_movimientos')
     .insert({
@@ -953,12 +970,12 @@ async function createMovementFromImported(row: any) {
       monto: Number(row.monto || 0),
       moneda: row.moneda || 'ARS',
       descripcion: row.descripcion_original,
-      categoria_financiera: row.categoria_confirmada || row.categoria_sugerida || 'Otros',
-      subcategoria_financiera: row.subcategoria_confirmada || row.subcategoria_sugerida || null,
+      categoria_financiera: categoria,
+      subcategoria_financiera: subcategoria,
       medio_pago: row.tarjeta ? `${row.tarjeta} crédito` : row.proveedor || null,
       tarjeta: row.tarjeta || null,
       banco_billetera: row.proveedor || null,
-      comercio: row.comercio_detectado || row.descripcion_original,
+      comercio,
       cuotas: row.cuotas_totales || null,
       estado: 'confirmado',
       origen: 'importacion',
@@ -1025,10 +1042,11 @@ function matchScore(row: any, movement: any) {
 
 async function mergeImportedIntoMovement(row: any, match: { movement: any; score: number; reason: string }) {
   const current = match.movement;
+  const entity = await resolveAndLearnEntity(row.comercio_detectado || row.descripcion_original).catch(() => null);
   const patch: any = {
     monto: Number(row.monto || current.monto || 0),
     moneda: row.moneda || current.moneda || 'ARS',
-    comercio: row.comercio_detectado || current.comercio || null,
+    comercio: entity?.nombre || row.comercio_detectado || current.comercio || null,
     descripcion: mergeDescription(current.descripcion, row.descripcion_original),
     medio_pago: current.medio_pago || (row.tarjeta ? `${row.tarjeta} crédito` : row.proveedor || null),
     tarjeta: current.tarjeta || row.tarjeta || null,
@@ -1113,13 +1131,15 @@ export async function getNextPendingImportedMovement(importacionId?: string | nu
   return data || null;
 }
 
-export async function getPendingImportedMovements(limit = 12) {
-  const { data, error } = await supabase.from('finanzas_movimientos_importados').select('*, finanzas_importaciones(periodo,tarjeta,proveedor,nombre_archivo)').eq('estado', 'pendiente_revision').order('created_at', { ascending: true }).limit(limit);
+export async function getPendingImportedMovements(limit = 12, importacionId?: string | null) {
+  let q = supabase.from('finanzas_movimientos_importados').select('*, finanzas_importaciones(periodo,tarjeta,proveedor,nombre_archivo)').eq('estado', 'pendiente_revision').order('created_at', { ascending: true }).limit(limit);
+  if (importacionId) q = q.eq('importacion_id', importacionId);
+  const { data, error } = await q;
   if (error) throw error;
   return data || [];
 }
 
-export async function classifyImportedMovementByIndex(index: number, categoryText: string, saveRule: boolean) {
+export async function classifyImportedMovementByIndex(index: number, categoryText: string, saveRule: boolean, entidadNombre?: string | null) {
   const rows = await getPendingImportedMovements(30);
   const row = rows[index - 1];
   if (!row) return { ok: false as const, message: `No encontré pendiente #${index}. Usá /importacion revisar.` };
@@ -1139,6 +1159,19 @@ export async function classifyImportedMovementByIndex(index: number, categoryTex
   let rule = null;
   if (saveRule) rule = await saveCommerceRuleFromImported(updated, parsed.category, parsed.subcategory);
 
+  // Si el usuario nos dijo explícitamente qué entidad es (ej: "es mercado pago"), la
+  // registramos como entidad maestra y guardamos el texto crudo del resumen como alias,
+  // para que la próxima vez que aparezca (aunque cambie el sufijo/código) se reconozca sola.
+  if (entidadNombre) {
+    try {
+      const master = await upsertMasterEntity({ nombre: entidadNombre, categoria: parsed.category, subcategoria: parsed.subcategory });
+      await upsertEntityAlias(master.id, updated.comercio_detectado || updated.descripcion_original, 'clarificacion_usuario');
+      updated.comercio_detectado = master.nombre;
+    } catch (entityError) {
+      console.error('No pude registrar la entidad a partir de la respuesta del usuario:', entityError);
+    }
+  }
+
   const match = await findManualMatch(updated);
   let movement: any;
   let action = 'importado';
@@ -1153,6 +1186,57 @@ export async function classifyImportedMovementByIndex(index: number, categoryTex
 
   await updateImportationState(row.importacion_id);
   return { ok: true as const, imported: updated, movement, rule, action, nextPending: await getNextPendingImportedMovement() };
+}
+
+async function interpretPendingAnswerWithGemini(row: any, answerText: string) {
+  if (!process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEYS && !process.env.GEMINI_API_KEY_2) return null;
+  const prompt = [
+    'Un movimiento de un resumen de tarjeta no se pudo clasificar automáticamente y el usuario explicó qué es.',
+    `Descripción original del resumen: ${row.descripcion_original || row.comercio_detectado || '-'}`,
+    `Monto: ${row.monto} ${row.moneda || 'ARS'}`,
+    `Fecha: ${row.fecha_movimiento || '-'}`,
+    `Respuesta del usuario: "${answerText}"`,
+    'Devolvé SOLO JSON válido, sin markdown, con esta forma exacta:',
+    '{ "entidad_nombre": string | null, "categoria": string, "subcategoria": string | null }',
+    'Reglas:',
+    '- "entidad_nombre": nombre corto y genérico del comercio, servicio o persona (ej: "Mercado Pago", "Farmacity", "mi hermano"). No repitas el texto crudo del resumen. Si no queda claro, usá null.',
+    '- "categoria" y "subcategoria": cortas, en español, consistentes con categorías de gastos personales (ej: Supermercado, Transporte, Salud, Comida afuera, Deudas / compartidos, Servicios, Otros).'
+  ].join('\n');
+
+  try {
+    const response = await withGemini(ai => ai.models.generateContent({
+      model: config.geminiModel(),
+      contents: [{ role: 'user', parts: [{ text: prompt }] }]
+    }), { operationName: 'interpretar respuesta de clasificación' });
+    const jsonText = extractJsonObject(response.text || '');
+    if (!jsonText) return null;
+    const parsed = JSON.parse(jsonText);
+    return {
+      entidad_nombre: parsed.entidad_nombre ? String(parsed.entidad_nombre).trim() : null,
+      categoria: parsed.categoria ? String(parsed.categoria).trim() : null,
+      subcategoria: parsed.subcategoria ? String(parsed.subcategoria).trim() : null
+    };
+  } catch (error: any) {
+    console.error('No pude interpretar respuesta de clasificación con Gemini:', error?.message || error);
+    return null;
+  }
+}
+
+// Permite responder en lenguaje natural ("1 es mercado pago, le pagué a mi hermano por
+// nafta") en vez de tener que usar la sintaxis rígida de /clasificar. Usa Gemini para
+// interpretar categoría + entidad; si Gemini no está disponible, cae a un parser simple.
+export async function classifyImportedMovementFromAnswer(index: number, answerText: string) {
+  const rows = await getPendingImportedMovements(30);
+  const row = rows[index - 1];
+  if (!row) return { ok: false as const, message: `No encontré pendiente #${index}. Usá /importacion revisar.` };
+
+  const interpreted = await interpretPendingAnswerWithGemini(row, answerText);
+  const fallback = parseCategoryAndSubcategory(answerText);
+  const categoria = interpreted?.categoria || fallback.category || 'Otros';
+  const subcategoria = interpreted?.subcategoria || fallback.subcategory || null;
+  const categoryText = [categoria, subcategoria].filter(Boolean).join(' / ');
+
+  return classifyImportedMovementByIndex(index, categoryText, false, interpreted?.entidad_nombre || null);
 }
 
 async function saveCommerceRuleFromImported(row: any, category: string, subcategory: string | null) {
@@ -1222,8 +1306,53 @@ export async function summarizeFinanceAnalytics(text: string) {
   if (error) throw error;
   const consolidatedRows = (data || []).filter((row: any) => matchesAnalyticsTarget(row, target));
   const importedRows = await loadUnconsolidatedImportedAnalyticsRows(period, target);
-  const rows = [...consolidatedRows, ...importedRows];
+  // Antes esta funcion solo miraba finanzas_movimientos / finanzas_movimientos_importados
+  // (resumenes de tarjeta, gastos escritos a mano). Los comprobantes fotografiados
+  // (facturas/tickets) viven en otra tabla aparte y nunca se sumaban aca — por eso
+  // "cuanto gaste en Gillette" no encontraba nada aunque el comprobante estaba cargado.
+  const comprobanteRows = await loadComprobanteAnalyticsRows(period, target);
+  const rows = [...consolidatedRows, ...importedRows, ...comprobanteRows];
   return { target, period, rows, totals: totalsByCurrency(rows), monthly: totalsByMonthAndCurrency(rows) };
+}
+
+async function loadComprobanteAnalyticsRows(period: { start: string; end: string }, target: { terms: string[] }) {
+  // Sin termino especifico (ej: "cuanto gaste este mes" a secas) no traemos comprobantes:
+  // ya estan cubiertos a nivel comercio por los movimientos de tarjeta/cuenta, y sumar
+  // ademas cada item de cada ticket duplicaria el total. Con un termino puntual (una marca,
+  // un producto) el riesgo de doble conteo es bajo porque los movimientos bancarios no
+  // suelen tener el nombre del producto, solo el comercio.
+  if (!target.terms.length) return [];
+
+  const { data, error } = await supabase
+    .from('finanzas_comprobante_items')
+    .select('*, finanzas_comprobantes!inner(fecha_emision,comercio,moneda,movimiento_financiero_id)')
+    .gte('finanzas_comprobantes.fecha_emision', period.start)
+    .lte('finanzas_comprobantes.fecha_emision', period.end)
+    // Si el comprobante ya quedo conciliado con un movimiento bancario, ese gasto ya esta
+    // contado arriba (finanzas_movimientos) — lo excluimos de aca para no duplicarlo.
+    .is('finanzas_comprobantes.movimiento_financiero_id', null)
+    .limit(2000);
+  if (error) throw error;
+
+  return (data || [])
+    .map((row: any) => {
+      const comp = row.finanzas_comprobantes || {};
+      return {
+        fecha_movimiento: comp.fecha_emision || null,
+        monto: Math.max(0, Number(row.importe || 0)),
+        moneda: comp.moneda || 'ARS',
+        comercio: comp.comercio || null,
+        descripcion: row.descripcion || null,
+        categoria_financiera: row.categoria || null,
+        subcategoria_financiera: row.subcategoria || null,
+        medio_pago: null,
+        tarjeta: null,
+        banco_billetera: null,
+        merchant_key: row.marca || null,
+        origen: 'comprobante'
+      };
+    })
+    .filter((row: any) => matchesAnalyticsTarget(row, target));
 }
 
 async function loadUnconsolidatedImportedAnalyticsRows(period: { start: string; end: string }, target: { terms: string[] }) {
@@ -1282,7 +1411,11 @@ export function formatFinanceAnalyticsReport(report: Awaited<ReturnType<typeof s
   lines.push('');
   lines.push('Últimos movimientos:');
   for (const row of rows.slice(-6).reverse()) {
-    const extra = row.origen === 'importacion_no_consolidada' ? ' [importado no consolidado]' : '';
+    const extra = row.origen === 'importacion_no_consolidada'
+      ? ' [importado no consolidado]'
+      : row.origen === 'comprobante'
+        ? ' [comprobante]'
+        : '';
     lines.push(`- ${row.fecha_movimiento}: ${formatMoney(Number(row.monto || 0), row.moneda || 'ARS')} — ${row.comercio || row.descripcion || '-'}${extra}`);
   }
   return lines.join('\n');
@@ -1334,11 +1467,16 @@ export function formatImportResult(result: Awaited<ReturnType<typeof importFinan
     lines.push('');
     lines.push('Hay movimientos clasificados que todavía no quedaron como gasto consolidado. Mandá: /importacion procesar');
   }
-  if (result.nextPending) {
+  const pendingList = (result as any).pendingList as any[] | undefined;
+  if (pendingList && pendingList.length) {
+    lines.push('', pendingList.length > 1 ? `No reconocí ${pendingList.length} movimientos. Contame qué son:` : 'No reconocí este movimiento. Contame qué es:');
+    pendingList.forEach((row, idx) => lines.push('', formatOnePending(row, idx + 1)));
+    lines.push('', 'Respondé así: "1 es mercado pago, le pagué a mi hermano por nafta" (funciona con cualquiera de los números de arriba).');
+    lines.push('También podés usar: /clasificar 1 Categoria guardar regla');
+  } else if (result.nextPending) {
     lines.push('', 'Próximo pendiente:');
     lines.push(formatOnePending(result.nextPending, 1));
-    lines.push('', 'Respondé: /clasificar 1 Categoria guardar regla');
-    lines.push('Ejemplo: /clasificar 1 Suscripciones guardar regla');
+    lines.push('', 'Respondé: "1 es ..." o /clasificar 1 Categoria guardar regla');
   }
   return lines.join('\n');
 }
@@ -1626,7 +1764,7 @@ function extractAnalyticsTarget(text: string) {
   if (/chat\s*gpt|chatgpt|openai/.test(t)) return { label: 'ChatGPT / OpenAI', terms: ['openai', 'chatgpt', 'chat gpt'] };
   const cleaned = t
     .replace(/^\/?reporte gastos?\s*/g, '')
-    .replace(/cu[aá]nto|cuanto|gaste|gast[eé]|gastaste|total|en|este|esta|año|ano|mes|llevo|vengo|suscripcion|suscripción|de|la|el|los|las|por/g, ' ')
+    .replace(/cu[aá]nto|cuanto|gaste|gast[eé]|gastaste|ultimamente|últimamente|total|en|este|esta|año|ano|mes|llevo|vengo|suscripcion|suscripción|de|la|el|los|las|por/g, ' ')
     .replace(/\b20\d{2}\b/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();

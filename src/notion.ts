@@ -279,6 +279,24 @@ export async function syncNotionFinanceResult(result: any) {
   return { movimientos, deudas, particiones };
 }
 
+export async function syncNotionImportedMovements(movements: any[]) {
+  const notion = getNotionClient();
+  if (!notion || !Array.isArray(movements) || !movements.length) return { movimientos: 0 };
+
+  const dbs = await ensureFinanceDatabases(notion);
+  let movimientos = 0;
+  for (const row of movements) {
+    if (!row?.id) continue;
+    try {
+      const pageId = await createOrUpdateNotionMovimiento(notion, dbs.finanzasMovimientosDatabaseId, row);
+      if (pageId) movimientos += 1;
+    } catch (error) {
+      console.error('No se pudo sincronizar movimiento importado a Notion:', error);
+    }
+  }
+  return { movimientos };
+}
+
 export async function setupFinanceNotionDatabases(options: { force?: boolean } = {}) {
   const notion = getNotionClient();
   if (!notion) throw new Error('Falta NOTION_TOKEN.');

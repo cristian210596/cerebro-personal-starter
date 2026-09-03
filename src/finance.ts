@@ -3,6 +3,7 @@ import { config } from './config.js';
 import { withGemini } from './geminiPool.js';
 import { isCerebrasConfigured, withCerebras } from './cerebrasPool.js';
 import { supabase, saveItem } from './supabaseClient.js';
+import { resolveAndLearnEntity } from './entityBrain.js';
 import type { Clasificacion, EntidadClasificada, ItemInsert } from './types.js';
 
 
@@ -377,6 +378,14 @@ export async function persistFinance(parsed: FinanceParse, itemId: string) {
 }
 
 async function insertMovimiento(parsed: Partial<FinanceParse>, itemId: string) {
+  // Mismo criterio que en la importación de resúmenes: si el comercio dicho/escrito
+  // matchea (exacto o parecido) con una entidad ya conocida, se normaliza al nombre
+  // canónico para que "uber", "uberx", etc. sumen siempre al mismo lugar en los reportes.
+  const entity = parsed.comercio ? await resolveAndLearnEntity(parsed.comercio).catch(() => null) : null;
+  const comercio = entity?.nombre || parsed.comercio || null;
+  const categoriaFinanciera = parsed.categoria_financiera || entity?.categoria || 'Otros';
+  const subcategoriaFinanciera = parsed.subcategoria_financiera || entity?.subcategoria || null;
+
   const { data, error } = await supabase
     .from('finanzas_movimientos')
     .insert({
@@ -385,12 +394,12 @@ async function insertMovimiento(parsed: Partial<FinanceParse>, itemId: string) {
       monto: Number(parsed.monto || parsed.pago_deuda_monto || 0),
       moneda: parsed.moneda || 'ARS',
       descripcion: parsed.descripcion || parsed.resumen || parsed.titulo || null,
-      categoria_financiera: parsed.categoria_financiera || 'Otros',
-      subcategoria_financiera: parsed.subcategoria_financiera || null,
+      categoria_financiera: categoriaFinanciera,
+      subcategoria_financiera: subcategoriaFinanciera,
       medio_pago: normalizePaymentMethod(parsed.medio_pago || parsed.tarjeta || parsed.banco_billetera),
       tarjeta: normalizeTarjeta(parsed.tarjeta || parsed.medio_pago),
       banco_billetera: normalizeBancoBilletera(parsed.banco_billetera || parsed.medio_pago),
-      comercio: parsed.comercio || null,
+      comercio,
       cuotas: parsed.cuotas ? Number(parsed.cuotas) : null,
       estado: parsed.estado || 'confirmado',
       item_id: itemId

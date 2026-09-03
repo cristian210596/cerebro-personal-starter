@@ -22,7 +22,7 @@ import {
   syncItemDerivedData,
   updateItemFields
 } from './supabaseClient.js';
-import { createNotionArchivoPage, createNotionItemPage, syncNotionDerivedForItem, syncNotionFinanceResult, updateNotionItemPage } from './notion.js';
+import { createNotionArchivoPage, createNotionItemPage, syncNotionDerivedForItem, syncNotionFinanceResult, syncNotionImportedMovements, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
 import { getGeminiPoolStatus, testGeminiPoolOnce } from './geminiPool.js';
 import { getCerebrasPoolStatus, testCerebrasPoolOnce, getCerebrasConfiguredKeyCount } from './cerebrasPool.js';
@@ -38,7 +38,7 @@ import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, format
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
-import { classifyImportedMovementByIndex, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
+import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
 import { formatComprobanteDetail, formatComprobanteImportResult, formatComprobanteItems, formatComprobantes, formatProductRuleResult, formatProductSpendingReport, formatProducts, getComprobanteItems, getLastComprobante, importComprobanteFromFile, listComprobantes, listProducts, looksLikeComprobanteFile, looksLikeProductQueryText, saveProductRuleFromText, summarizeProductSpending } from './comprobantes.js';
 import { confirmLastSalaryReceipt, correctLastSalaryReceiptFromText, createManualSalaryReceiptFromText, formatSalaryConcepts, formatSalaryImportResult, formatSalaryList, formatSalaryReceipt, formatSalarySummary, getLastSalaryReceipt, getSalaryConcepts, importSalaryReceiptFromFile, listSalaryReceipts, looksLikeSalaryFile, looksLikeSalaryQueryText, summarizeSalaryFromText } from './salary.js';
 import { enqueueProcessingTask, cleanupQueueCompleted, formatQueue, formatQueueProcessResults, listQueue, processQueue, retryLastQueued } from './processingQueue.js';
@@ -427,6 +427,12 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return handleRevisionCommand(chatId, text.replace(/^revisi[oó]n\s*/i, ''));
   }
 
+  const pendingAnswerMatch = text.trim().match(/^(\d{1,2})\s*(?:es|son|:|-)\s+(.+)$/i);
+  if (pendingAnswerMatch) {
+    const handled = await handlePendingImportedAnswer(chatId, Number(pendingAnswerMatch[1]), pendingAnswerMatch[2]);
+    if (handled) return;
+  }
+
   if (looksLikeImportCommand(text)) {
     const handled = await handleImportNaturalText(chatId, text);
     if (handled) return;
@@ -634,6 +640,14 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
         itemId: null,
         archivoId: archivo.id
       });
+
+      if (financeImport.recognized) {
+        try {
+          await syncNotionImportedMovements((financeImport as any).processed?.movements || []);
+        } catch (error) {
+          console.error('No se pudo sincronizar movimientos importados a Notion:', error);
+        }
+      }
 
       const financeImportMessage = formatImportResult(financeImport);
       const importReason = !financeImport.recognized && 'reason' in financeImport ? String((financeImport as any).reason || '') : '';
@@ -868,6 +882,13 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
           itemId: result.item.id,
           archivoId: archivo.id
         });
+        if (financeImport.recognized) {
+          try {
+            await syncNotionImportedMovements((financeImport as any).processed?.movements || []);
+          } catch (notionError) {
+            console.error('No se pudo sincronizar movimientos importados a Notion:', notionError);
+          }
+        }
         financeImportMessage = formatImportResult(financeImport);
       } catch (error: any) {
         console.error('No pude importar finanzas desde archivo:', error);
@@ -1418,10 +1439,39 @@ async function handleClasificarImportadoCommand(chatId: number, args: string) {
   const saveRule = /guardar regla|siempre|recordar/i.test(text);
   try {
     const result = await classifyImportedMovementByIndex(index, text, saveRule);
+    if (result.ok && result.movement) {
+      try { await syncNotionImportedMovements([result.movement]); } catch (notionError) { console.error('No se pudo sincronizar movimiento clasificado a Notion:', notionError); }
+    }
     return sendMessage(chatId, formatClassifyImportedResult(result));
   } catch (error: any) {
     console.error('No pude clasificar importado:', error);
     return sendMessage(chatId, `No pude clasificar movimiento importado: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+// Responder en lenguaje natural a un pendiente de clasificación: "1 es mercado pago,
+// le pagué a mi hermano por nafta". Si el número no corresponde a ningún pendiente
+// real, no hace nada (devuelve false) para no interferir con mensajes normales que
+// arrancan con un número por otro motivo.
+async function handlePendingImportedAnswer(chatId: number, index: number, answerText: string) {
+  try {
+    const pending = await getPendingImportedMovements(30);
+    if (!pending.length || index < 1 || index > pending.length) return false;
+
+    await sendMessage(chatId, 'Anotado. Clasificando con lo que me contaste...');
+    const result = await classifyImportedMovementFromAnswer(index, answerText);
+    if (!result.ok) {
+      await sendMessage(chatId, result.message);
+      return true;
+    }
+    if (result.movement) {
+      try { await syncNotionImportedMovements([result.movement]); } catch (notionError) { console.error('No se pudo sincronizar movimiento clasificado a Notion:', notionError); }
+    }
+    await sendMessage(chatId, formatClassifyImportedResult(result));
+    return true;
+  } catch (error: any) {
+    console.error('No pude interpretar respuesta a pendiente de clasificación:', error);
+    return false;
   }
 }
 
