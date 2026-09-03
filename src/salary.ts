@@ -607,6 +607,19 @@ function extractSalaryPeriodRange(text: string) {
   const singlePeriod = extractPeriodFromText(text);
   if (singlePeriod) return { startPeriod: singlePeriod, endPeriod: singlePeriod };
 
+  // "el mes pasado" / "mes anterior": un solo periodo, el mes calendario anterior a hoy.
+  // Antes esto no estaba contemplado y caia directo al default de "todo el año".
+  if (t.includes('mes pasado') || t.includes('mes anterior')) {
+    const p = periodLabel(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+    return { startPeriod: p, endPeriod: p };
+  }
+
+  // "este mes": un solo periodo, el mes actual.
+  if (t.includes('este mes')) {
+    const p = periodLabel(now);
+    return { startPeriod: p, endPeriod: p };
+  }
+
   // "ultimos/ultimos N meses": ventana relativa real, contando hacia atras desde el mes actual.
   // Antes "ultimos" (sin leer el numero) devolvia siempre un rango fijo de ~24 meses.
   const monthsBackMatch = t.match(/(?:ultimos?|últimos?)\s+(\d{1,2})\s*mes(?:es)?/);
@@ -615,6 +628,12 @@ function extractSalaryPeriodRange(text: string) {
     const endPeriod = periodLabel(now);
     const startPeriod = periodLabel(new Date(now.getFullYear(), now.getMonth() - (n - 1), 1));
     return { startPeriod, endPeriod };
+  }
+
+  // "el año pasado" / "año anterior": el año calendario completo anterior (no el actual).
+  // Quedo pendiente ayer, lo cierro ahora de paso porque es el mismo tipo de bug.
+  if (t.includes('ano pasado') || t.includes('año pasado') || t.includes('ano anterior') || t.includes('año anterior')) {
+    return { startPeriod: `${year - 1}-01`, endPeriod: `${year - 1}-12` };
   }
 
   if (t.includes('este ano') || t.includes('este año')) return { startPeriod: `${year}-01`, endPeriod: `${year}-12` };
@@ -645,7 +664,9 @@ function extractConceptTarget(text: string) {
   const cleaned = t
     .replace(/[¿?¡!.,;:]+/g, ' ')
     .replace(/^\/?sueldo\s*/, '')
-    .replace(/\b(cu[aá]nto|cuanto|gan[eé]|gane|cobr[eé]|cobro|me pagaron|total|neto|bruto|recibo|de|del|los|las|el|la|en|mi|mis|este|esta|ano|año|mes|meses|ultimos?|últimos?)\b/g, ' ')
+    // "pasado/anterior/proximo/actual/corriente" describen CUANDO, no un concepto del recibo.
+    // Sin esto, "cuanto cobre el mes pasado" devolvia targetConcept="pasado" (bug real, visto en vivo).
+    .replace(/\b(cu[aá]nto|cuanto|gan[eé]|gane|cobr[eé]|cobro|me pagaron|total|neto|bruto|recibo|de|del|los|las|el|la|en|mi|mis|este|esta|ano|año|mes|meses|ultimos?|últimos?|pasado|pasada|anterior|proximo|próximo|actual|corriente)\b/g, ' ')
     .replace(/\d+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
