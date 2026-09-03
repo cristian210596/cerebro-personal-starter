@@ -38,7 +38,7 @@ import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, format
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
-import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
+import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, getUnsyncedImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
 import { formatComprobanteDetail, formatComprobanteImportResult, formatComprobanteItems, formatComprobantes, formatProductRuleResult, formatProductSpendingReport, formatProducts, getComprobanteItems, getLastComprobante, importComprobanteFromFile, listComprobantes, listProducts, looksLikeComprobanteFile, looksLikeProductQueryText, saveProductRuleFromText, summarizeProductSpending } from './comprobantes.js';
 import { confirmLastSalaryReceipt, correctLastSalaryReceiptFromText, createManualSalaryReceiptFromText, formatSalaryConcepts, formatSalaryImportResult, formatSalaryList, formatSalaryReceipt, formatSalarySummary, getLastSalaryReceipt, getSalaryConcepts, importSalaryReceiptFromFile, listSalaryReceipts, looksLikeSalaryFile, looksLikeSalaryQueryText, summarizeSalaryFromText } from './salary.js';
 import { enqueueProcessingTask, cleanupQueueCompleted, formatQueue, formatQueueProcessResults, listQueue, processQueue, retryLastQueued } from './processingQueue.js';
@@ -642,11 +642,7 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
       });
 
       if (financeImport.recognized) {
-        try {
-          await syncNotionImportedMovements((financeImport as any).processed?.movements || []);
-        } catch (error) {
-          console.error('No se pudo sincronizar movimientos importados a Notion:', error);
-        }
+        await syncPendingImportedMovementsToNotion();
       }
 
       const financeImportMessage = formatImportResult(financeImport);
@@ -883,11 +879,7 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
           archivoId: archivo.id
         });
         if (financeImport.recognized) {
-          try {
-            await syncNotionImportedMovements((financeImport as any).processed?.movements || []);
-          } catch (notionError) {
-            console.error('No se pudo sincronizar movimientos importados a Notion:', notionError);
-          }
+          await syncPendingImportedMovementsToNotion();
         }
         financeImportMessage = formatImportResult(financeImport);
       } catch (error: any) {
@@ -1395,6 +1387,7 @@ async function handleImportacionCommand(chatId: number, args: string) {
   try {
     if (a.includes('procesar') || a.includes('consolidar')) {
       const result = await processFinanceImportation();
+      await syncPendingImportedMovementsToNotion();
       return sendMessage(chatId, formatProcessImportResult(result));
     }
 
@@ -1439,13 +1432,23 @@ async function handleClasificarImportadoCommand(chatId: number, args: string) {
   const saveRule = /guardar regla|siempre|recordar/i.test(text);
   try {
     const result = await classifyImportedMovementByIndex(index, text, saveRule);
-    if (result.ok && result.movement) {
-      try { await syncNotionImportedMovements([result.movement]); } catch (notionError) { console.error('No se pudo sincronizar movimiento clasificado a Notion:', notionError); }
-    }
+    if (result.ok) await syncPendingImportedMovementsToNotion();
     return sendMessage(chatId, formatClassifyImportedResult(result));
   } catch (error: any) {
     console.error('No pude clasificar importado:', error);
     return sendMessage(chatId, `No pude clasificar movimiento importado: ${error?.message || 'error desconocido'}`);
+  }
+}
+
+// Sincroniza a Notion CUALQUIER movimiento importado que todavia no tenga
+// página de Notion asociada, sin importar si se creó ahora o en una importación
+// anterior (incluye datos de pruebas viejas hechas antes de este fix).
+async function syncPendingImportedMovementsToNotion() {
+  try {
+    const pending = await getUnsyncedImportedMovements();
+    if (pending.length) await syncNotionImportedMovements(pending);
+  } catch (error) {
+    console.error('No se pudo sincronizar movimientos importados pendientes a Notion:', error);
   }
 }
 
@@ -1464,9 +1467,7 @@ async function handlePendingImportedAnswer(chatId: number, index: number, answer
       await sendMessage(chatId, result.message);
       return true;
     }
-    if (result.movement) {
-      try { await syncNotionImportedMovements([result.movement]); } catch (notionError) { console.error('No se pudo sincronizar movimiento clasificado a Notion:', notionError); }
-    }
+    await syncPendingImportedMovementsToNotion();
     await sendMessage(chatId, formatClassifyImportedResult(result));
     return true;
   } catch (error: any) {

@@ -1131,6 +1131,17 @@ export async function getNextPendingImportedMovement(importacionId?: string | nu
   return data || null;
 }
 
+export async function getUnsyncedImportedMovements(limit = 200) {
+  const { data, error } = await supabase
+    .from('finanzas_movimientos')
+    .select('*')
+    .eq('origen', 'importacion')
+    .is('notion_page_id', null)
+    .limit(limit);
+  if (error) throw error;
+  return data || [];
+}
+
 export async function getPendingImportedMovements(limit = 12, importacionId?: string | null) {
   let q = supabase.from('finanzas_movimientos_importados').select('*, finanzas_importaciones(periodo,tarjeta,proveedor,nombre_archivo)').eq('estado', 'pendiente_revision').order('created_at', { ascending: true }).limit(limit);
   if (importacionId) q = q.eq('importacion_id', importacionId);
