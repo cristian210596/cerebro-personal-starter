@@ -1335,6 +1335,23 @@ export async function getPendingImportedMovements(limit = 12, importacionId?: st
   return data || [];
 }
 
+// Si el usuario responde solo con el texto de la sugerencia (ej: "sin categoría"),
+// sin el número del pendiente adelante ("8 es ..."), antes esto no matcheaba
+// ningún handler de finanzas y terminaba guardado como una nota genérica sin
+// relación con el movimiento. Devuelve las posiciones (1-based, mismas que se
+// muestran como "#N") cuya sugerencia coincide exactamente con el texto.
+export async function findPendingIndicesMatchingSuggestion(text: string): Promise<number[]> {
+  const needle = String(text || '').trim().toLowerCase();
+  if (!needle) return [];
+  const rows = await getPendingImportedMovements(30);
+  const indices: number[] = [];
+  rows.forEach((row: any, i: number) => {
+    const suggestion = String(row.categoria_sugerida || 'sin categoría').trim().toLowerCase();
+    if (suggestion === needle) indices.push(i + 1);
+  });
+  return indices;
+}
+
 export async function classifyImportedMovementByIndex(index: number, categoryText: string, saveRule: boolean, entidadNombre?: string | null, detalle?: string | null) {
   const rows = await getPendingImportedMovements(30);
   const row = rows[index - 1];

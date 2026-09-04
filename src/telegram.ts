@@ -38,7 +38,7 @@ import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, format
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
-import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, correctLastFinanceMovementFromText, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, getUnsyncedImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, importPaymentScreenshotFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
+import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, correctLastFinanceMovementFromText, findPendingIndicesMatchingSuggestion, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, getUnsyncedImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, importPaymentScreenshotFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
 import { formatComprobanteDetail, formatComprobanteImportResult, formatComprobanteItems, formatComprobantes, formatProductRuleResult, formatProductSpendingReport, formatProducts, getComprobanteItems, getLastComprobante, importComprobanteFromFile, listComprobantes, listProducts, looksLikeComprobanteFile, looksLikeProductQueryText, saveProductRuleFromText, summarizeProductSpending } from './comprobantes.js';
 import { confirmLastSalaryReceipt, correctLastSalaryReceiptFromText, createManualSalaryReceiptFromText, formatSalaryConcepts, formatSalaryImportResult, formatSalaryList, formatSalaryReceipt, formatSalarySummary, getLastSalaryReceipt, getSalaryConcepts, importSalaryReceiptFromFile, listSalaryReceipts, looksLikeSalaryFile, looksLikeSalaryQueryText, summarizeSalaryFromText } from './salary.js';
 import { enqueueProcessingTask, cleanupQueueCompleted, formatQueue, formatQueueProcessResults, listQueue, processQueue, retryLastQueued } from './processingQueue.js';
@@ -452,6 +452,17 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (pendingAnswerMatch) {
     const handled = await handlePendingImportedAnswer(chatId, Number(pendingAnswerMatch[1]), pendingAnswerMatch[2]);
     if (handled) return;
+  } else {
+    // Respondió solo con la sugerencia (ej: "sin categoría"), sin el número del
+    // pendiente adelante. Antes esto se perdía como nota genérica random.
+    const suggestionMatches = await findPendingIndicesMatchingSuggestion(text);
+    if (suggestionMatches.length === 1) {
+      const handled = await handlePendingImportedAnswer(chatId, suggestionMatches[0], text.trim());
+      if (handled) return;
+    } else if (suggestionMatches.length > 1) {
+      await sendMessage(chatId, `Hay ${suggestionMatches.length} pendientes con esa misma sugerencia (#${suggestionMatches.join(', #')}). Decime el número, ej: "${suggestionMatches[0]} es ${text.trim()}".`);
+      return;
+    }
   }
 
   // "Modificar/corregir el último gasto. Es panadería" (o "movimiento"/"consumo"/"pago").
