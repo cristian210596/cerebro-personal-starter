@@ -453,6 +453,35 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     const handled = await handlePendingImportedAnswer(chatId, Number(pendingAnswerMatch[1]), pendingAnswerMatch[2]);
     if (handled) return;
   } else {
+    // Respuesta en bloque: varias líneas, una por pendiente ("1 sin categoria\n2
+    // sin categoria\n..."). El regex de una sola línea no cruza saltos de línea,
+    // así que antes esto no matcheaba nada y el bloque entero se perdía como una
+    // única nota genérica. Si cada línea no vacía tiene el formato "N es/son/:/-
+    // texto", se procesa cada una. Se va de mayor a menor índice porque
+    // clasificar un pendiente lo saca de la lista y corre los índices de los que
+    // quedan; yendo de atrás para adelante los números que faltan no se mueven.
+    const rawLines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
+    const perLineMatches = rawLines.map(l => l.match(/^(\d{1,2})\s*(?:es|son|:|-)\s+(.+)$/i));
+    if (rawLines.length > 1 && rawLines.length <= 30 && perLineMatches.every(Boolean)) {
+      await sendMessage(chatId, `Clasificando ${perLineMatches.length} pendientes...`);
+      const ordered = perLineMatches
+        .map(m => ({ index: Number(m![1]), answer: m![2] }))
+        .sort((a, b) => b.index - a.index);
+      const results: string[] = [];
+      for (const { index, answer } of ordered) {
+        try {
+          const result = await classifyImportedMovementFromAnswer(index, answer);
+          results.push(result.ok ? `#${index}: ${result.movement.comercio || '-'} — ${result.movement.categoria_financiera || '-'}` : `#${index}: ${result.message}`);
+        } catch (error: any) {
+          results.push(`#${index}: error (${error?.message || 'desconocido'})`);
+        }
+      }
+      results.reverse();
+      const notionLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
+      await sendMessage(chatId, [results.join('\n'), notionLine].filter(Boolean).join('\n\n'));
+      return;
+    }
+
     // Respondió solo con la sugerencia (ej: "sin categoría"), sin el número del
     // pendiente adelante. Antes esto se perdía como nota genérica random.
     const suggestionMatches = await findPendingIndicesMatchingSuggestion(text);

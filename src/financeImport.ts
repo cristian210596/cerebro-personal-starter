@@ -343,6 +343,7 @@ async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: str
   ];
 
   let best: string | null = null;
+  let bestLooksLikeStatement: string | null = null;
   for (const [name, fn] of attempts) {
     try {
       const text = await fn();
@@ -350,14 +351,32 @@ async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: str
       const cleaned = cleanPdfText(text);
       if (!best || cleaned.length > best.length) best = cleaned;
 
-      // Si ya parece resumen de tarjeta, no seguimos: priorizamos velocidad.
+      // Si ya parece resumen de tarjeta, verificamos que se pueda parsear de
+      // verdad antes de quedarnos con este extractor. Un extractor puede
+      // concatenar columnas sin espacio (ej: comprobante y monto pegados) y
+      // aun así matchear el encabezado "detalle del consumo" sin que se
+      // pueda extraer ni un movimiento; en ese caso seguimos probando los
+      // demás extractores en vez de conformarnos con texto inútil.
       if (/detalle\s+del\s+consumo/i.test(cleaned) && /(visa|master\s*card|mastercard|galicia)/i.test(cleaned)) {
-        console.log(`PDF financiero: texto extraído con ${name}. Caracteres: ${cleaned.length}`);
-        return cleaned;
+        if (!bestLooksLikeStatement) bestLooksLikeStatement = cleaned;
+        const trialParse = parseVisaGaliciaPdfText(cleaned, fileName);
+        if (trialParse && trialParse.movimientos.length > 0) {
+          console.log(`PDF financiero: texto extraído con ${name} (parseable, ${trialParse.movimientos.length} movimientos). Caracteres: ${cleaned.length}`);
+          return cleaned;
+        }
+        console.log(`PDF financiero: ${name} matcheó encabezado de resumen pero no logró parsear ningún movimiento; pruebo otro extractor.`);
       }
     } catch (error: any) {
       console.error(`Extractor PDF ${name} falló:`, error?.message || error);
     }
+  }
+
+  // Ningún extractor dio texto parseable en columnas, pero al menos uno
+  // reconoció el encabezado de resumen: es mejor que "best" (que puede ser
+  // texto más largo pero de una parte irrelevante, como texto legal).
+  if (bestLooksLikeStatement) {
+    console.log(`PDF financiero: ningún extractor parseó movimientos; uso el que matcheó encabezado. Caracteres: ${bestLooksLikeStatement.length}`);
+    return bestLooksLikeStatement;
   }
 
   if (best && best.length > 120) {
