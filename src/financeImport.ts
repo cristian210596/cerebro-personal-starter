@@ -4,6 +4,7 @@ import { supabase } from './supabaseClient.js';
 import { config } from './config.js';
 import { withGemini } from './geminiPool.js';
 import { resolveAndLearnEntity, upsertEntityAlias, upsertMasterEntity } from './entityBrain.js';
+import * as XLSX from 'xlsx';
 
 
 export type ImportedMovement = {
@@ -102,10 +103,19 @@ export async function importFinanceFile(input: {
   }
 
   let parsed: ParsedFinanceDocument | null = null;
-  if (isCsvLike(fileName, mimeType)) {
+  let pdfTextLength = 0;
+  let geminiFallbackAttempted = false;
+  if (isXlsxLike(fileName, mimeType)) {
+    // Antes isCsvLike ya matcheaba .xlsx por el mimetype ("spreadsheet") y lo leía
+    // con buffer.toString('utf8'): un .xlsx es un zip binario, así que esto daba
+    // basura y terminaba en "Formato financiero no reconocido". Ahora se lee de
+    // verdad con la librería xlsx y se reusa el mismo parser de CSV sobre el texto.
+    parsed = parseXlsxFinance(input.buffer, fileName);
+  } else if (isCsvLike(fileName, mimeType)) {
     parsed = parseCsvFinance(input.buffer.toString('utf8'), fileName);
   } else if (isPdfLike(fileName, mimeType)) {
     const pdfText = await tryExtractPdfText(input.buffer, fileName, mimeType);
+    pdfTextLength = pdfText?.length || 0;
     if (pdfText && pdfText.length > 120) {
       parsed = parseVisaGaliciaPdfText(pdfText, fileName);
       console.log(`Importador financiero PDF: texto local ${pdfText.length} chars; movimientos locales ${parsed?.movimientos?.length || 0}`);
@@ -117,6 +127,7 @@ export async function importFinanceFile(input: {
     // usamos Gemini SOLO para convertir el resumen a JSON estructurado.
     // Esto queda después de pdf-parse/pdf2json/pdfjs y usa el pool de keys con rotación.
     if (!parsed?.movimientos?.length) {
+      geminiFallbackAttempted = true;
       parsed = await tryParseFinancePdfWithGemini(input.buffer, fileName, mimeType, input.caption || '');
       if (parsed?.movimientos?.length) {
         console.log(`Importador financiero PDF: fallback Gemini extrajo ${parsed.movimientos.length} movimientos.`);
@@ -127,12 +138,27 @@ export async function importFinanceFile(input: {
   }
 
   if (!parsed?.es_resumen_financiero || !Array.isArray(parsed.movimientos) || !parsed.movimientos.length) {
+    // Antes esto era un mensaje genérico sin ninguna pista de qué falló. No tengo
+    // acceso a los logs de Vercel, así que ahora el diagnóstico va directo al chat.
+    const hints: string[] = [];
+    if (isPdfLike(fileName, mimeType)) {
+      hints.push(pdfTextLength > 120
+        ? `Extraje texto local (${pdfTextLength} caracteres) pero no reconocí el formato de movimientos.`
+        : `No pude extraer texto legible del PDF localmente (${pdfTextLength} caracteres extraídos).`);
+      hints.push(geminiFallbackAttempted
+        ? 'El fallback con Gemini tampoco encontró movimientos (si esto se repite, puede ser cuota agotada: revisá con /gemini estado).'
+        : 'No llegué a intentar el fallback con Gemini.');
+    } else if (isXlsxLike(fileName, mimeType)) {
+      hints.push('Abrí el Excel y confirmá que la primera hoja tenga una fila de encabezados con columnas de fecha, descripción/comercio y monto/importe.');
+    }
     return {
       recognized: false as const,
       duplicate: false,
-      reason: isPdfLike(fileName, mimeType)
-        ? 'No pude extraer movimientos del PDF con parser local ni con fallback Gemini. Subí el PDF exportado original o CSV/Excel del banco.'
-        : 'Formato financiero no reconocido.'
+      reason: [
+        isPdfLike(fileName, mimeType) ? 'No pude extraer movimientos del PDF.' : isXlsxLike(fileName, mimeType) ? 'No pude extraer movimientos del Excel.' : 'Formato financiero no reconocido.',
+        ...hints,
+        'Probá subir el PDF exportado original o el CSV/Excel tal cual lo descargaste del banco, o mandalo de nuevo si esto fue algo puntual.'
+      ].join(' ')
     };
   }
 
@@ -831,6 +857,26 @@ function extractJsonObject(text: string) {
   return raw.slice(start, end + 1);
 }
 
+function parseXlsxFinance(buffer: Buffer, fileName: string): ParsedFinanceDocument {
+  const empty: ParsedFinanceDocument = {
+    es_resumen_financiero: false, tipo_fuente: 'documento_financiero', proveedor: null, cuenta: null, tarjeta: null,
+    periodo: null, fecha_cierre: null, fecha_vencimiento: null, total_pesos: null, total_dolares: null, pago_minimo: null, movimientos: []
+  };
+  try {
+    const workbook = XLSX.read(buffer, { type: 'buffer' });
+    const sheetName = workbook.SheetNames[0];
+    const sheet = sheetName ? workbook.Sheets[sheetName] : null;
+    if (!sheet) return empty;
+    // Reusa el mismo parser genérico de CSV (detección de columnas fecha/monto/descripción
+    // por encabezado) convirtiendo la primera hoja a texto CSV.
+    const csvText = XLSX.utils.sheet_to_csv(sheet);
+    return parseCsvFinance(csvText, fileName);
+  } catch (error: any) {
+    console.error('No pude leer el Excel financiero:', error?.message || error);
+    return empty;
+  }
+}
+
 function parseCsvFinance(text: string, fileName: string): ParsedFinanceDocument {
   const rows = parseDelimited(text).slice(0, 1000);
   const movements: ImportedMovement[] = [];
@@ -1289,7 +1335,7 @@ export async function getPendingImportedMovements(limit = 12, importacionId?: st
   return data || [];
 }
 
-export async function classifyImportedMovementByIndex(index: number, categoryText: string, saveRule: boolean, entidadNombre?: string | null) {
+export async function classifyImportedMovementByIndex(index: number, categoryText: string, saveRule: boolean, entidadNombre?: string | null, detalle?: string | null) {
   const rows = await getPendingImportedMovements(30);
   const row = rows[index - 1];
   if (!row) return { ok: false as const, message: `No encontré pendiente #${index}. Usá /importacion revisar.` };
@@ -1322,6 +1368,14 @@ export async function classifyImportedMovementByIndex(index: number, categoryTex
     }
   }
 
+  // Si el usuario contó qué compró o para qué fue el gasto además de la categoría/entidad,
+  // se suma a la descripción para no perderlo (antes se descartaba por completo).
+  if (detalle) {
+    updated.descripcion_original = updated.descripcion_original
+      ? `${updated.descripcion_original} — ${detalle}`
+      : detalle;
+  }
+
   const match = await findManualMatch(updated);
   let movement: any;
   let action = 'importado';
@@ -1347,10 +1401,11 @@ export async function interpretPendingAnswerWithGemini(row: any, answerText: str
     `Fecha: ${row.fecha_movimiento || '-'}`,
     `Respuesta del usuario: "${answerText}"`,
     'Devolvé SOLO JSON válido, sin markdown, con esta forma exacta:',
-    '{ "entidad_nombre": string | null, "categoria": string, "subcategoria": string | null }',
+    '{ "entidad_nombre": string | null, "categoria": string, "subcategoria": string | null, "detalle": string | null }',
     'Reglas:',
-    '- "entidad_nombre": nombre corto y genérico del comercio, servicio o persona (ej: "Mercado Pago", "Farmacity", "mi hermano"). No repitas el texto crudo del resumen. Si no queda claro, usá null.',
-    '- "categoria" y "subcategoria": cortas, en español, consistentes con categorías de gastos personales (ej: Supermercado, Transporte, Salud, Comida afuera, Deudas / compartidos, Servicios, Otros).'
+    '- "entidad_nombre": el nombre del comercio/servicio/persona que el USUARIO diga en su respuesta (ej: "panadería de la esquina", "mi hermano", "Farmacity"). Priorizá siempre lo que dice el usuario por sobre la descripción original del resumen: si el usuario nombra un comercio distinto al que aparece ahí (por ejemplo, el resumen trae el nombre de una persona pero el usuario dice que fue una panadería), usá lo que dijo el usuario. No repitas el texto crudo del resumen salvo que el usuario lo confirme. Si el usuario solo mencionó el medio de pago (ej: "es mercado pago") sin nombrar comercio, usá null.',
+    '- "categoria" y "subcategoria": cortas, en español, consistentes con categorías de gastos personales (ej: Supermercado, Transporte, Salud, Comida afuera, Deudas / compartidos, Servicios, Otros).',
+    '- "detalle": si el usuario contó qué compró, para qué fue el gasto, o cualquier detalle adicional más allá de la categoría/entidad (ej: "pastafrola y biscochitos", "arreglo de la bici"), un resumen corto de eso en sus palabras. Si no agregó nada más, null.'
   ].join('\n');
 
   try {
@@ -1364,7 +1419,8 @@ export async function interpretPendingAnswerWithGemini(row: any, answerText: str
     return {
       entidad_nombre: parsed.entidad_nombre ? String(parsed.entidad_nombre).trim() : null,
       categoria: parsed.categoria ? String(parsed.categoria).trim() : null,
-      subcategoria: parsed.subcategoria ? String(parsed.subcategoria).trim() : null
+      subcategoria: parsed.subcategoria ? String(parsed.subcategoria).trim() : null,
+      detalle: parsed.detalle ? String(parsed.detalle).trim() : null
     };
   } catch (error: any) {
     console.error('No pude interpretar respuesta de clasificación con Gemini:', error?.message || error);
@@ -1386,7 +1442,7 @@ export async function classifyImportedMovementFromAnswer(index: number, answerTe
   const subcategoria = interpreted?.subcategoria || fallback.subcategory || null;
   const categoryText = [categoria, subcategoria].filter(Boolean).join(' / ');
 
-  return classifyImportedMovementByIndex(index, categoryText, false, interpreted?.entidad_nombre || null);
+  return classifyImportedMovementByIndex(index, categoryText, false, interpreted?.entidad_nombre || null, interpreted?.detalle || null);
 }
 
 // Corrige el último finanzas_movimientos YA consolidado (no un pendiente de
@@ -1424,12 +1480,17 @@ export async function correctLastFinanceMovementFromText(answerText: string) {
     }
   }
 
+  const descripcion = interpreted?.detalle
+    ? `${current.descripcion || ''}${current.descripcion ? ' — ' : ''}${interpreted.detalle}`.trim()
+    : current.descripcion;
+
   const { data: updated, error: updateError } = await supabase
     .from('finanzas_movimientos')
     .update({
       categoria_financiera: categoria,
       subcategoria_financiera: subcategoria,
       comercio,
+      descripcion,
       updated_at: new Date().toISOString()
     })
     .eq('id', current.id)
@@ -1858,6 +1919,12 @@ function findDateInText(text: string) {
   const ar = text.match(/\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|\d{2})\b/);
   if (ar) return normalizeDate(`${ar[1]}-${ar[2]}-${ar[3]}`);
   return null;
+}
+
+function isXlsxLike(fileName: string, mimeType: string) {
+  const name = String(fileName || '').toLowerCase();
+  const mime = String(mimeType || '').toLowerCase();
+  return /\.xlsx?$|\.xlsm$/.test(name) || mime.includes('spreadsheetml') || mime.includes('ms-excel');
 }
 
 function isCsvLike(fileName: string, mimeType: string) {

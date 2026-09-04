@@ -90,9 +90,30 @@ async function getUpdates(offset: number): Promise<TelegramUpdate[]> {
   return json.result;
 }
 
+// Si procesar un update tarda (PDF pesado, Gemini lento) y Vercel no responde a
+// tiempo, Telegram reintenta el webhook con el MISMO update_id. Sin esto, cada
+// reintento reprocesaba todo desde cero: "Recibido/Procesando" duplicados y, en
+// el peor caso, importaciones duplicadas. Se descarta en silencio cualquier
+// update_id ya visto (insert con PK; el segundo insert choca y ahí se detecta).
+async function wasUpdateAlreadyProcessed(updateId: number): Promise<boolean> {
+  if (!updateId) return false;
+  try {
+    const { error } = await supabase.from('telegram_updates_procesados').insert({ update_id: updateId });
+    if (!error) return false;
+    if ((error as any).code === '23505') return true; // unique_violation: ya procesado
+    console.error('No pude registrar update_id de Telegram (sigo procesando igual):', error);
+    return false;
+  } catch (error) {
+    console.error('No pude registrar update_id de Telegram (sigo procesando igual):', error);
+    return false;
+  }
+}
+
 export async function handleTelegramUpdate(update: TelegramUpdate) {
   const msg = update.message;
   if (!msg) return;
+
+  if (await wasUpdateAlreadyProcessed(update.update_id)) return;
 
   const chatId = msg.chat.id;
   await rememberTelegramChat(chatId);

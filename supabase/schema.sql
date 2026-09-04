@@ -127,3 +127,9 @@ insert into public.taxonomia (grupo, valor, descripcion) values
 ('tipo_item','Persona','Dato sobre persona'),
 ('tipo_item','Lugar','Dato sobre lugar')
 on conflict (grupo, valor) do nothing;
+
+create table if not exists public.telegram_updates_procesados (
+  update_id bigint primary key,
+  chat_id text,
+  created_at timestamptz not null default now()
+);
