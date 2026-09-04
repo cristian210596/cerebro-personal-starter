@@ -128,7 +128,7 @@ export async function importFinanceFile(input: {
     // Esto queda después de pdf-parse/pdf2json/pdfjs y usa el pool de keys con rotación.
     if (!parsed?.movimientos?.length) {
       geminiFallbackAttempted = true;
-      parsed = await tryParseFinancePdfWithGemini(input.buffer, fileName, mimeType, input.caption || '');
+      parsed = await tryParseFinancePdfWithGemini(input.buffer, fileName, mimeType, input.caption || '', pdfText);
       if (parsed?.movimientos?.length) {
         console.log(`Importador financiero PDF: fallback Gemini extrajo ${parsed.movimientos.length} movimientos.`);
       }
@@ -775,7 +775,7 @@ function parsePagoMinimo(text: string) {
   return m ? parseAmountLoose(m[1]) : null;
 }
 
-async function tryParseFinancePdfWithGemini(buffer: Buffer, fileName: string, mimeType: string, caption: string): Promise<ParsedFinanceDocument | null> {
+async function tryParseFinancePdfWithGemini(buffer: Buffer, fileName: string, mimeType: string, caption: string, pdfText?: string | null): Promise<ParsedFinanceDocument | null> {
   if (!process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEYS && !process.env.GEMINI_API_KEY_2) return null;
   if (buffer.length > 15 * 1024 * 1024) return null;
 
@@ -823,18 +823,30 @@ async function tryParseFinancePdfWithGemini(buffer: Buffer, fileName: string, mi
     `Nombre de archivo: ${fileName}`
   ].filter(Boolean).join('\n');
 
+  // Si pdf-parse ya extrajo texto local usable, se lo mandamos a Gemini como
+  // texto plano: es una llamada mucho más rápida que comprensión multimodal
+  // del PDF entero, y evita el timeout de 60s de Vercel (Hobby plan) en
+  // resúmenes largos. El modo multimodal (inlineData, más lento) queda como
+  // último recurso solo si no hay texto local (ej: PDF escaneado/imagen).
+  const usableText = (pdfText || '').trim();
+  const MAX_TEXT_CHARS = 60000;
+  const truncated = usableText.length > MAX_TEXT_CHARS;
+  const textForPrompt = truncated ? usableText.slice(0, MAX_TEXT_CHARS) : usableText;
+
+  const parts = usableText
+    ? [{ text: `${prompt}
+
+Texto extraído del documento (pdf-parse${truncated ? ', truncado' : ''}):
+${textForPrompt}` }]
+    : [
+        { text: prompt },
+        { inlineData: { mimeType: mimeType || 'application/pdf', data: buffer.toString('base64') } }
+      ];
+
   try {
     const response = await withGemini(ai => ai.models.generateContent({
       model: config.geminiModel(),
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { text: prompt },
-            { inlineData: { mimeType: mimeType || 'application/pdf', data: buffer.toString('base64') } }
-          ]
-        }
-      ]
+      contents: [{ role: 'user', parts }]
     }), { operationName: 'importación financiera PDF' });
 
     const jsonText = extractJsonObject(response.text || '');
