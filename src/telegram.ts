@@ -448,6 +448,32 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return handleRevisionCommand(chatId, text.replace(/^revisi[oó]n\s*/i, ''));
   }
 
+  // Comandos en bloque para todos los pendientes de una sola vez: "todos sin
+  // clasificar" (los marca a todos con la sugerencia "sin categoría", igual que
+  // responder eso mismo pendiente por pendiente) o "todos ignorar" (los ignora a
+  // todos). Antes había que resolver cada pendiente uno por uno.
+  const normalizedBulkAll = removeAccents(text.trim().toLowerCase());
+  if (/^todos?\s+sin\s+clasificar\.?$/.test(normalizedBulkAll)) {
+    const pendingAll = await getPendingImportedMovements(30);
+    if (!pendingAll.length) {
+      await sendMessage(chatId, 'No hay movimientos pendientes de clasificar.');
+      return;
+    }
+    const pairs = pendingAll.map((_, i) => ({ index: i + 1, answer: 'sin categoría' })).sort((a, b) => b.index - a.index);
+    await classifyPendingBulk(chatId, pairs);
+    return;
+  }
+  if (/^todos?\s+ignorar\.?$/.test(normalizedBulkAll)) {
+    const pendingAll = await getPendingImportedMovements(30);
+    if (!pendingAll.length) {
+      await sendMessage(chatId, 'No hay movimientos pendientes de clasificar.');
+      return;
+    }
+    const indicesDesc = pendingAll.map((_, i) => i + 1).sort((a, b) => b - a);
+    await ignorePendingBulk(chatId, indicesDesc);
+    return;
+  }
+
   const pendingAnswerMatch = text.trim().match(/^(\d{1,2})\s*(?:es|son|:|-)\s+(.+)$/i);
   if (pendingAnswerMatch) {
     const handled = await handlePendingImportedAnswer(chatId, Number(pendingAnswerMatch[1]), pendingAnswerMatch[2]);
@@ -479,6 +505,19 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
       results.reverse();
       const notionLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
       await sendMessage(chatId, [results.join('\n'), notionLine].filter(Boolean).join('\n\n'));
+      return;
+    }
+
+    // Respuesta en una sola línea, separada por comas, una por pendiente: "el 1
+    // es panadería, el 2 es cine con tarjeta de crédito, el 3 es fútbol de los
+    // miércoles". El "el" antes del número es opcional.
+    const commaParts = text.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
+    const commaMatches = commaParts.map(p => p.match(/^(?:el\s+)?(\d{1,2})(?:\s+(?:es|son)\s+|\s*[:\-]\s*|\s+)(.+)$/i));
+    if (commaParts.length > 1 && commaParts.length <= 30 && commaMatches.every(Boolean)) {
+      const ordered = commaMatches
+        .map(m => ({ index: Number(m![1]), answer: m![2] }))
+        .sort((a, b) => b.index - a.index);
+      await classifyPendingBulk(chatId, ordered);
       return;
     }
 
@@ -1548,7 +1587,15 @@ async function handleImportacionCommand(chatId: number, args: string) {
 
 async function handleClasificarImportadoCommand(chatId: number, args: string) {
   const match = String(args || '').trim().match(/^(\d+)\s+(.+)$/);
-  if (!match) return sendMessage(chatId, 'Usá: /clasificar 1 Suscripciones guardar regla');
+  if (!match) {
+    // "/clasificar" sin argumentos: antes tiraba solo el texto de ayuda y había
+    // que ir resolviendo pendiente por pendiente. Ahora muestra el listado
+    // completo de una, para poder responder todo junto (línea por línea, en una
+    // sola línea separada por comas, o con "todos sin clasificar"/"todos ignorar").
+    const pending = await getPendingImportedMovements(30);
+    if (pending.length) return sendMessage(chatId, formatPendingImported(pending));
+    return sendMessage(chatId, 'Usá: /clasificar 1 Suscripciones guardar regla');
+  }
   const index = Number(match[1]);
   const text = match[2];
   const saveRule = /guardar regla|siempre|recordar/i.test(text);
@@ -1662,6 +1709,45 @@ async function handlePendingImportedAnswer(chatId: number, index: number, answer
     console.error('No pude interpretar respuesta a pendiente de clasificación:', error);
     return false;
   }
+}
+
+// Clasifica varios pendientes de una sola tanda (usado por "todos sin
+// clasificar" y por las respuestas en bloque, separadas por línea o por coma).
+// orderedPairs debe venir ordenado de mayor a menor índice: clasificar un
+// pendiente lo saca de la lista y corre los índices de los que quedan, así que
+// yendo de atrás para adelante los números que faltan procesar no se mueven.
+async function classifyPendingBulk(chatId: number, orderedPairs: { index: number; answer: string }[]) {
+  await sendMessage(chatId, `Clasificando ${orderedPairs.length} pendientes...`);
+  const results: string[] = [];
+  for (const { index, answer } of orderedPairs) {
+    try {
+      const result = await classifyImportedMovementFromAnswer(index, answer);
+      results.push(result.ok ? `#${index}: ${result.movement.comercio || '-'} — ${result.movement.categoria_financiera || '-'}` : `#${index}: ${result.message}`);
+    } catch (error: any) {
+      results.push(`#${index}: error (${error?.message || 'desconocido'})`);
+    }
+  }
+  results.reverse();
+  const notionLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
+  await sendMessage(chatId, [results.join('\n'), notionLine].filter(Boolean).join('\n\n'));
+}
+
+// Ignora varios pendientes de una sola tanda (usado por "todos ignorar").
+// indicesDesc debe venir ordenado de mayor a menor por la misma razón que
+// classifyPendingBulk.
+async function ignorePendingBulk(chatId: number, indicesDesc: number[]) {
+  await sendMessage(chatId, `Ignorando ${indicesDesc.length} pendientes...`);
+  const results: string[] = [];
+  for (const index of indicesDesc) {
+    try {
+      const result = await ignoreImportedMovementByIndex(index);
+      results.push(result.ok ? `#${index}: ignorado` : `#${index}: ${result.message}`);
+    } catch (error: any) {
+      results.push(`#${index}: error (${error?.message || 'desconocido'})`);
+    }
+  }
+  results.reverse();
+  await sendMessage(chatId, results.join('\n'));
 }
 
 async function handleIgnorarImportadoCommand(chatId: number, args: string) {
