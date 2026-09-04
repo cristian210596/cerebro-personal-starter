@@ -20,6 +20,19 @@ type GeminiPoolState = {
 
 const DEFAULT_COOLDOWN_MS = 10 * 60 * 1000;
 const MAX_ATTEMPTS_MULTIPLIER = 2;
+const DEFAULT_CALL_TIMEOUT_MS = 20 * 1000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`timeout: ${label} superó ${ms}ms sin responder`));
+    }, ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); }
+    );
+  });
+}
 
 const state: GeminiPoolState = {
   initialized: false,
@@ -44,7 +57,7 @@ function initializePool() {
 
 export async function withGemini<T>(
   operation: (ai: GoogleGenAI, meta: { keyIndex: number; keyLabel: string }) => Promise<T>,
-  options: { operationName?: string; cooldownMs?: number } = {}
+  options: { operationName?: string; cooldownMs?: number; timeoutMs?: number } = {}
 ): Promise<T> {
   initializePool();
 
@@ -53,6 +66,7 @@ export async function withGemini<T>(
   }
 
   const cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
   const maxAttempts = Math.max(state.clients.length, state.clients.length * MAX_ATTEMPTS_MULTIPLIER);
   let lastError: any = null;
 
@@ -62,7 +76,11 @@ export async function withGemini<T>(
 
     try {
       entry.lastUsedAt = new Date().toISOString();
-      const result = await operation(entry.client, { keyIndex: entry.index, keyLabel: entry.label });
+      const result = await withTimeout(
+        operation(entry.client, { keyIndex: entry.index, keyLabel: entry.label }),
+        timeoutMs,
+        options.operationName || 'gemini'
+      );
       entry.failures = 0;
       entry.lastError = undefined;
       return result;
@@ -113,6 +131,14 @@ function classifyGeminiError(error: any): { retryable: boolean; detail: string; 
   ].filter(Boolean).join(' ').toLowerCase();
 
   const retryDelayMs = extractRetryDelayMs(error);
+
+  if (text.startsWith('timeout:')) {
+    return {
+      retryable: true,
+      detail: 'timeout (sin respuesta de Gemini)',
+      cooldownMs: retryDelayMs || 60 * 1000
+    };
+  }
 
   if (
     status === 429 ||

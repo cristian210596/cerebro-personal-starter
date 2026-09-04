@@ -461,7 +461,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     // clasificar un pendiente lo saca de la lista y corre los índices de los que
     // quedan; yendo de atrás para adelante los números que faltan no se mueven.
     const rawLines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
-    const perLineMatches = rawLines.map(l => l.match(/^(\d{1,2})\s*(?:es|son|:|-)\s+(.+)$/i));
+    const perLineMatches = rawLines.map(l => l.match(/^(\d{1,2})(?:\s+(?:es|son)\s+|\s*[:\-]\s*|\s+)(.+)$/i));
     if (rawLines.length > 1 && rawLines.length <= 30 && perLineMatches.every(Boolean)) {
       await sendMessage(chatId, `Clasificando ${perLineMatches.length} pendientes...`);
       const ordered = perLineMatches
