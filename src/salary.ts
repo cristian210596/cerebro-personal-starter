@@ -388,9 +388,16 @@ export async function correctLastSalaryReceiptFromText(text: string) {
   return { ok: true as const, recibo: data, patch };
 }
 
-export async function summarizeSalaryFromText(text: string) {
-  const period = extractSalaryPeriodRange(text);
-  const targetConcept = extractConceptTarget(text);
+export async function summarizeSalaryFromText(text: string, overrides?: { startPeriod?: string; endPeriod?: string; concept?: string | null }) {
+  // El router de intencion (Gemini) puede resolver el periodo/concepto el mismo
+  // y pasarlos ya normalizados (YYYY-MM), evitando los limites de
+  // extractSalaryPeriodRange/extractConceptTarget (que no entienden rangos como
+  // "entre el mes 3 y el 5" ni "entre marzo y mayo"). Sin overrides, el
+  // comportamiento es igual que siempre (parseo por texto).
+  const period = overrides?.startPeriod && overrides?.endPeriod
+    ? { startPeriod: overrides.startPeriod, endPeriod: overrides.endPeriod }
+    : extractSalaryPeriodRange(text);
+  const targetConcept = overrides && overrides.concept !== undefined ? overrides.concept : extractConceptTarget(text);
   const { data: receipts, error } = await supabase
     .from('sueldos_recibos')
     .select('*')

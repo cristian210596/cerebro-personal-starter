@@ -1602,9 +1602,21 @@ async function findExistingImport(hash: string) {
   return data || null;
 }
 
-export async function summarizeFinanceAnalytics(text: string) {
-  const target = extractAnalyticsTarget(text);
-  const period = extractAnalyticsPeriod(text);
+export async function summarizeFinanceAnalytics(text: string, overrides?: { startPeriod?: string; endPeriod?: string; terms?: string[]; label?: string }) {
+  // El router de intencion (Gemini) puede resolver el periodo/terminos el mismo
+  // y pasarlos ya normalizados, evitando los limites de los parsers heuristicos
+  // extractAnalyticsTarget/extractAnalyticsPeriod. Sin overrides, el
+  // comportamiento es igual que siempre (parseo por texto).
+  const target = overrides?.terms && overrides.terms.length
+    ? { label: overrides.label || overrides.terms.join(' ') || 'gastos consultados', terms: overrides.terms }
+    : extractAnalyticsTarget(text);
+  const period = overrides?.startPeriod && overrides?.endPeriod
+    ? {
+        label: `${overrides.startPeriod} a ${overrides.endPeriod}`,
+        start: `${overrides.startPeriod}-01`,
+        end: lastDayOfMonth(Number(overrides.endPeriod.slice(0, 4)), Number(overrides.endPeriod.slice(5, 7)))
+      }
+    : extractAnalyticsPeriod(text);
   const { data, error } = await supabase
     .from('finanzas_movimientos')
     .select('*')

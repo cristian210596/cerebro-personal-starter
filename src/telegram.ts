@@ -35,6 +35,7 @@ import { correctLastFinanceMovement, deleteLastFinanceMovement, deleteLastItem, 
 import { deleteLastPending, formatPendingDone, formatPendingSaved, formatPendientes, listPendientes, looksLikePendingText, markPendingDone, savePendingFromText } from './pending.js';
 import { formatMaintenanceRunResult, formatMaintenanceStatus, getMaintenanceStatus, rememberTelegramChat, runScheduledMaintenance } from './maintenance.js';
 import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, formatDuplicateCleanup, formatLastSaved, formatPeriodSummary, formatUnifiedSearch, getLastSavedSnapshot, looksLikeLastSavedQuestion, looksLikeUniversalCorrection, unifiedSearch } from './chatPro.js';
+import { executeRouterDecision, looksLikeQuestion, routeQuestionWithGemini } from './intentRouter.js';
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
@@ -585,6 +586,22 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   if (looksLikeFinanceText(text)) {
     const financeHandled = await handleFinanceNaturalText(chatId, msg.message_id, msg.from?.id, text);
     if (financeHandled) return;
+  }
+
+  // Router de intencion con IA: si el texto tiene pinta de PREGUNTA y ningun
+  // patron/comando de arriba la reconocio, en vez de guardarla como nota
+  // generica (la causa raiz de casi todos los "esto no lo entendio" que
+  // veniamos arreglando uno por uno), Gemini decide a que reporte/funcion ya
+  // existente corresponde y con que parametros llamarla. El calculo real lo
+  // sigue haciendo el codigo de siempre contra Supabase.
+  if (looksLikeQuestion(text)) {
+    const decision = await routeQuestionWithGemini(chatId, text);
+    if (decision) {
+      const handled = await executeRouterDecision(chatId, decision, text, sendMessage);
+      if (handled) return;
+    }
+    await sendMessage(chatId, 'No entendí esa pregunta. Probá reformularla o mandá /ayuda para ver los comandos disponibles.');
+    return;
   }
 
   await sendMessage(chatId, 'Procesando...');
