@@ -36,6 +36,7 @@ import { deleteLastPending, formatPendingDone, formatPendingSaved, formatPendien
 import { formatMaintenanceRunResult, formatMaintenanceStatus, getMaintenanceStatus, rememberTelegramChat, runScheduledMaintenance } from './maintenance.js';
 import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, formatDuplicateCleanup, formatLastSaved, formatPeriodSummary, formatUnifiedSearch, getLastSavedSnapshot, looksLikeLastSavedQuestion, looksLikeUniversalCorrection, unifiedSearch } from './chatPro.js';
 import { executeRouterDecision, looksLikeQuestion, routeQuestionWithGemini } from './intentRouter.js';
+import { formatImportCalibracionesResult, importCalibracionesFromFile, looksLikeCalibracionesFile } from './equipos.js';
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
@@ -738,6 +739,36 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
     let transcripcion: string | null = null;
     let descripcionIa: string | null = null;
     const caption = String((msg as any).caption || '').trim();
+
+    // Planilla de calibraciones/equipos: se reconoce por nombre/caption
+    // ("calibracion...") + xlsx, y se importa directo a Supabase sin pasar
+    // por el clasificador generico ni por Gemini. Va ANTES que el importador
+    // financiero porque tambien es un .xlsx y no tiene que confundirse con
+    // un resumen de tarjeta.
+    if (media.kind === 'document' && looksLikeCalibracionesFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption)) {
+      await sendMessage(chatId, 'Parece la planilla de calibraciones. La importo...');
+      const calibResult = await importCalibracionesFromFile({ buffer: downloaded.buffer });
+
+      const archivo = await saveArchivo({
+        item_id: null,
+        tipo_archivo: media.kind,
+        nombre_archivo: media.fileName || `${media.kind}-${msg.message_id}`,
+        mime_type: media.mimeType || downloaded.mimeType || null,
+        storage_url: stored.storageRef,
+        transcripcion: null,
+        descripcion_ia: 'Planilla de calibraciones/equipos importada.'
+      });
+      try {
+        await createNotionArchivoPage(archivo);
+      } catch (error) {
+        console.error('No se pudo sincronizar planilla de calibraciones a Notion:', error);
+      }
+
+      return sendMessage(chatId, [
+        formatImportCalibracionesResult(calibResult),
+        stored.signedUrl ? `\nArchivo: ${stored.signedUrl}` : ''
+      ].filter(Boolean).join('\n'));
+    }
 
     // Importador financiero sin Gemini: no clasificamos el PDF como item general.
     // Esto evita gastar cuota de Gemini y evita que un resumen de tarjeta quede como nota basura.

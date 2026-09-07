@@ -3,6 +3,7 @@ import { config } from './config.js';
 import { summarizeSalaryFromText, formatSalarySummary, listSalaryReceipts, formatSalaryList, getLastSalaryReceipt, formatSalaryReceipt } from './salary.js';
 import { summarizeFinanceAnalytics, formatFinanceAnalyticsReport } from './financeImport.js';
 import { getLastSavedSnapshot, formatLastSaved, unifiedSearch, formatUnifiedSearch } from './chatPro.js';
+import { getEquipoInfo, formatEquipoInfo, queryVencimientos, formatVencimientosReport } from './equipos.js';
 
 // Router de intencion con IA: se activa cuando el texto tiene pinta de PREGUNTA
 // y ningun patron/comando basado en reglas la reconocio. Antes, ese texto caia
@@ -46,6 +47,8 @@ type RouterArgs = {
   financeLabel?: string | null;
   query?: string | null;
   listFilterText?: string | null;
+  equipoCodigo?: string | null;
+  excludeTerms?: string[] | null;
 };
 
 type RouterChoice = { tool: string; args: RouterArgs };
@@ -87,10 +90,12 @@ export async function routeQuestionWithGemini(chatId: number, text: string): Pro
     '- finance_report: gastos/consumos por comercio, categoría, tarjeta o medio de pago en un rango de fechas. Args: startPeriod, endPeriod ("YYYY-MM"), financeTerms (lista de palabras clave del comercio/categoría/tarjeta mencionados, ej ["visa"], ["uber"], ["supermercado"]), financeLabel (texto corto para mostrar como título, ej "tarjeta visa").',
     '- last_saved: qué fue lo último que se guardó en el sistema (cualquier tipo: nota, gasto, pendiente, etc). Sin argumentos.',
     '- search: buscar algo guardado por palabra clave, cuando no es claramente sueldo ni finanzas. Args: query (texto de búsqueda).',
+    '- equipos_vencimientos: qué equipos/instrumentos de planta vencen o están vencidos en un período, opcionalmente excluyendo un tipo (ej "ignorando HVAC/manómetros" son los códigos que empiezan con MAN). Args: startPeriod, endPeriod ("YYYY-MM"; si no da período, dejar los dos null para traer todos los vencidos/por vencer), excludeTerms (lista de prefijos de código a excluir, ej ["MAN"], o null).',
+    '- equipo_info: qué se sabe de un equipo puntual por su código (ej "BAL-017", "EMP-001", "EST-001"): ubicación, última calibración, vencimiento, proveedor, observaciones. Args: equipoCodigo (el código tal cual, sin inventar ceros ni cambiar el formato).',
     '- none: si la pregunta no corresponde a ninguna función de arriba, o falta información imposible de inferir (ni siquiera con el contexto de arriba).',
     '',
     'Devolvé SOLO JSON válido, sin markdown, con esta forma exacta:',
-    '{ "tool": "salary_report"|"salary_list"|"salary_latest"|"finance_report"|"last_saved"|"search"|"none", "args": { "startPeriod": string|null, "endPeriod": string|null, "concept": string|null, "financeTerms": string[]|null, "financeLabel": string|null, "query": string|null, "listFilterText": string|null } }'
+    '{ "tool": "salary_report"|"salary_list"|"salary_latest"|"finance_report"|"last_saved"|"search"|"equipos_vencimientos"|"equipo_info"|"none", "args": { "startPeriod": string|null, "endPeriod": string|null, "concept": string|null, "financeTerms": string[]|null, "financeLabel": string|null, "query": string|null, "listFilterText": string|null, "equipoCodigo": string|null, "excludeTerms": string[]|null } }'
   ].filter(Boolean).join('\n');
 
   try {
@@ -163,6 +168,22 @@ export async function executeRouterDecision(
         if (!args.query) return false;
         const result = await unifiedSearch(args.query);
         await sendMessage(chatId, formatUnifiedSearch(result));
+        return true;
+      }
+      case 'equipos_vencimientos': {
+        const rows = await queryVencimientos({
+          startPeriod: args.startPeriod || undefined,
+          endPeriod: args.endPeriod || undefined,
+          excludePrefixes: args.excludeTerms && args.excludeTerms.length ? args.excludeTerms : undefined
+        });
+        const label = args.startPeriod ? `en ${args.startPeriod}${args.endPeriod && args.endPeriod !== args.startPeriod ? ` a ${args.endPeriod}` : ''}` : undefined;
+        await sendMessage(chatId, formatVencimientosReport(rows, { label }));
+        return true;
+      }
+      case 'equipo_info': {
+        if (!args.equipoCodigo) return false;
+        const rows = await getEquipoInfo(args.equipoCodigo);
+        await sendMessage(chatId, formatEquipoInfo(args.equipoCodigo, rows));
         return true;
       }
       default:
