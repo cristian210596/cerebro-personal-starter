@@ -652,7 +652,7 @@ function extractSalaryPeriodRange(text: string) {
 function extractConceptTarget(text: string) {
   const t = norm(text);
   if (t.includes('ganancias')) return 'ganancias';
-  if (t.includes('horas extras') || t.includes('hora extra')) return 'horas extra';
+  if (/\bhoras?\s+extras?\b/.test(t)) return 'horas extra';
   if (t.includes('obra social')) return 'obra social';
   if (t.includes('jubilatorio') || t.includes('jubilacion') || t.includes('jubilación')) return 'jubilatorio';
   if (t.includes('antiguedad') || t.includes('antigüedad')) return 'antiguedad';
@@ -667,6 +667,10 @@ function extractConceptTarget(text: string) {
     // "pasado/anterior/proximo/actual/corriente" describen CUANDO, no un concepto del recibo.
     // Sin esto, "cuanto cobre el mes pasado" devolvia targetConcept="pasado" (bug real, visto en vivo).
     .replace(/\b(cu[aá]nto|cuanto|gan[eé]|gane|cobr[eé]|cobro|me pagaron|total|neto|bruto|recibo|de|del|los|las|el|la|en|mi|mis|este|esta|ano|año|mes|meses|ultimos?|últimos?|pasado|pasada|anterior|proximo|próximo|actual|corriente)\b/g, ' ')
+    // Los nombres de mes describen CUANDO, no un concepto del recibo (mismo motivo por el
+    // que ya se sacan "pasado/anterior/proximo" arriba). Sin esto, "cuanto gane de X en
+    // mayo" dejaba targetConcept = "X mayo" en vez de "X", y nunca encontraba el concepto.
+    .replace(new RegExp(`\\b(${Object.keys(MONTHS).join('|')})\\b`, 'g'), ' ')
     .replace(/\d+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
