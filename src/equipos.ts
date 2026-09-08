@@ -1,5 +1,6 @@
 import * as XLSX from 'xlsx';
 import { supabase } from './supabaseClient.js';
+import { createSignedFileUrl } from './storage.js';
 
 // Calibraciones de equipos (GMP): importa la hoja "Calibraciones con datos" de
 // la planilla maestra que Cristian mantiene a mano, y expone consultas de
@@ -406,4 +407,118 @@ export function formatEquipoInfo(codigo: string, rows: any[]): string {
     ].filter(Boolean).join('\n');
   });
   return [`Info de "${codigo}" (${rows.length} registro${rows.length > 1 ? 's' : ''}):`, '', ...lineas].join('\n\n');
+}
+
+// ---------------------------------------------------------------------------
+// Fase 3: "memoria" de un equipo = todo lo que se guardó alguna vez (notas,
+// fotos, hechos durables) mencionando su código, usando el sistema genérico
+// de entidades/items/archivos/memorias que el bot ya tenía. Se busca por
+// substring normalizado (sin acentos, sin mayúsculas) contra nombre y alias
+// de la entidad, porque el clasificador de Gemini no siempre guarda el
+// código exactamente igual (ej "EMP-001" vs "Empacadora EMP-001").
+export type EquipoMemoria = {
+  entidad: { id: string; tipo: string; nombre: string } | null;
+  items: any[];
+  archivos: Array<{ id: string; nombre_archivo: string | null; descripcion_ia: string | null; created_at: string; url: string | null }>;
+  memorias: any[];
+};
+
+export async function getEquipoMemoria(codigo: string): Promise<EquipoMemoria> {
+  const vacio: EquipoMemoria = { entidad: null, items: [], archivos: [], memorias: [] };
+  const codigoTrim = String(codigo || '').trim();
+  if (!codigoTrim) return vacio;
+  const codigoNorm = norm(codigoTrim);
+
+  const { data: entidadesCandidatas, error: entError } = await supabase
+    .from('entidades')
+    .select('*')
+    .ilike('tipo', '%equipo%');
+  if (entError) throw entError;
+
+  const matches = (entidadesCandidatas || []).filter((e: any) => {
+    const nombreNorm = norm(e.nombre || '');
+    if (nombreNorm && (nombreNorm.includes(codigoNorm) || codigoNorm.includes(nombreNorm))) return true;
+    return (e.alias || []).some((a: string) => norm(a).includes(codigoNorm));
+  });
+  if (!matches.length) return vacio;
+
+  const entidadIds = matches.map((e: any) => e.id);
+  const { data: links, error: linkError } = await supabase
+    .from('item_entidades')
+    .select('item_id')
+    .in('entidad_id', entidadIds);
+  if (linkError) throw linkError;
+
+  const itemIds = [...new Set((links || []).map((l: any) => l.item_id))];
+  if (!itemIds.length) return { entidad: matches[0], items: [], archivos: [], memorias: [] };
+
+  const [{ data: items, error: itemsError }, { data: archivosRaw, error: archivosError }, { data: memorias, error: memoriasError }] = await Promise.all([
+    supabase.from('items').select('*').in('id', itemIds).order('created_at', { ascending: false }),
+    supabase.from('archivos').select('*').in('item_id', itemIds).order('created_at', { ascending: false }),
+    supabase.from('memorias').select('*').eq('vigente', true).in('origen_item_id', itemIds)
+  ]);
+  if (itemsError) throw itemsError;
+  if (archivosError) throw archivosError;
+  if (memoriasError) throw memoriasError;
+
+  const archivos = await Promise.all((archivosRaw || []).map(async (a: any) => ({
+    id: a.id,
+    nombre_archivo: a.nombre_archivo,
+    descripcion_ia: a.descripcion_ia,
+    created_at: a.created_at,
+    url: a.storage_url ? await createSignedFileUrl(a.storage_url).catch(() => null) : null
+  })));
+
+  return { entidad: matches[0], items: items || [], archivos, memorias: memorias || [] };
+}
+
+// Combina los datos técnicos de Fase 1 (equipos_calibraciones) con la
+// memoria de Fase 3 (notas/fotos/hechos durables) en una sola respuesta a
+// "qué sabés de la EMP-001?". Es el reemplazo de equipo_info en el router.
+export async function getEquipoCompleto(codigo: string) {
+  const [filasTecnicas, memoria] = await Promise.all([
+    getEquipoInfo(codigo),
+    getEquipoMemoria(codigo)
+  ]);
+  return { filasTecnicas, memoria };
+}
+
+export function formatEquipoCompleto(codigo: string, data: { filasTecnicas: any[]; memoria: EquipoMemoria }): string {
+  const { filasTecnicas, memoria } = data;
+  if (!filasTecnicas.length && !memoria.items.length) {
+    return `No tengo cargado nada con el código "${codigo}" (ni en calibraciones, ni en notas o fotos).`;
+  }
+
+  const partes: string[] = [];
+  partes.push(filasTecnicas.length ? formatEquipoInfo(codigo, filasTecnicas) : `Info de "${codigo}": no tiene datos de calibración cargados todavía.`);
+
+  if (memoria.items.length) {
+    partes.push('');
+    partes.push(`Notas guardadas (${memoria.items.length}):`);
+    for (const item of memoria.items) {
+      const fecha = String(item.created_at || '').slice(0, 10);
+      const resumen = item.titulo || item.resumen || String(item.texto_original || '').slice(0, 80) || 'sin título';
+      partes.push(`- [${fecha}] ${resumen}`);
+      if (item.accion_futura) partes.push(`  Acción futura: ${item.accion_futura}`);
+    }
+  }
+
+  if (memoria.archivos.length) {
+    partes.push('');
+    partes.push(`Fotos/archivos (${memoria.archivos.length}):`);
+    for (const a of memoria.archivos) {
+      const desc = a.descripcion_ia ? ` — ${a.descripcion_ia}` : '';
+      partes.push(`- ${a.nombre_archivo || 'archivo'}${desc}${a.url ? `\n  ${a.url}` : ' (sin link disponible)'}`);
+    }
+  }
+
+  if (memoria.memorias.length) {
+    partes.push('');
+    partes.push('Para tener en cuenta:');
+    for (const m of memoria.memorias) {
+      partes.push(`- ${m.afirmacion}`);
+    }
+  }
+
+  return partes.join('\n');
 }

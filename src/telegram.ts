@@ -38,6 +38,7 @@ import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, format
 import { executeRouterDecision, looksLikeQuestion, routeQuestionWithGemini } from './intentRouter.js';
 import { formatImportCalibracionesResult, importCalibracionesFromFile, looksLikeCalibracionesFile, looksLikeEquipoQueryText } from './equipos.js';
 import { extractCalendarEventWithGemini, formatCalendarEventSaved, looksLikeCalendarEventText, saveCalendarEvent } from './calendario.js';
+import { looksLikeCalibracionEventText, looksLikeConfirmacionCalibracion, proponerActualizacionCalibracion, resolverConfirmacionCalibracion } from './calibracionEventos.js';
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
@@ -128,6 +129,17 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
   if (!text) {
     await sendMessage(chatId, 'No encontré texto ni archivo compatible para guardar.');
+    return;
+  }
+
+  // Fase 4: si hay una actualización de calibración pendiente de confirmar
+  // para este chat (el usuario ya vio "¿Confirmás? Respondé sí o no") y el
+  // texto es justo esa confirmación, resolverla ANTES que cualquier otro
+  // router — si no, un simple "sí" podría terminar mal interpretado por el
+  // router conversacional o guardado como nota genérica.
+  if (await looksLikeConfirmacionCalibracion(chatId, text)) {
+    const respuesta = await resolverConfirmacionCalibracion(chatId, text);
+    await sendMessage(chatId, respuesta);
     return;
   }
 
@@ -605,6 +617,20 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     // generico) en vez de cortar el mensaje con un error.
   }
 
+  // Fase 4: registrar que un equipo YA se calibró ("hoy se calibró la
+  // BAL-017 con éxito por ISPISA"). Es una AFIRMACION sobre algo que YA
+  // pasó (a diferencia del bloque de arriba, que es sobre algo que va a
+  // pasar), por eso tiene su propio detector basado en verbos en pasado +
+  // código de equipo, y también va ANTES del router de preguntas.
+  if (looksLikeCalibracionEventText(text)) {
+    const propuesta = await proponerActualizacionCalibracion(chatId, text);
+    if (propuesta) {
+      return sendMessage(chatId, propuesta);
+    }
+    // Si Gemini no pudo extraer un código de equipo válido del texto,
+    // seguimos el flujo normal en vez de cortar el mensaje con un error.
+  }
+
   // Router de intencion con IA: si el texto tiene pinta de PREGUNTA y ningun
   // patron/comando de arriba la reconocio, en vez de guardarla como nota
   // generica (la causa raiz de casi todos los "esto no lo entendio" que
@@ -615,14 +641,22 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   // ("listado de dataloggers", "dataloggers vencidos") tienen que llegar
   // aca tambien: looksLikeQuestion() no las agarra porque no tienen "que" ni
   // "?", y por eso antes caian derecho al clasificador generico de notas.
-  if (looksLikeQuestion(text) || looksLikeEquipoQueryText(text)) {
+  const esPreguntaReal = looksLikeQuestion(text);
+  const esFraseDeEquipos = !esPreguntaReal && looksLikeEquipoQueryText(text);
+  if (esPreguntaReal || esFraseDeEquipos) {
     const decision = await routeQuestionWithGemini(chatId, text);
     if (decision) {
       const handled = await executeRouterDecision(chatId, decision, text, sendMessage);
       if (handled) return;
     }
-    await sendMessage(chatId, 'No entendí esa pregunta. Probá reformularla o mandá /ayuda para ver los comandos disponibles.');
-    return;
+    if (esPreguntaReal) {
+      await sendMessage(chatId, 'No entendí esa pregunta. Probá reformularla o mandá /ayuda para ver los comandos disponibles.');
+      return;
+    }
+    // Frase de equipos que NO era una pregunta (ej "cuando califique la
+    // EST-001 debo recordar preparar las endotoxinas") y el router no
+    // encontró qué función usar: seguimos el flujo normal de abajo, que la
+    // guarda como nota genérica, en vez de descartarla con un error.
   }
 
   await sendMessage(chatId, 'Procesando...');
@@ -639,13 +673,50 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   await sendMessage(chatId, formatSaved(result.clasificacion));
 }
 
+// Telegram rechaza mensajes de texto de más de 4096 caracteres. Antes se
+// truncaba con .slice(0, 3900) y se perdía el resto en silencio (asi se
+// cortó, por ejemplo, un listado de 23 dataloggers vencidos a mitad de
+// palabra). Ahora se parte en varios mensajes respetando saltos de línea,
+// para no cortar ningún renglón de un reporte a la mitad.
+const TELEGRAM_CHUNK_LEN = 3800;
+
+function splitTelegramMessage(text: string, maxLen: number): string[] {
+  if (text.length <= maxLen) return [text];
+  const lineas = text.split('\n');
+  const chunks: string[] = [];
+  let actual = '';
+  for (const linea of lineas) {
+    if (linea.length > maxLen) {
+      // Una sola línea más larga que el límite (caso raro): la partimos a la fuerza.
+      if (actual) { chunks.push(actual); actual = ''; }
+      for (let i = 0; i < linea.length; i += maxLen) {
+        chunks.push(linea.slice(i, i + maxLen));
+      }
+      continue;
+    }
+    const candidato = actual ? `${actual}\n${linea}` : linea;
+    if (candidato.length > maxLen) {
+      chunks.push(actual);
+      actual = linea;
+    } else {
+      actual = candidato;
+    }
+  }
+  if (actual) chunks.push(actual);
+  return chunks;
+}
+
 export async function sendMessage(chatId: number, text: string) {
-  const res = await fetch(`${apiBase}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 3900) })
-  });
-  if (!res.ok) throw new Error(`Telegram sendMessage falló: ${res.status}`);
+  const chunks = splitTelegramMessage(text, TELEGRAM_CHUNK_LEN);
+  for (let i = 0; i < chunks.length; i++) {
+    const prefix = chunks.length > 1 ? `(${i + 1}/${chunks.length})\n` : '';
+    const res = await fetch(`${apiBase}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: `${prefix}${chunks[i]}` })
+    });
+    if (!res.ok) throw new Error(`Telegram sendMessage falló: ${res.status} (parte ${i + 1}/${chunks.length})`);
+  }
 }
 
 export async function sendDocument(chatId: number, filename: string, buffer: Buffer, caption?: string) {

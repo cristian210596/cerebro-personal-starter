@@ -3,7 +3,7 @@ import { config } from './config.js';
 import { summarizeSalaryFromText, formatSalarySummary, listSalaryReceipts, formatSalaryList, getLastSalaryReceipt, formatSalaryReceipt } from './salary.js';
 import { summarizeFinanceAnalytics, formatFinanceAnalyticsReport } from './financeImport.js';
 import { getLastSavedSnapshot, formatLastSaved, unifiedSearch, formatUnifiedSearch } from './chatPro.js';
-import { getEquipoInfo, formatEquipoInfo, queryVencimientos, formatVencimientosReport } from './equipos.js';
+import { getEquipoCompleto, formatEquipoCompleto, queryVencimientos, formatVencimientosReport } from './equipos.js';
 
 // Router de intencion con IA: se activa cuando el texto tiene pinta de PREGUNTA
 // y ningun patron/comando basado en reglas la reconocio. Antes, ese texto caia
@@ -93,7 +93,7 @@ export async function routeQuestionWithGemini(chatId: number, text: string): Pro
     '- last_saved: qué fue lo último que se guardó en el sistema (cualquier tipo: nota, gasto, pendiente, etc). Sin argumentos.',
     '- search: buscar algo guardado por palabra clave, cuando no es claramente sueldo ni finanzas. Args: query (texto de búsqueda).',
     '- equipos_vencimientos: qué equipos/instrumentos de planta vencen, están vencidos, o un LISTADO de un tipo de equipo (ej "listado de dataloggers", "dataloggers vencidos", "que balanzas tengo"), opcionalmente excluyendo un tipo (ej "ignorando HVAC/manómetros" son los códigos que empiezan con MAN). Args: startPeriod, endPeriod ("YYYY-MM"; si no da período, dejar los dos null), excludeTerms (prefijos de código a excluir, ej ["MAN"], o null), includeTerms (prefijos de código a INCLUIR exclusivamente si piden un tipo puntual, ej "dataloggers" -> ["DAT"], "balanzas" -> ["BAL"], o null si no piden un tipo particular), soloEstado ("vencido" si piden solo lo ya vencido sin importar el período, "por_vencer" si piden solo lo próximo a vencer, o null).',
-    '- equipo_info: qué se sabe de un equipo puntual por su código (ej "BAL-017", "EMP-001", "EST-001"): ubicación, última calibración, vencimiento, proveedor, observaciones. Args: equipoCodigo (el código tal cual, sin inventar ceros ni cambiar el formato).',
+    '- equipo_info: qué se sabe de un equipo puntual por su código (ej "BAL-017", "EMP-001", "EST-001"): ubicación, última calibración, vencimiento, proveedor, observaciones, Y TAMBIÉN notas, fotos y hechos guardados sobre ese equipo (ej "que sabes de la EMP-001", "que tengo guardado de la EST-001"). Args: equipoCodigo (el código tal cual, sin inventar ceros ni cambiar el formato).',
     '- none: si la pregunta no corresponde a ninguna función de arriba, o falta información imposible de inferir (ni siquiera con el contexto de arriba).',
     '',
     'Devolvé SOLO JSON válido, sin markdown, con esta forma exacta:',
@@ -186,8 +186,8 @@ export async function executeRouterDecision(
       }
       case 'equipo_info': {
         if (!args.equipoCodigo) return false;
-        const rows = await getEquipoInfo(args.equipoCodigo);
-        await sendMessage(chatId, formatEquipoInfo(args.equipoCodigo, rows));
+        const data = await getEquipoCompleto(args.equipoCodigo);
+        await sendMessage(chatId, formatEquipoCompleto(args.equipoCodigo, data));
         return true;
       }
       default:
