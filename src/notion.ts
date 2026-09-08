@@ -14,6 +14,7 @@ type NotionDbConfig = {
   finanzasMovimientosDatabaseId?: string;
   finanzasDeudasDatabaseId?: string;
   finanzasParticionesDatabaseId?: string;
+  calendarioDatabaseId?: string;
 };
 
 function notionAvailable() {
@@ -101,6 +102,42 @@ export async function createNotionArchivoPage(archivo: any) {
   });
 
   return page.id;
+}
+
+export async function createNotionCalendarioPage(evento: { titulo: string; fecha: string | null; categoria: string; equipoCodigo: string | null; proveedor: string | null; notas: string | null }, textoOriginal: string) {
+  const notion = getNotionClient();
+  if (!notion) return null;
+
+  const dbConfig = loadNotionDbConfig();
+  const databaseId = dbConfig.calendarioDatabaseId;
+  if (!databaseId) return null;
+
+  const titulo = cleanNotionText(evento.titulo || textoOriginal, 180) || 'Evento';
+  const properties = {
+    'Título': { title: [{ text: { content: titulo } }] },
+    'Fecha': evento.fecha ? { date: { start: evento.fecha } } : { date: null },
+    'Categoría': selectProp(evento.categoria),
+    'Equipo': evento.equipoCodigo ? { rich_text: [{ text: { content: cleanNotionText(evento.equipoCodigo, 100) } }] } : { rich_text: [] },
+    'Proveedor': evento.proveedor ? { rich_text: [{ text: { content: cleanNotionText(evento.proveedor, 200) } }] } : { rich_text: [] },
+    'Notas': evento.notas ? { rich_text: [{ text: { content: cleanNotionText(evento.notas, 1900) } }] } : { rich_text: [] },
+    'Origen': selectProp('manual')
+  };
+
+  const page = await notion.pages.create({
+    parent: { database_id: databaseId },
+    icon: { type: 'emoji', emoji: emojiForCalendarCategory(evento.categoria) },
+    properties,
+    children: [calloutBlock('📅', `Texto original: ${textoOriginal}`)] as any
+  });
+
+  return page.id;
+}
+
+function emojiForCalendarCategory(categoria: string | null | undefined) {
+  const c = String(categoria || '').toLowerCase();
+  if (c.includes('laboral')) return '💼';
+  if (c.includes('facultad')) return '📚';
+  return '🗓️';
 }
 
 function normalizeTipoArchivo(value: unknown) {

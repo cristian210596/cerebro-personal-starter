@@ -9,6 +9,7 @@
     "build": "tsc",
     "setup:supabase": "tsx src/scripts/setupSupabase.ts",
     "setup:notion": "tsx src/scripts/setupNotion.ts",
+    "setup:calendario-notion": "tsx src/scripts/setupCalendarioNotion.ts",
     "test:classify": "tsx src/scripts/testClassifier.ts",
     "set:webhook": "tsx src/scripts/setWebhook.ts"
   },

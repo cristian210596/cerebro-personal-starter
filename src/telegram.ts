@@ -36,7 +36,8 @@ import { deleteLastPending, formatPendingDone, formatPendingSaved, formatPendien
 import { formatMaintenanceRunResult, formatMaintenanceStatus, getMaintenanceStatus, rememberTelegramChat, runScheduledMaintenance } from './maintenance.js';
 import { applyUniversalCorrection, buildPeriodSummary, cleanupDuplicates, formatDuplicateCleanup, formatLastSaved, formatPeriodSummary, formatUnifiedSearch, getLastSavedSnapshot, looksLikeLastSavedQuestion, looksLikeUniversalCorrection, unifiedSearch } from './chatPro.js';
 import { executeRouterDecision, looksLikeQuestion, routeQuestionWithGemini } from './intentRouter.js';
-import { formatImportCalibracionesResult, importCalibracionesFromFile, looksLikeCalibracionesFile } from './equipos.js';
+import { formatImportCalibracionesResult, importCalibracionesFromFile, looksLikeCalibracionesFile, looksLikeEquipoQueryText } from './equipos.js';
+import { extractCalendarEventWithGemini, formatCalendarEventSaved, looksLikeCalendarEventText, saveCalendarEvent } from './calendario.js';
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
@@ -589,13 +590,32 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     if (financeHandled) return;
   }
 
+  // Captura de eventos de calendario en lenguaje natural ("el miercoles 10
+  // viene ISPISA a calibrar la BAL-001"). Es una AFIRMACION sobre algo que
+  // va a pasar, no una pregunta, por eso tiene su propio detector y va
+  // ANTES del router de preguntas (que nunca la agarraria).
+  if (looksLikeCalendarEventText(text)) {
+    const evento = await extractCalendarEventWithGemini(text);
+    if (evento) {
+      const notionPageId = await saveCalendarEvent(evento, text);
+      return sendMessage(chatId, formatCalendarEventSaved(evento, notionPageId));
+    }
+    // Si Gemini no pudo extraer una fecha concreta, seguimos el flujo normal
+    // (puede terminar en el router de preguntas o en el clasificador
+    // generico) en vez de cortar el mensaje con un error.
+  }
+
   // Router de intencion con IA: si el texto tiene pinta de PREGUNTA y ningun
   // patron/comando de arriba la reconocio, en vez de guardarla como nota
   // generica (la causa raiz de casi todos los "esto no lo entendio" que
   // veniamos arreglando uno por uno), Gemini decide a que reporte/funcion ya
   // existente corresponde y con que parametros llamarla. El calculo real lo
   // sigue haciendo el codigo de siempre contra Supabase.
-  if (looksLikeQuestion(text)) {
+  // Ademas de preguntas propiamente dichas, frases AFIRMATIVAS sobre equipos
+  // ("listado de dataloggers", "dataloggers vencidos") tienen que llegar
+  // aca tambien: looksLikeQuestion() no las agarra porque no tienen "que" ni
+  // "?", y por eso antes caian derecho al clasificador generico de notas.
+  if (looksLikeQuestion(text) || looksLikeEquipoQueryText(text)) {
     const decision = await routeQuestionWithGemini(chatId, text);
     if (decision) {
       const handled = await executeRouterDecision(chatId, decision, text, sendMessage);

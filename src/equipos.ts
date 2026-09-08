@@ -285,11 +285,24 @@ export type VencimientosQuery = {
   startPeriod?: string | null; // YYYY-MM
   endPeriod?: string | null; // YYYY-MM
   excludePrefixes?: string[] | null; // ej ["MAN", "MAG"]
+  includePrefixes?: string[] | null; // ej ["DAT"] -> "listado de dataloggers"
+  soloEstado?: 'vencido' | 'por_vencer' | null; // filtra por estado ya calculado, sin depender de un periodo
   incluirFueraDeUsoPermanente?: boolean;
 };
 
 export async function queryVencimientos(query: VencimientosQuery) {
-  let q = supabase.from('equipos_calibraciones').select('*').not('fecha_recalibracion', 'is', null);
+  // Un listado puro por tipo (ej "listado de dataloggers", sin periodo ni
+  // filtro de estado) tiene que traer TODO lo de ese tipo, incluso equipos
+  // sin fecha de recalibración cargada todavía. Un pedido de vencimientos
+  // (con periodo o con soloEstado) sí necesita fecha para poder evaluarse.
+  const esListadoPuro = Boolean(
+    query.includePrefixes && query.includePrefixes.length && !query.startPeriod && !query.endPeriod && !query.soloEstado
+  );
+
+  let q = supabase.from('equipos_calibraciones').select('*');
+  if (!esListadoPuro) {
+    q = q.not('fecha_recalibracion', 'is', null);
+  }
 
   if (query.startPeriod) {
     q = q.gte('fecha_recalibracion', `${query.startPeriod}-01`);
@@ -311,6 +324,13 @@ export async function queryVencimientos(query: VencimientosQuery) {
     const prefixesNorm = query.excludePrefixes.map(p => norm(p));
     rows = rows.filter((r: any) => !prefixesNorm.some(p => norm(r.codigo).startsWith(p)));
   }
+  if (query.includePrefixes && query.includePrefixes.length) {
+    const prefixesNorm = query.includePrefixes.map(p => norm(p));
+    rows = rows.filter((r: any) => prefixesNorm.some(p => norm(r.codigo).startsWith(p)));
+  }
+  if (query.soloEstado) {
+    rows = rows.filter((r: any) => computeEstadoVencimiento(r.fecha_recalibracion) === query.soloEstado);
+  }
 
   return rows;
 }
@@ -322,9 +342,10 @@ export function formatVencimientosReport(rows: any[], opts: { label?: string } =
   const hoy = new Date();
   const lineas = rows.map((r: any) => {
     const estado = computeEstadoVencimiento(r.fecha_recalibracion, hoy);
-    const estadoTxt = estado === 'vencido' ? 'VENCIDO' : estado === 'por_vencer' ? 'por vencer' : 'vigente';
+    const estadoTxt = estado === 'vencido' ? 'VENCIDO' : estado === 'por_vencer' ? 'por vencer' : estado === 'vigente' ? 'vigente' : 'sin periodicidad registrada';
     const subidTxt = r.subid && r.subid !== 'N.A.' ? ` (${r.subid})` : '';
-    return `${r.codigo}${subidTxt} - ${r.equipo || 'sin nombre'} — vence ${r.fecha_recalibracion} (${estadoTxt}) — Proveedor: ${r.proveedor || 'sin dato'}${r.ubicacion ? ` — Ubicación: ${r.ubicacion}` : ''}`;
+    const venceTxt = r.fecha_recalibracion ? `vence ${r.fecha_recalibracion}` : 'sin fecha de vencimiento registrada';
+    return `${r.codigo}${subidTxt} - ${r.equipo || 'sin nombre'} — ${venceTxt} (${estadoTxt}) — Proveedor: ${r.proveedor || 'sin dato'}${r.ubicacion ? ` — Ubicación: ${r.ubicacion}` : ''}`;
   });
   return [
     `Equipos${opts.label ? ` ${opts.label}` : ''} (${rows.length}):`,
@@ -342,6 +363,30 @@ export async function getEquipoInfo(codigo: string) {
     .order('subid', { ascending: true });
   if (error) throw error;
   return data || [];
+}
+
+// Deteccion de pedidos AFIRMATIVOS (no preguntas) sobre equipos, para que
+// "listado de dataloggers" o "dataloggers vencidos" lleguen al router de
+// intencion en vez de cortar como nota generica (que es lo que pasaba: al
+// no tener "que"/"?" no calificaban como pregunta). Es angosta a proposito
+// -> exige una palabra de dominio de equipos o un patron de codigo, para no
+// interceptar notas comunes que usan "vencido" en otro sentido (ej "la
+// tarjeta vencida", "el contrato vencido").
+const PALABRAS_DOMINIO_EQUIPOS = 'equipo|equipos|instrumento|instrumentos|datalogger|dataloggers|balanza|balanzas|autoclave|autoclaves|termohigrometro|termohigrometros|manometro|manometros|sonda|sondas|phmetro|conductimetro|conductimetros|freezer|heladera|heladeras|camara|estufa|estufas|microscopio|flujo laminar|rotavapor';
+const PATRON_CODIGO_EQUIPO = /\b[a-z]{2,5}-\d{2,4}\b/i;
+
+export function looksLikeEquipoQueryText(text: string): boolean {
+  const t = norm(text);
+  if (!t || t.startsWith('/')) return false;
+  if (t.length > 200) return false;
+
+  if (PATRON_CODIGO_EQUIPO.test(t)) return true;
+
+  const tieneDominio = new RegExp(`\\b(${PALABRAS_DOMINIO_EQUIPOS})\\b`).test(t);
+  if (/^(listado|lista)\b/.test(t) && tieneDominio) return true;
+  if (/\b(vence|vencen|vencido|vencidos|vencimiento|vencimientos)\b/.test(t) && tieneDominio) return true;
+
+  return false;
 }
 
 export function formatEquipoInfo(codigo: string, rows: any[]): string {

@@ -49,6 +49,8 @@ type RouterArgs = {
   listFilterText?: string | null;
   equipoCodigo?: string | null;
   excludeTerms?: string[] | null;
+  includeTerms?: string[] | null;
+  soloEstado?: 'vencido' | 'por_vencer' | null;
 };
 
 type RouterChoice = { tool: string; args: RouterArgs };
@@ -90,12 +92,12 @@ export async function routeQuestionWithGemini(chatId: number, text: string): Pro
     '- finance_report: gastos/consumos por comercio, categoría, tarjeta o medio de pago en un rango de fechas. Args: startPeriod, endPeriod ("YYYY-MM"), financeTerms (lista de palabras clave del comercio/categoría/tarjeta mencionados, ej ["visa"], ["uber"], ["supermercado"]), financeLabel (texto corto para mostrar como título, ej "tarjeta visa").',
     '- last_saved: qué fue lo último que se guardó en el sistema (cualquier tipo: nota, gasto, pendiente, etc). Sin argumentos.',
     '- search: buscar algo guardado por palabra clave, cuando no es claramente sueldo ni finanzas. Args: query (texto de búsqueda).',
-    '- equipos_vencimientos: qué equipos/instrumentos de planta vencen o están vencidos en un período, opcionalmente excluyendo un tipo (ej "ignorando HVAC/manómetros" son los códigos que empiezan con MAN). Args: startPeriod, endPeriod ("YYYY-MM"; si no da período, dejar los dos null para traer todos los vencidos/por vencer), excludeTerms (lista de prefijos de código a excluir, ej ["MAN"], o null).',
+    '- equipos_vencimientos: qué equipos/instrumentos de planta vencen, están vencidos, o un LISTADO de un tipo de equipo (ej "listado de dataloggers", "dataloggers vencidos", "que balanzas tengo"), opcionalmente excluyendo un tipo (ej "ignorando HVAC/manómetros" son los códigos que empiezan con MAN). Args: startPeriod, endPeriod ("YYYY-MM"; si no da período, dejar los dos null), excludeTerms (prefijos de código a excluir, ej ["MAN"], o null), includeTerms (prefijos de código a INCLUIR exclusivamente si piden un tipo puntual, ej "dataloggers" -> ["DAT"], "balanzas" -> ["BAL"], o null si no piden un tipo particular), soloEstado ("vencido" si piden solo lo ya vencido sin importar el período, "por_vencer" si piden solo lo próximo a vencer, o null).',
     '- equipo_info: qué se sabe de un equipo puntual por su código (ej "BAL-017", "EMP-001", "EST-001"): ubicación, última calibración, vencimiento, proveedor, observaciones. Args: equipoCodigo (el código tal cual, sin inventar ceros ni cambiar el formato).',
     '- none: si la pregunta no corresponde a ninguna función de arriba, o falta información imposible de inferir (ni siquiera con el contexto de arriba).',
     '',
     'Devolvé SOLO JSON válido, sin markdown, con esta forma exacta:',
-    '{ "tool": "salary_report"|"salary_list"|"salary_latest"|"finance_report"|"last_saved"|"search"|"equipos_vencimientos"|"equipo_info"|"none", "args": { "startPeriod": string|null, "endPeriod": string|null, "concept": string|null, "financeTerms": string[]|null, "financeLabel": string|null, "query": string|null, "listFilterText": string|null, "equipoCodigo": string|null, "excludeTerms": string[]|null } }'
+    '{ "tool": "salary_report"|"salary_list"|"salary_latest"|"finance_report"|"last_saved"|"search"|"equipos_vencimientos"|"equipo_info"|"none", "args": { "startPeriod": string|null, "endPeriod": string|null, "concept": string|null, "financeTerms": string[]|null, "financeLabel": string|null, "query": string|null, "listFilterText": string|null, "equipoCodigo": string|null, "excludeTerms": string[]|null, "includeTerms": string[]|null, "soloEstado": "vencido"|"por_vencer"|null } }'
   ].filter(Boolean).join('\n');
 
   try {
@@ -174,7 +176,9 @@ export async function executeRouterDecision(
         const rows = await queryVencimientos({
           startPeriod: args.startPeriod || undefined,
           endPeriod: args.endPeriod || undefined,
-          excludePrefixes: args.excludeTerms && args.excludeTerms.length ? args.excludeTerms : undefined
+          excludePrefixes: args.excludeTerms && args.excludeTerms.length ? args.excludeTerms : undefined,
+          includePrefixes: args.includeTerms && args.includeTerms.length ? args.includeTerms : undefined,
+          soloEstado: args.soloEstado || undefined
         });
         const label = args.startPeriod ? `en ${args.startPeriod}${args.endPeriod && args.endPeriod !== args.startPeriod ? ` a ${args.endPeriod}` : ''}` : undefined;
         await sendMessage(chatId, formatVencimientosReport(rows, { label }));
