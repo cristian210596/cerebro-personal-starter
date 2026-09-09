@@ -93,6 +93,7 @@ function procesarMailsCristian() {
 
   for (const thread of threads) {
     const mensajes = thread.getMessages();
+    let hiloOk = true;
     for (const mensaje of mensajes) {
       const messageId = mensaje.getId();
 
@@ -108,17 +109,21 @@ function procesarMailsCristian() {
           enviados++;
         } else {
           fallidos++;
+          hiloOk = false;
         }
       } catch (error) {
         fallidos++;
+        hiloOk = false;
         Logger.log('Error procesando mensaje ' + messageId + ': ' + error);
       }
     }
-    // Marcamos el hilo como procesado sólo si TODOS sus mensajes se
+    // Marcamos el hilo como procesado SOLO si TODOS sus mensajes se
     // enviaron bien en esta corrida (si alguno falló, se reintenta el
     // hilo completo en la próxima corrida — reenviar un mail ya guardado
     // no rompe nada porque el servidor dedupe por gmailMessageId).
-    thread.addLabel(labelProcesado);
+    if (hiloOk) {
+      thread.addLabel(labelProcesado);
+    }
   }
 
   Logger.log('Corrida terminada. Enviados: ' + enviados + '. Fallidos: ' + fallidos + '.');
