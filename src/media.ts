@@ -22,7 +22,7 @@ export async function transcribeAudio(buffer: Buffer, mimeType = 'audio/ogg') {
         ]
       }
     ]
-  }), { operationName: 'transcripción de audio' });
+  }), { operationName: 'transcripción de audio', timeoutMs: 45000, maxAttempts: 1 });
 
   return (response.text || '').trim();
 }
@@ -44,7 +44,7 @@ export async function describeImage(buffer: Buffer, mimeType = 'image/jpeg', cap
         ]
       }
     ]
-  }), { operationName: 'descripción de imagen' });
+  }), { operationName: 'descripción de imagen', timeoutMs: 45000, maxAttempts: 1 });
 
   return (response.text || '').trim();
 }

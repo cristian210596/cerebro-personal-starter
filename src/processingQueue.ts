@@ -177,7 +177,7 @@ async function processOneTask(task: any) {
     return { ok: recognized, task, result };
   } catch (error: any) {
     const msg = String(error?.message || error);
-    const quota = /quota|rate limit|429|gemini sin cuota|resource_exhausted/i.test(msg);
+    const quota = /quota|rate limit|429|gemini sin cuota|resource_exhausted|no respondió a tiempo/i.test(msg);
     await supabase.from('procesamiento_cola').update({
       estado: quota ? 'reintentar' : 'error',
       motivo: quota ? 'gemini_cuota' : 'error',

@@ -199,7 +199,7 @@ async function extractComprobanteWithGemini(buffer: Buffer, mimeType: string, fi
         ]
       }
     ]
-  }), { operationName: 'extracción comprobante/ticket' });
+  }), { operationName: 'extracción comprobante/ticket', timeoutMs: 45000, maxAttempts: 1 });
 
   const raw = String(response.text || '').trim();
   return parseJsonLoose(raw) as ParsedComprobante;

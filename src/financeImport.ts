@@ -317,7 +317,7 @@ async function extractPaymentScreenshotWithGemini(buffer: Buffer, mimeType: stri
           ]
         }
       ]
-    }), { operationName: 'detección captura de pago' });
+    }), { operationName: 'detección captura de pago', timeoutMs: 45000, maxAttempts: 1 });
 
     const jsonText = extractJsonObject(response.text || '');
     if (!jsonText) return null;
@@ -866,7 +866,7 @@ ${textForPrompt}` }]
     const response = await withGemini(ai => ai.models.generateContent({
       model: config.geminiModel(),
       contents: [{ role: 'user', parts }]
-    }), { operationName: 'importación financiera PDF' });
+    }), { operationName: 'importación financiera PDF', timeoutMs: 45000, maxAttempts: 1 });
 
     const jsonText = extractJsonObject(response.text || '');
     if (!jsonText) return null;

@@ -159,7 +159,7 @@ export async function extractSalaryReceiptWithGemini(buffer: Buffer, mimeType: s
         ]
       }
     ]
-  }), { operationName: 'extracción recibo de sueldo' });
+  }), { operationName: 'extracción recibo de sueldo', timeoutMs: 45000, maxAttempts: 1 });
 
   const raw = String(response.text || '').trim();
   const parsed = parseJsonLoose(raw) as ParsedSalaryReceipt;

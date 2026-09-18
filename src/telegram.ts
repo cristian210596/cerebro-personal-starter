@@ -945,7 +945,7 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
         console.error('No pude revisar/importar comprobante:', error);
         const msgText = String(error?.message || '');
         const compHint = looksLikeComprobanteFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption) || /ticket|factura|comprobante|coto|arredo|gallo/i.test(caption || '');
-        const geminiQuota = /gemini sin cuota|quota|rate limit|resource_exhausted|429/i.test(msgText);
+        const geminiQuota = /gemini sin cuota|quota|rate limit|resource_exhausted|429|no respondió a tiempo/i.test(msgText);
         if (geminiQuota || compHint) {
           const queuedKind = compHint ? 'comprobante' : 'media';
           const archivo = await saveArchivo({
@@ -1026,7 +1026,7 @@ async function handleMediaMessage(msg: NonNullable<TelegramUpdate['message']>) {
         console.error('No pude revisar/importar recibo de sueldo:', error);
         const msgText = String(error?.message || '');
         const salaryHint = looksLikeSalaryFile(media.fileName || '', media.mimeType || downloaded.mimeType || '', caption) || /recibo|haberes|sueldo|liquidaci[oó]n/i.test(caption || '');
-        const geminiQuota = /gemini sin cuota|quota|rate limit|resource_exhausted|429/i.test(msgText);
+        const geminiQuota = /gemini sin cuota|quota|rate limit|resource_exhausted|429|no respondió a tiempo/i.test(msgText);
 
         // Importante: si ya intentamos procesar una foto como posible recibo y falló por cuota,
         // NO seguimos al flujo genérico de "describir imagen". Eso consumía otra llamada Gemini

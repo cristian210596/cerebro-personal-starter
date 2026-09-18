@@ -57,7 +57,7 @@ function initializePool() {
 
 export async function withGemini<T>(
   operation: (ai: GoogleGenAI, meta: { keyIndex: number; keyLabel: string }) => Promise<T>,
-  options: { operationName?: string; cooldownMs?: number; timeoutMs?: number } = {}
+  options: { operationName?: string; cooldownMs?: number; timeoutMs?: number; maxAttempts?: number } = {}
 ): Promise<T> {
   initializePool();
 
@@ -67,8 +67,10 @@ export async function withGemini<T>(
 
   const cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
-  const maxAttempts = Math.max(state.clients.length, state.clients.length * MAX_ATTEMPTS_MULTIPLIER);
+  const maxAttempts = options.maxAttempts ?? Math.max(state.clients.length, state.clients.length * MAX_ATTEMPTS_MULTIPLIER);
   let lastError: any = null;
+  let sawTimeout = false;
+  let sawQuota = false;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const entry = pickClient();
@@ -88,6 +90,8 @@ export async function withGemini<T>(
       lastError = error;
       const reason = classifyGeminiError(error);
       entry.lastError = reason.detail;
+      if (reason.detail.startsWith('timeout')) sawTimeout = true;
+      if (reason.detail.includes('cuota')) sawQuota = true;
 
       if (reason.retryable) {
         entry.failures += 1;
@@ -99,8 +103,11 @@ export async function withGemini<T>(
     }
   }
 
-  const activeAgain = getEarliestRecoveryText();
   const op = options.operationName ? ` (${options.operationName})` : '';
+  if (sawTimeout && !sawQuota) {
+    throw new Error(`Gemini no respondió a tiempo${op}. Puede ser un documento grande; probá de nuevo con /cola procesar forzar en unos minutos.`.trim());
+  }
+  const activeAgain = getEarliestRecoveryText();
   throw new Error(`Gemini sin cuota temporalmente${op}. ${activeAgain}`.trim());
 }
 
