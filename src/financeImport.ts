@@ -351,15 +351,18 @@ async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: str
       const cleaned = cleanPdfText(text);
       if (!best || cleaned.length > best.length) best = cleaned;
 
-      // Si ya parece resumen de tarjeta, verificamos que se pueda parsear de
-      // verdad antes de quedarnos con este extractor. Un extractor puede
-      // concatenar columnas sin espacio (ej: comprobante y monto pegados) y
-      // aun así matchear el encabezado "detalle del consumo" sin que se
-      // pueda extraer ni un movimiento; en ese caso seguimos probando los
-      // demás extractores en vez de conformarnos con texto inútil.
-      if (/detalle\s+del\s+consumo/i.test(cleaned) && /(visa|master\s*card|mastercard|galicia)/i.test(cleaned)) {
+      // Si ya parece resumen de tarjeta o de cuenta MercadoPago, verificamos que se
+      // pueda parsear de verdad antes de quedarnos con este extractor. Un extractor
+      // puede matchear el encabezado sin que se pueda extraer ni un movimiento
+      // (columnas pegadas o reordenadas); en ese caso seguimos probando los demás.
+      const statementChecks: Array<[RegExp[], (t: string, f: string) => ParsedFinanceDocument | null]> = [
+        [[/detalle\s+del\s+consumo/i, /(visa|master\s*card|mastercard|galicia)/i], parseVisaGaliciaPdfText],
+        [[/detalle\s+de\s+movimientos/i, /mercado\s*pago/i], parseMercadoPagoPdfText]
+      ];
+      for (const [patterns, parseFn] of statementChecks) {
+        if (!patterns.every(p => p.test(cleaned))) continue;
         if (!bestLooksLikeStatement) bestLooksLikeStatement = cleaned;
-        const trialParse = parseVisaGaliciaPdfText(cleaned, fileName);
+        const trialParse = parseFn(cleaned, fileName);
         if (trialParse && trialParse.movimientos.length > 0) {
           console.log(`PDF financiero: texto extraído con ${name} (parseable, ${trialParse.movimientos.length} movimientos). Caracteres: ${cleaned.length}`);
           return cleaned;
