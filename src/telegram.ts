@@ -494,34 +494,31 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     const handled = await handlePendingImportedAnswer(chatId, Number(pendingAnswerMatch[1]), pendingAnswerMatch[2]);
     if (handled) return;
   } else {
-    // Respuesta en bloque: varias líneas, una por pendiente ("1 sin categoria\n2
-    // sin categoria\n..."). El regex de una sola línea no cruza saltos de línea,
-    // así que antes esto no matcheaba nada y el bloque entero se perdía como una
-    // única nota genérica. Si cada línea no vacía tiene el formato "N es/son/:/-
-    // texto", se procesa cada una. Se va de mayor a menor índice porque
-    // clasificar un pendiente lo saca de la lista y corre los índices de los que
-    // quedan; yendo de atrás para adelante los números que faltan no se mueven.
+    // Respuesta en bloque: varias líneas, una instrucción por línea. Cada línea
+    // puede ser "N categoria" (clasificar), "ignorar N" o "ignorar N a M" / "ignorar
+    // del N al M" (rango). Si TODAS las líneas matchean alguno de esos 3 formatos,
+    // se procesan juntas. Se va de mayor a menor índice porque resolver un grupo lo
+    // saca de la lista y corre los índices de los que quedan.
     const rawLines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
-    const perLineMatches = rawLines.map(l => l.match(/^(\d{1,2})(?:\s+(?:es|son)\s+|\s*[:\-]\s*|\s+)(.+)$/i));
-    if (rawLines.length > 1 && rawLines.length <= 30 && perLineMatches.every(Boolean)) {
-      const ordered = perLineMatches
-        .map(m => ({ index: Number(m![1]), answer: m![2] }))
-        .sort((a, b) => b.index - a.index);
-      await classifyPendingBulk(chatId, ordered);
-      return;
+    const perLineActions = rawLines.map(parseBulkPendingLine);
+    if (rawLines.length > 1 && rawLines.length <= 60 && perLineActions.every(Boolean)) {
+      const actions = perLineActions.flatMap(a => a!);
+      if (actions.length <= 200) {
+        await executeBulkPendingActions(chatId, actions);
+        return;
+      }
     }
 
-    // Respuesta en una sola línea, separada por comas, una por pendiente: "el 1
-    // es panadería, el 2 es cine con tarjeta de crédito, el 3 es fútbol de los
-    // miércoles". El "el" antes del número es opcional.
+    // Respuesta en una sola línea, separada por comas, una instrucción por parte:
+    // "el 1 es panadería, ignorar 2, 3 cine con tarjeta de crédito".
     const commaParts = text.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
-    const commaMatches = commaParts.map(p => p.match(/^(?:el\s+)?(\d{1,2})(?:\s+(?:es|son)\s+|\s*[:\-]\s*|\s+)(.+)$/i));
-    if (commaParts.length > 1 && commaParts.length <= 30 && commaMatches.every(Boolean)) {
-      const ordered = commaMatches
-        .map(m => ({ index: Number(m![1]), answer: m![2] }))
-        .sort((a, b) => b.index - a.index);
-      await classifyPendingBulk(chatId, ordered);
-      return;
+    const commaActions = commaParts.map(parseBulkPendingLine);
+    if (commaParts.length > 1 && commaParts.length <= 60 && commaActions.every(Boolean)) {
+      const actions = commaActions.flatMap(a => a!);
+      if (actions.length <= 200) {
+        await executeBulkPendingActions(chatId, actions);
+        return;
+      }
     }
 
     // Respondió solo con la sugerencia (ej: "sin categoría"), sin el número del
@@ -1757,7 +1754,59 @@ async function handleClasificarImportadoCommand(chatId: number, args: string) {
   }
 }
 
-// Sincroniza a Notion CUALQUIER movimiento importado que todavia no tenga
+// Parsea una línea de instrucción sobre un pendiente/grupo: "18 bazar" (clasificar),
+// "ignorar 5" (ignorar uno) o "ignorar 1 a 17" / "ignorar del 35 al 52" (ignorar un
+// rango). Devuelve una o más acciones (el rango expande a una acción por índice), o
+// null si la línea no matchea ninguno de los 3 formatos.
+type BulkPendingAction = { index: number; type: 'classify'; answer: string } | { index: number; type: 'ignore' };
+
+function parseBulkPendingLine(lineRaw: string): BulkPendingAction[] | null {
+  const line = lineRaw.trim();
+  const rangeMatch = line.match(/^ignorar\s+(?:del\s+)?(\d{1,3})\s+(?:a|al)\s+(\d{1,3})\.?$/i);
+  if (rangeMatch) {
+    const start = Number(rangeMatch[1]);
+    const end = Number(rangeMatch[2]);
+    if (start > end || end - start > 200) return null;
+    const actions: BulkPendingAction[] = [];
+    for (let i = start; i <= end; i++) actions.push({ index: i, type: 'ignore' });
+    return actions;
+  }
+  const singleIgnoreMatch = line.match(/^ignorar\s+(?:el\s+)?(\d{1,3})\.?$/i);
+  if (singleIgnoreMatch) return [{ index: Number(singleIgnoreMatch[1]), type: 'ignore' }];
+
+  const classifyMatch = line.match(/^(?:el\s+)?(\d{1,3})(?:\s+(?:es|son)\s+|\s*[:\-]\s*|\s+)(.+)$/i);
+  if (classifyMatch) return [{ index: Number(classifyMatch[1]), type: 'classify', answer: classifyMatch[2] }];
+
+  return null;
+}
+
+// Junta acciones de clasificar/ignorar por índice de grupo, en un solo mensaje o
+// varias líneas ("ignorar 1 a 17" + "18 bazar" + "19 recital" + ...). Se ejecuta
+// de mayor a menor índice por la misma razón que classifyPendingBulk/ignorePendingBulk:
+// resolver un grupo lo saca de la lista y corre los índices de los que quedan.
+async function executeBulkPendingActions(chatId: number, actions: BulkPendingAction[]) {
+  const ordered = [...actions].sort((a, b) => b.index - a.index);
+  await sendMessage(chatId, `Procesando ${ordered.length} instrucciones...`);
+  const results: string[] = [];
+  for (const action of ordered) {
+    try {
+      if (action.type === 'ignore') {
+        const result = await ignoreGroupByIndex(action.index);
+        results.push(result.ok ? `#${action.index}: ignorado (${(result as any).label}, ${(result as any).count})` : `#${action.index}: ${(result as any).message}`);
+      } else {
+        const result = await classifyGroupFromAnswer(action.index, action.answer);
+        results.push(result.ok ? `#${action.index}: ${result.label} (${result.count}) — ${action.answer}` : `#${action.index}: ${(result as any).message}`);
+      }
+    } catch (error: any) {
+      results.push(`#${action.index}: error (${error?.message || 'desconocido'})`);
+    }
+  }
+  results.reverse();
+  const notionLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
+  await sendMessage(chatId, [results.join('\n'), notionLine].filter(Boolean).join('\n\n'));
+}
+
+
 // página de Notion asociada, sin importar si se creó ahora o en una importación
 // anterior (incluye datos de pruebas viejas hechas antes de este fix).
 // Devuelve el resultado (en vez de tragarse el error en silencio) para poder
