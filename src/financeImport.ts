@@ -1255,8 +1255,8 @@ async function createMovementFromImported(row: any) {
   // asi que "cuanto gaste en Uber" no encontraba nada si el texto cambiaba de un resumen
   // a otro. Ahora se resuelve contra las entidades maestras conocidas: si hay match, el
   // comercio se normaliza al nombre canonico y el texto crudo queda aprendido como alias.
-  const entity = await resolveAndLearnEntity(row.comercio_detectado || row.descripcion_original).catch(() => null);
-  const comercio = entity?.nombre || row.comercio_detectado || row.descripcion_original;
+  const entity = await resolveAndLearnEntity(usableComercio(row.comercio_detectado) || row.descripcion_original).catch(() => null);
+  const comercio = entity?.nombre || usableComercio(row.comercio_detectado) || row.descripcion_original;
   const categoria = row.categoria_confirmada || row.categoria_sugerida || entity?.categoria || 'Otros';
   const subcategoria = row.subcategoria_confirmada || row.subcategoria_sugerida || entity?.subcategoria || null;
 
@@ -1340,7 +1340,7 @@ function matchScore(row: any, movement: any) {
 
 async function mergeImportedIntoMovement(row: any, match: { movement: any; score: number; reason: string }) {
   const current = match.movement;
-  const entity = await resolveAndLearnEntity(row.comercio_detectado || row.descripcion_original).catch(() => null);
+  const entity = await resolveAndLearnEntity(usableComercio(row.comercio_detectado) || row.descripcion_original).catch(() => null);
   const patch: any = {
     monto: Number(row.monto || current.monto || 0),
     moneda: row.moneda || current.moneda || 'ARS',
@@ -1543,7 +1543,7 @@ export async function getGroupedPendingImportedMovements(limit = 60) {
     if (!group) {
       group = {
         key,
-        label: clean(row.comercio_detectado) || clean(row.descripcion_original) || 'Sin descripción',
+        label: usableComercio(row.comercio_detectado) || clean(row.descripcion_original) || 'Sin descripción',
         rows: [],
         count: 0,
         total: 0,
@@ -2379,6 +2379,15 @@ function sha256(buffer: Buffer) {
 
 function clean(value: any) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+// Un comercio_detectado degenerado (ej: "/", quedó así por una regla vieja rota)
+// no debe ganarle nunca a la descripción real en un "a || b". Se considera
+// degenerado si, sacando letras/números, no queda nada usable.
+function usableComercio(value: any): string | null {
+  const v = clean(value);
+  if (!v) return null;
+  return v.replace(/[^a-z0-9áéíóúñ]/gi, '').length >= 2 ? v : null;
 }
 
 function norm(value: any) {
