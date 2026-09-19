@@ -1469,6 +1469,10 @@ export async function classifyImportedMovementByIndex(index: number, categoryTex
   const rows = await getPendingImportedMovements(30);
   const row = rows[index - 1];
   if (!row) return { ok: false as const, message: `No encontré pendiente #${index}. Usá /importacion revisar.` };
+  return applyClassificationToRow(row, categoryText, saveRule, entidadNombre, detalle);
+}
+
+async function applyClassificationToRow(row: any, categoryText: string, saveRule: boolean, entidadNombre?: string | null, detalle?: string | null) {
   const parsed = parseCategoryAndSubcategory(categoryText);
   if (!parsed.category) return { ok: false as const, message: 'Indicá categoría. Ejemplo: /clasificar 1 Suscripciones guardar regla' };
 
@@ -1520,6 +1524,138 @@ export async function classifyImportedMovementByIndex(index: number, categoryTex
 
   await updateImportationState(row.importacion_id);
   return { ok: true as const, imported: updated, movement, rule, action, nextPending: await getNextPendingImportedMovement() };
+}
+
+// Agrupa pendientes por comercio para no tener que clasificar el mismo comercio
+// varias veces (ej: 4 transferencias distintas a la misma persona). El orden y la
+// clave de agrupación son deterministas (mismo criterio que merchant_key/comercio),
+// así que el mismo índice de grupo resuelve a lo mismo entre el listado y la
+// clasificación, mientras no se clasifique nada en el medio.
+export async function getGroupedPendingImportedMovements(limit = 60) {
+  const rows = await getPendingImportedMovements(limit);
+  const groups: { key: string; label: string; rows: any[]; count: number; total: number; categoria_sugerida: string | null }[] = [];
+  const byKey = new Map<string, typeof groups[number]>();
+
+  for (const row of rows) {
+    const rawKey = row.merchant_key || merchantKeyFrom(row.comercio_detectado || row.descripcion_original || '');
+    const key = rawKey && rawKey.trim().length >= 3 ? rawKey : `__row_${row.id}`;
+    let group = byKey.get(key);
+    if (!group) {
+      group = {
+        key,
+        label: clean(row.comercio_detectado) || clean(row.descripcion_original) || 'Sin descripción',
+        rows: [],
+        count: 0,
+        total: 0,
+        categoria_sugerida: row.categoria_sugerida || null
+      };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.rows.push(row);
+    group.count += 1;
+    group.total += Number(row.monto || 0);
+  }
+
+  return groups;
+}
+
+export function formatPendingImportedGrouped(groups: Awaited<ReturnType<typeof getGroupedPendingImportedMovements>>) {
+  if (!groups.length) return 'Importación financiera\n\nNo hay movimientos pendientes de clasificar.';
+  const lines = ['Pendientes por clasificar (agrupados por comercio)', ''];
+  groups.forEach((g, i) => {
+    const montoTxt = formatMoney(g.total, 'ARS');
+    lines.push(`#${i + 1} — ${g.label} (${g.count} mov., ${montoTxt})`);
+    if (g.count === 1) {
+      const r = g.rows[0];
+      lines.push(`   ${r.fecha_movimiento || '-'} — ${formatMoney(Number(r.monto || 0), r.moneda || 'ARS')}`);
+    }
+    lines.push('');
+  });
+  lines.push('Para clasificar todo junto en un mensaje: 1 kiosco, 2 ferreteria, 3 nafta');
+  lines.push('También sirve uno por línea, o /clasificar 1 Categoria guardar regla para guardar la regla de ese comercio.');
+  return lines.join('\n');
+}
+
+export async function classifyGroupByIndex(groupIndex: number, categoryText: string, saveRule: boolean, entidadNombre?: string | null, detalle?: string | null) {
+  const groups = await getGroupedPendingImportedMovements(60);
+  const group = groups[groupIndex - 1];
+  if (!group) return { ok: false as const, message: `No encontré el grupo #${groupIndex}. Usá /importacion revisar.` };
+
+  const results: Awaited<ReturnType<typeof applyClassificationToRow>>[] = [];
+  for (const row of group.rows) {
+    results.push(await applyClassificationToRow(row, categoryText, saveRule, entidadNombre, detalle));
+  }
+  const ok = results.every(r => r.ok);
+  return { ok, label: group.label, count: group.count, results };
+}
+
+// Igual que classifyGroupByIndex pero interpretando la respuesta en lenguaje natural
+// una sola vez (con la primera fila del grupo como contexto) y aplicándola a todas
+// las filas del grupo, en vez de llamar a Gemini una vez por fila.
+export async function classifyGroupFromAnswer(groupIndex: number, answerText: string) {
+  const groups = await getGroupedPendingImportedMovements(60);
+  const group = groups[groupIndex - 1];
+  if (!group) return { ok: false as const, message: `No encontré el grupo #${groupIndex}. Usá /importacion revisar.` };
+
+  const interpreted = await interpretPendingAnswerWithGemini(group.rows[0], answerText);
+  const fallback = parseCategoryAndSubcategory(answerText);
+  const categoria = interpreted?.categoria || fallback.category || 'Otros';
+  const subcategoria = interpreted?.subcategoria || fallback.subcategory || null;
+  const categoryText = [categoria, subcategoria].filter(Boolean).join(' / ');
+
+  const results: Awaited<ReturnType<typeof applyClassificationToRow>>[] = [];
+  for (const row of group.rows) {
+    results.push(await applyClassificationToRow(row, categoryText, false, interpreted?.entidad_nombre || null, interpreted?.detalle || null));
+  }
+  const ok = results.every(r => r.ok);
+  return { ok, label: group.label, count: group.count, results };
+}
+
+export function formatClassifyGroupResult(result: Awaited<ReturnType<typeof classifyGroupByIndex>>) {
+  if (!result.ok || !('results' in result)) return (result as any).message || 'No pude clasificar el grupo.';
+  const first = result.results.find(r => r.ok) as any;
+  const categoria = first?.movement?.categoria_financiera || '-';
+  const lines = [
+    `Grupo clasificado: ${result.label}`,
+    '',
+    `Movimientos actualizados: ${result.count}`,
+    `Categoría: ${categoria}`
+  ];
+  const failed = result.results.filter(r => !r.ok);
+  if (failed.length) lines.push('', `${failed.length} no se pudieron actualizar: ${failed.map((r: any) => r.message).join('; ')}`);
+  return lines.join('\n');
+}
+
+export async function ignoreGroupByIndex(groupIndex: number) {
+  const groups = await getGroupedPendingImportedMovements(60);
+  const group = groups[groupIndex - 1];
+  if (!group) return { ok: false as const, message: `No encontré el grupo #${groupIndex}. Usá /importacion revisar.` };
+  for (const row of group.rows) {
+    const { error } = await supabase.from('finanzas_movimientos_importados').update({ estado: 'ignorado', updated_at: new Date().toISOString() }).eq('id', row.id);
+    if (error) throw error;
+    await updateImportationState(row.importacion_id);
+  }
+  return { ok: true as const, label: group.label, count: group.count };
+}
+
+export function formatIgnoreGroupResult(result: Awaited<ReturnType<typeof ignoreGroupByIndex>>) {
+  if (!result.ok) return (result as any).message || 'No pude ignorar el grupo.';
+  return `Grupo ignorado: ${result.label} (${result.count} movimientos).`;
+}
+
+// Versión agrupada de findPendingIndicesMatchingSuggestion: devuelve índices de
+// GRUPO (no de fila) cuya sugerencia coincide con el texto.
+export async function findGroupIndicesMatchingSuggestion(text: string): Promise<number[]> {
+  const needle = String(text || '').trim().toLowerCase();
+  if (!needle) return [];
+  const groups = await getGroupedPendingImportedMovements(60);
+  const indices: number[] = [];
+  groups.forEach((g, i) => {
+    const suggestion = String(g.categoria_sugerida || 'sin categoría').trim().toLowerCase();
+    if (suggestion === needle) indices.push(i + 1);
+  });
+  return indices;
 }
 
 export async function interpretPendingAnswerWithGemini(row: any, answerText: string) {

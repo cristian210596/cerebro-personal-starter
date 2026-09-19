@@ -42,7 +42,7 @@ import { looksLikeCalibracionEventText, looksLikeConfirmacionCalibracion, propon
 import { buildDiagnostics, formatDiagnostics, formatOperationalLogs, formatSystemAutotest, getOperationalLogs, runSystemAutotest } from './diagnostics.js';
 import { buildOperationalReview, formatOperationalReview, looksLikeReviewRequest } from './reviewPro.js';
 import { formatClarifyCorrection, formatNaturalDeletePrompt, naturalDeleteArgs, routeConversationalText } from './conversationRouter.js';
-import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, correctLastFinanceMovementFromText, findPendingIndicesMatchingSuggestion, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, getUnsyncedImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, importPaymentScreenshotFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
+import { classifyImportedMovementByIndex, classifyImportedMovementFromAnswer, classifyGroupByIndex, classifyGroupFromAnswer, formatClassifyGroupResult, formatIgnoreGroupResult, getGroupedPendingImportedMovements, formatPendingImportedGrouped, findGroupIndicesMatchingSuggestion, ignoreGroupByIndex, correctLastFinanceMovementFromText, findPendingIndicesMatchingSuggestion, formatClassifyImportedResult, formatFinanceAnalyticsReport, formatIgnoreImportedResult, formatImportResult, formatImports, formatPendingImported, formatProcessImportResult, getPendingImportedMovements, getUnsyncedImportedMovements, ignoreImportedMovementByIndex, importFinanceFile, importPaymentScreenshotFile, latestFinanceImport, listFinanceImports, looksLikeFinanceAnalyticsText, looksLikeFinanceFile, looksLikeImportCommand, processFinanceImportation, summarizeFinanceAnalytics } from './financeImport.js';
 import { formatComprobanteDetail, formatComprobanteImportResult, formatComprobanteItems, formatComprobantes, formatProductRuleResult, formatProductSpendingReport, formatProducts, getComprobanteItems, getLastComprobante, importComprobanteFromFile, listComprobantes, listProducts, looksLikeComprobanteFile, looksLikeProductQueryText, saveProductRuleFromText, summarizeProductSpending } from './comprobantes.js';
 import { confirmLastSalaryReceipt, correctLastSalaryReceiptFromText, createManualSalaryReceiptFromText, formatSalaryConcepts, formatSalaryImportResult, formatSalaryList, formatSalaryReceipt, formatSalarySummary, getLastSalaryReceipt, getSalaryConcepts, importSalaryReceiptFromFile, listSalaryReceipts, looksLikeSalaryFile, looksLikeSalaryQueryText, summarizeSalaryFromText } from './salary.js';
 import { enqueueProcessingTask, cleanupQueueCompleted, formatQueue, formatQueueProcessResults, listQueue, processQueue, retryLastQueued } from './processingQueue.js';
@@ -469,22 +469,22 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
   // todos). Antes había que resolver cada pendiente uno por uno.
   const normalizedBulkAll = removeAccents(text.trim().toLowerCase());
   if (/^todos?\s+sin\s+clasificar\.?$/.test(normalizedBulkAll)) {
-    const pendingAll = await getPendingImportedMovements(30);
-    if (!pendingAll.length) {
+    const groupsAll = await getGroupedPendingImportedMovements(60);
+    if (!groupsAll.length) {
       await sendMessage(chatId, 'No hay movimientos pendientes de clasificar.');
       return;
     }
-    const pairs = pendingAll.map((_, i) => ({ index: i + 1, answer: 'sin categoría' })).sort((a, b) => b.index - a.index);
+    const pairs = groupsAll.map((_, i) => ({ index: i + 1, answer: 'sin categoría' })).sort((a, b) => b.index - a.index);
     await classifyPendingBulk(chatId, pairs);
     return;
   }
   if (/^todos?\s+ignorar\.?$/.test(normalizedBulkAll)) {
-    const pendingAll = await getPendingImportedMovements(30);
-    if (!pendingAll.length) {
+    const groupsAll = await getGroupedPendingImportedMovements(60);
+    if (!groupsAll.length) {
       await sendMessage(chatId, 'No hay movimientos pendientes de clasificar.');
       return;
     }
-    const indicesDesc = pendingAll.map((_, i) => i + 1).sort((a, b) => b - a);
+    const indicesDesc = groupsAll.map((_, i) => i + 1).sort((a, b) => b - a);
     await ignorePendingBulk(chatId, indicesDesc);
     return;
   }
@@ -504,22 +504,10 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     const rawLines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
     const perLineMatches = rawLines.map(l => l.match(/^(\d{1,2})(?:\s+(?:es|son)\s+|\s*[:\-]\s*|\s+)(.+)$/i));
     if (rawLines.length > 1 && rawLines.length <= 30 && perLineMatches.every(Boolean)) {
-      await sendMessage(chatId, `Clasificando ${perLineMatches.length} pendientes...`);
       const ordered = perLineMatches
         .map(m => ({ index: Number(m![1]), answer: m![2] }))
         .sort((a, b) => b.index - a.index);
-      const results: string[] = [];
-      for (const { index, answer } of ordered) {
-        try {
-          const result = await classifyImportedMovementFromAnswer(index, answer);
-          results.push(result.ok ? `#${index}: ${result.movement.comercio || '-'} — ${result.movement.categoria_financiera || '-'}` : `#${index}: ${result.message}`);
-        } catch (error: any) {
-          results.push(`#${index}: error (${error?.message || 'desconocido'})`);
-        }
-      }
-      results.reverse();
-      const notionLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
-      await sendMessage(chatId, [results.join('\n'), notionLine].filter(Boolean).join('\n\n'));
+      await classifyPendingBulk(chatId, ordered);
       return;
     }
 
@@ -538,12 +526,12 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
 
     // Respondió solo con la sugerencia (ej: "sin categoría"), sin el número del
     // pendiente adelante. Antes esto se perdía como nota genérica random.
-    const suggestionMatches = await findPendingIndicesMatchingSuggestion(text);
+    const suggestionMatches = await findGroupIndicesMatchingSuggestion(text);
     if (suggestionMatches.length === 1) {
       const handled = await handlePendingImportedAnswer(chatId, suggestionMatches[0], text.trim());
       if (handled) return;
     } else if (suggestionMatches.length > 1) {
-      await sendMessage(chatId, `Hay ${suggestionMatches.length} pendientes con esa misma sugerencia (#${suggestionMatches.join(', #')}). Decime el número, ej: "${suggestionMatches[0]} es ${text.trim()}".`);
+      await sendMessage(chatId, `Hay ${suggestionMatches.length} grupos con esa misma sugerencia (#${suggestionMatches.join(', #')}). Decime el número, ej: "${suggestionMatches[0]} es ${text.trim()}".`);
       return;
     }
   }
@@ -1695,7 +1683,7 @@ async function handleImportacionCommand(chatId: number, args: string) {
       const imp = await latestFinanceImport();
       if (!imp) return sendMessage(chatId, 'No hay importaciones financieras todavía.');
       const stats = await import('./financeImport.js').then(m => m.buildImportStats(imp.id));
-      const pending = await getPendingImportedMovements(5);
+      const groupsPreview = await getGroupedPendingImportedMovements(30);
       return sendMessage(chatId, [
         'Última importación financiera',
         '',
@@ -1710,12 +1698,12 @@ async function handleImportacionCommand(chatId: number, args: string) {
         `Pendientes: ${stats.pendiente_revision || 0}`,
         '',
         stats.clasificado ? 'Para consolidar los ya clasificados: /importacion procesar' : '',
-        pending.length ? formatPendingImported(pending.slice(0, 5)) : 'Sin pendientes de clasificación.'
+        groupsPreview.length ? formatPendingImportedGrouped(groupsPreview.slice(0, 5)) : 'Sin pendientes de clasificación.'
       ].filter(Boolean).join('\n'));
     }
     if (a.includes('revisar') || a.includes('pendiente')) {
-      const rows = await getPendingImportedMovements(12);
-      return sendMessage(chatId, formatPendingImported(rows));
+      const groups = await getGroupedPendingImportedMovements(60);
+      return sendMessage(chatId, formatPendingImportedGrouped(groups));
     }
     return sendMessage(chatId, 'Usá: /importacion ultima, /importacion revisar o /importacion procesar');
   } catch (error: any) {
@@ -1725,23 +1713,44 @@ async function handleImportacionCommand(chatId: number, args: string) {
 }
 
 async function handleClasificarImportadoCommand(chatId: number, args: string) {
-  const match = String(args || '').trim().match(/^(\d+)\s+(.+)$/);
-  if (!match) {
+  const raw = String(args || '').trim();
+  if (!raw) {
     // "/clasificar" sin argumentos: antes tiraba solo el texto de ayuda y había
     // que ir resolviendo pendiente por pendiente. Ahora muestra el listado
-    // completo de una, para poder responder todo junto (línea por línea, en una
-    // sola línea separada por comas, o con "todos sin clasificar"/"todos ignorar").
-    const pending = await getPendingImportedMovements(30);
-    if (pending.length) return sendMessage(chatId, formatPendingImported(pending));
+    // agrupado por comercio, para poder responder todo junto en un solo mensaje
+    // ("1 kiosco, 2 ferreteria, 3 nafta"), línea por línea, o con "todos sin
+    // clasificar"/"todos ignorar".
+    const groups = await getGroupedPendingImportedMovements(60);
+    if (groups.length) return sendMessage(chatId, formatPendingImportedGrouped(groups));
+    return sendMessage(chatId, 'Usá: /clasificar 1 Suscripciones guardar regla');
+  }
+
+  // Varios grupos en un mismo /clasificar, separados por coma: "/clasificar 1
+  // kiosco, 2 ferreteria, 3 nafta". Sin esto, la coma terminaba pegada al texto
+  // de la primera categoría en vez de separar pares.
+  const commaParts = raw.split(/\s*,\s*/).map(s => s.trim()).filter(Boolean);
+  const commaMatches = commaParts.map(p => p.match(/^(\d+)\s+(.+)$/));
+  if (commaParts.length > 1 && commaMatches.every(Boolean)) {
+    const ordered = commaMatches
+      .map(m => ({ index: Number(m![1]), answer: m![2] }))
+      .sort((a, b) => b.index - a.index);
+    await classifyPendingBulk(chatId, ordered);
+    return;
+  }
+
+  const match = raw.match(/^(\d+)\s+(.+)$/);
+  if (!match) {
+    const groups = await getGroupedPendingImportedMovements(60);
+    if (groups.length) return sendMessage(chatId, formatPendingImportedGrouped(groups));
     return sendMessage(chatId, 'Usá: /clasificar 1 Suscripciones guardar regla');
   }
   const index = Number(match[1]);
   const text = match[2];
   const saveRule = /guardar regla|siempre|recordar/i.test(text);
   try {
-    const result = await classifyImportedMovementByIndex(index, text, saveRule);
+    const result = await classifyGroupByIndex(index, text, saveRule);
     const notionLine = result.ok ? formatNotionSyncLine(await syncPendingImportedMovementsToNotion()) : '';
-    return sendMessage(chatId, [formatClassifyImportedResult(result), notionLine].filter(Boolean).join('\n\n'));
+    return sendMessage(chatId, [formatClassifyGroupResult(result), notionLine].filter(Boolean).join('\n\n'));
   } catch (error: any) {
     console.error('No pude clasificar importado:', error);
     return sendMessage(chatId, `No pude clasificar movimiento importado: ${error?.message || 'error desconocido'}`);
@@ -1778,9 +1787,9 @@ function formatNotionSyncLine(sync: { ok: boolean; synced: number; total: number
 async function handleLastFinanceMovementCorrection(chatId: number, answerTextRaw: string): Promise<boolean> {
   const answerText = String(answerTextRaw || '').trim();
   try {
-    const pending = await getPendingImportedMovements(30);
-    if (pending.length) {
-      const handled = await handlePendingImportedAnswer(chatId, pending.length, answerText || 'sin detalle adicional');
+    const groups = await getGroupedPendingImportedMovements(60);
+    if (groups.length) {
+      const handled = await handlePendingImportedAnswer(chatId, groups.length, answerText || 'sin detalle adicional');
       if (handled) return true;
     }
 
@@ -1832,17 +1841,17 @@ function formatCorrectedMovement(row: any) {
 // arrancan con un número por otro motivo.
 async function handlePendingImportedAnswer(chatId: number, index: number, answerText: string) {
   try {
-    const pending = await getPendingImportedMovements(30);
-    if (!pending.length || index < 1 || index > pending.length) return false;
+    const groups = await getGroupedPendingImportedMovements(60);
+    if (!groups.length || index < 1 || index > groups.length) return false;
 
     await sendMessage(chatId, 'Anotado. Clasificando con lo que me contaste...');
-    const result = await classifyImportedMovementFromAnswer(index, answerText);
+    const result = await classifyGroupFromAnswer(index, answerText);
     if (!result.ok) {
-      await sendMessage(chatId, result.message);
+      await sendMessage(chatId, (result as any).message);
       return true;
     }
     const notionLine = formatNotionSyncLine(await syncPendingImportedMovementsToNotion());
-    await sendMessage(chatId, [formatClassifyImportedResult(result), notionLine].filter(Boolean).join('\n\n'));
+    await sendMessage(chatId, [formatClassifyGroupResult(result), notionLine].filter(Boolean).join('\n\n'));
     return true;
   } catch (error: any) {
     console.error('No pude interpretar respuesta a pendiente de clasificación:', error);
@@ -1856,12 +1865,12 @@ async function handlePendingImportedAnswer(chatId: number, index: number, answer
 // pendiente lo saca de la lista y corre los índices de los que quedan, así que
 // yendo de atrás para adelante los números que faltan procesar no se mueven.
 async function classifyPendingBulk(chatId: number, orderedPairs: { index: number; answer: string }[]) {
-  await sendMessage(chatId, `Clasificando ${orderedPairs.length} pendientes...`);
+  await sendMessage(chatId, `Clasificando ${orderedPairs.length} grupos...`);
   const results: string[] = [];
   for (const { index, answer } of orderedPairs) {
     try {
-      const result = await classifyImportedMovementFromAnswer(index, answer);
-      results.push(result.ok ? `#${index}: ${result.movement.comercio || '-'} — ${result.movement.categoria_financiera || '-'}` : `#${index}: ${result.message}`);
+      const result = await classifyGroupFromAnswer(index, answer);
+      results.push(result.ok ? `#${index}: ${result.label} (${result.count}) — ${answer}` : `#${index}: ${(result as any).message}`);
     } catch (error: any) {
       results.push(`#${index}: error (${error?.message || 'desconocido'})`);
     }
@@ -1875,12 +1884,12 @@ async function classifyPendingBulk(chatId: number, orderedPairs: { index: number
 // indicesDesc debe venir ordenado de mayor a menor por la misma razón que
 // classifyPendingBulk.
 async function ignorePendingBulk(chatId: number, indicesDesc: number[]) {
-  await sendMessage(chatId, `Ignorando ${indicesDesc.length} pendientes...`);
+  await sendMessage(chatId, `Ignorando ${indicesDesc.length} grupos...`);
   const results: string[] = [];
   for (const index of indicesDesc) {
     try {
-      const result = await ignoreImportedMovementByIndex(index);
-      results.push(result.ok ? `#${index}: ignorado` : `#${index}: ${result.message}`);
+      const result = await ignoreGroupByIndex(index);
+      results.push(result.ok ? `#${index}: ignorado (${(result as any).label}, ${(result as any).count})` : `#${index}: ${(result as any).message}`);
     } catch (error: any) {
       results.push(`#${index}: error (${error?.message || 'desconocido'})`);
     }
@@ -1893,8 +1902,8 @@ async function handleIgnorarImportadoCommand(chatId: number, args: string) {
   const match = String(args || '').trim().match(/^(?:importado\s+)?(\d+)$/i);
   if (!match) return sendMessage(chatId, 'Usá: /ignorar importado 1');
   try {
-    const result = await ignoreImportedMovementByIndex(Number(match[1]));
-    return sendMessage(chatId, formatIgnoreImportedResult(result));
+    const result = await ignoreGroupByIndex(Number(match[1]));
+    return sendMessage(chatId, formatIgnoreGroupResult(result));
   } catch (error: any) {
     console.error('No pude ignorar importado:', error);
     return sendMessage(chatId, `No pude ignorar movimiento importado: ${error?.message || 'error desconocido'}`);
