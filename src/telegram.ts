@@ -489,10 +489,13 @@ export async function handleTelegramUpdate(update: TelegramUpdate) {
     return;
   }
 
-  const pendingAnswerMatch = text.trim().match(/^(\d{1,2})\s*(?:es|son|:|-)\s+(.+)$/i);
-  if (pendingAnswerMatch) {
-    const handled = await handlePendingImportedAnswer(chatId, Number(pendingAnswerMatch[1]), pendingAnswerMatch[2]);
+  const singleLineActions = parseBulkPendingLine(text.trim());
+  if (singleLineActions && singleLineActions.length === 1 && singleLineActions[0].type === 'classify') {
+    const handled = await handlePendingImportedAnswer(chatId, singleLineActions[0].index, singleLineActions[0].answer);
     if (handled) return;
+  } else if (singleLineActions) {
+    await executeBulkPendingActions(chatId, singleLineActions);
+    return;
   } else {
     // Respuesta en bloque: varias líneas, una instrucción por línea. Cada línea
     // puede ser "N categoria" (clasificar), "ignorar N" o "ignorar N a M" / "ignorar
