@@ -1632,6 +1632,10 @@ export async function correctLastFinanceMovementFromText(answerText: string) {
 
 async function saveCommerceRuleFromImported(row: any, category: string, subcategory: string | null) {
   const patron = row.merchant_key || merchantKeyFrom(row.comercio_detectado || row.descripcion_original);
+  if (!patron || patron.trim().length < 3) {
+    console.error('No guardo regla de comercio: patrón vacío o demasiado corto.', { row_id: row?.id, comercio_detectado: row?.comercio_detectado, descripcion_original: row?.descripcion_original });
+    return null;
+  }
   const { data, error } = await supabase
     .from('finanzas_reglas_comercios')
     .upsert({
@@ -1952,9 +1956,10 @@ function builtInRuleFor(m: ImportedMovement) {
 
 async function loadSavedRule(row: any) {
   const key = row.merchant_key || merchantKeyFrom(row.comercio_detectado || row.descripcion_original);
+  if (!key || key.trim().length < 3) return null;
   const { data, error } = await supabase.from('finanzas_reglas_comercios').select('*').eq('aplicar_auto', true).limit(500);
   if (error) throw error;
-  return (data || []).find((r: any) => key.includes(r.patron) || r.patron.includes(key)) || null;
+  return (data || []).find((r: any) => r.patron && r.patron.trim().length >= 3 && (key.includes(r.patron) || r.patron.includes(key))) || null;
 }
 
 async function applySavedRule(row: any) {
