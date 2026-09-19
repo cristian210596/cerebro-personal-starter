@@ -1666,19 +1666,21 @@ export async function interpretPendingAnswerWithGemini(row: any, answerText: str
     `Monto: ${row.monto} ${row.moneda || 'ARS'}`,
     `Fecha: ${row.fecha_movimiento || '-'}`,
     `Respuesta del usuario: "${answerText}"`,
+    'Tenés acceso a búsqueda web: si el nombre del comercio en la descripción original (ej: "ARREDO", "MERPAGO*LAPOSTADEL") no es un comercio obviamente conocido, buscalo en internet para identificar qué tipo de negocio es (rubro) ANTES de asignar categoría. Ejemplo: "ARREDO" es una cadena argentina de blanquería/textil para el hogar → categoría Casa. No inventes el rubro si la búsqueda no da nada claro: en ese caso priorizá lo que dijo el usuario.',
     'Devolvé SOLO JSON válido, sin markdown, con esta forma exacta:',
     '{ "entidad_nombre": string | null, "categoria": string, "subcategoria": string | null, "detalle": string | null }',
     'Reglas:',
     '- "entidad_nombre": el nombre del comercio/servicio/persona que el USUARIO diga en su respuesta (ej: "panadería de la esquina", "mi hermano", "Farmacity"). Priorizá siempre lo que dice el usuario por sobre la descripción original del resumen: si el usuario nombra un comercio distinto al que aparece ahí (por ejemplo, el resumen trae el nombre de una persona pero el usuario dice que fue una panadería), usá lo que dijo el usuario. No repitas el texto crudo del resumen salvo que el usuario lo confirme. Si el usuario solo mencionó el medio de pago (ej: "es mercado pago") sin nombrar comercio, usá null.',
-    '- "categoria" y "subcategoria": basate en lo que el usuario CONTÓ que fue el gasto o para qué lo usó (ej: "es un sándwich que compré para cenar" → Comida afuera; "entrada a un recital" → Ocio), NO en la descripción original del resumen ni en ninguna sugerencia previa. Usá la descripción original del resumen solo como apoyo si la respuesta del usuario es ambigua y no dice de qué se trató el gasto. Categorías cortas, en español, consistentes con categorías de gastos personales (ej: Supermercado, Transporte, Salud, Comida afuera, Ocio, Deudas / compartidos, Servicios, Otros).',
+    '- "categoria" y "subcategoria": basate en lo que el usuario CONTÓ que fue el gasto o para qué lo usó (ej: "es un sándwich que compré para cenar" → Comida afuera; "entrada a un recital" → Ocio), NO en la descripción original del resumen ni en ninguna sugerencia previa. Si la respuesta del usuario es genérica (ej: "compras", "gasto") y el nombre del comercio identifica un rubro más específico (por vos mismo o por búsqueda web), usá ese rubro más específico. Categorías cortas, en español, consistentes con categorías de gastos personales (ej: Supermercado, Transporte, Salud, Comida afuera, Ocio, Casa, Deudas / compartidos, Servicios, Otros).',
     '- "detalle": si el usuario contó qué compró, para qué fue el gasto, o cualquier detalle adicional más allá de la categoría/entidad (ej: "pastafrola y biscochitos", "arreglo de la bici"), un resumen corto de eso en sus palabras. Si no agregó nada más, null.'
   ].join('\n');
 
   try {
     const response = await withGemini(ai => ai.models.generateContent({
       model: config.geminiModel(),
-      contents: [{ role: 'user', parts: [{ text: prompt }] }]
-    }), { operationName: 'interpretar respuesta de clasificación' });
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { tools: [{ googleSearch: {} }] }
+    }), { operationName: 'interpretar respuesta de clasificación', timeoutMs: 30000 });
     const jsonText = extractJsonObject(response.text || '');
     if (!jsonText) return null;
     const parsed = JSON.parse(jsonText);
@@ -2248,29 +2250,38 @@ function normalizeCurrency(value: any) {
   return 'ARS';
 }
 
+const CATEGORY_ALIASES: Record<string, string> = {
+  transporte: 'Transporte', taxi: 'Transporte', remis: 'Transporte', sube: 'Transporte', colectivo: 'Transporte', subte: 'Transporte', uber: 'Transporte', cabify: 'Transporte', didi: 'Transporte',
+  auto: 'Auto', automotriz: 'Auto', nafta: 'Auto', combustible: 'Auto', ypf: 'Auto', shell: 'Auto', axion: 'Auto', puma: 'Auto', mecanico: 'Auto', taller: 'Auto', autoszanet: 'Auto',
+  suscripciones: 'Suscripciones', suscripcion: 'Suscripciones', icloud: 'Suscripciones', google: 'Suscripciones', 'google one': 'Suscripciones', claude: 'Suscripciones', anthropic: 'Suscripciones', chatgpt: 'Suscripciones', openai: 'Suscripciones', netflix: 'Suscripciones', spotify: 'Suscripciones', 'disney plus': 'Suscripciones', youtube: 'Suscripciones', 'youtube premium': 'Suscripciones',
+  supermercado: 'Supermercado', super: 'Supermercado', coto: 'Supermercado', carrefour: 'Supermercado', dia: 'Supermercado', jumbo: 'Supermercado', disco: 'Supermercado', vea: 'Supermercado',
+  alimentos: 'Alimentos', 'alimentos y bebidas': 'Alimentos', kiosco: 'Alimentos', kiosko: 'Alimentos', fiambreria: 'Alimentos', panaderia: 'Alimentos', verduleria: 'Alimentos', carniceria: 'Alimentos', almacen: 'Alimentos', bazar: 'Alimentos',
+  'comida afuera': 'Comida afuera', comida: 'Comida afuera', 'comida a domicilio': 'Comida afuera', delivery: 'Comida afuera', rappi: 'Comida afuera', pedidosya: 'Comida afuera', 'pedidos ya': 'Comida afuera', restaurante: 'Comida afuera', bar: 'Comida afuera', cafe: 'Comida afuera', cafeteria: 'Comida afuera', 'salida cena': 'Comida afuera', pizzeria: 'Comida afuera',
+  servicios: 'Servicios', luz: 'Servicios', gas: 'Servicios', agua: 'Servicios', internet: 'Servicios', telefono: 'Servicios', celular: 'Servicios', edenor: 'Servicios', edesur: 'Servicios', aysa: 'Servicios', metrogas: 'Servicios', movistar: 'Servicios', personal: 'Servicios', claro: 'Servicios', telecentro: 'Servicios',
+  impuestos: 'Impuestos', afip: 'Impuestos', arca: 'Impuestos', abl: 'Impuestos', rentas: 'Impuestos', patente: 'Impuestos',
+  educacion: 'Educación', universidad: 'Educación', facultad: 'Educación', curso: 'Educación', colegio: 'Educación',
+  farmacia: 'Farmacia', farmacity: 'Farmacia', remedios: 'Farmacia', medicamentos: 'Farmacia',
+  salud: 'Salud', medico: 'Salud', doctor: 'Salud', 'obra social': 'Salud', prepaga: 'Salud',
+  ropa: 'Ropa', indumentaria: 'Ropa', calzado: 'Ropa', zapatillas: 'Ropa',
+  tecnologia: 'Tecnología', electronica: 'Tecnología',
+  ocio: 'Ocio', recital: 'Ocio', cine: 'Ocio', teatro: 'Ocio', entretenimiento: 'Ocio', salidas: 'Ocio', joda: 'Ocio', boliche: 'Ocio',
+  casa: 'Casa', hogar: 'Casa', limpieza: 'Casa', ferreteria: 'Casa', mueble: 'Casa', muebles: 'Casa',
+  alquiler: 'Alquiler', expensas: 'Alquiler',
+  trabajo: 'Trabajo', oficina: 'Trabajo',
+  regalos: 'Regalos', regalo: 'Regalos', cumpleanos: 'Regalos',
+  transferencias: 'Transferencias', transferencia: 'Transferencias',
+  'deudas / compartidos': 'Deudas / compartidos', deudas: 'Deudas / compartidos', compartido: 'Deudas / compartidos',
+  'ingreso laboral': 'Ingreso laboral', sueldo: 'Ingreso laboral', salario: 'Ingreso laboral',
+  donaciones: 'Donaciones', donacion: 'Donaciones',
+  mascotas: 'Mascotas', veterinaria: 'Mascotas', herspet: 'Mascotas', 'hers pet': 'Mascotas', 'pet shop': 'Mascotas',
+  'gastos financieros': 'Gastos financieros',
+  otros: 'Otros'
+};
+
 function normalizeCategory(value: any) {
   const v = clean(value);
   if (!v) return null;
-  const aliases: Record<string, string> = {
-    transporte: 'Transporte',
-    suscripciones: 'Suscripciones',
-    supermercado: 'Supermercado',
-    alimentos: 'Alimentos',
-    'comida afuera': 'Comida afuera',
-    servicios: 'Servicios',
-    impuestos: 'Impuestos',
-    educacion: 'Educación',
-    educación: 'Educación',
-    farmacia: 'Farmacia',
-    tecnologia: 'Tecnología',
-    tecnología: 'Tecnología',
-    ocio: 'Ocio',
-    casa: 'Casa',
-    auto: 'Auto',
-    otros: 'Otros',
-    'gastos financieros': 'Gastos financieros'
-  };
-  return aliases[norm(v)] || v;
+  return CATEGORY_ALIASES[norm(v)] || v;
 }
 
 function normalizePeriod(period: any, closing?: any, due?: any) {
