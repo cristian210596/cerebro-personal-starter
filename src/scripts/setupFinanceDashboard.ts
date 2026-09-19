@@ -36,6 +36,10 @@ async function createView(body: Record<string, any>) {
   return notionFetch('/views', { method: 'POST', body: JSON.stringify(body) });
 }
 
+async function updateView(viewId: string, body: Record<string, any>) {
+  return notionFetch(`/views/${viewId}`, { method: 'PATCH', body: JSON.stringify(body) });
+}
+
 async function main() {
   const databaseId = await getAppConfigValue('notion_finanzas_movimientos_database_id');
   if (!databaseId) {
@@ -63,18 +67,67 @@ async function main() {
   const categoriaId = propId('Categoría');
   const montoId = propId('Monto');
   const fechaId = propId('Fecha');
+  const comercioId = propId('Comercio');
+  const estadoId = propId('Estado');
+  const tituloId = propId('Título');
+
+  // Qué se ve en cada tarjeta del board: lo útil de un vistazo (monto, fecha,
+  // comercio, estado), todo lo demás oculto para que no quede sobrecargado.
+  const cardProperties = [
+    { property_id: tituloId, visible: true },
+    { property_id: montoId, visible: true },
+    { property_id: fechaId, visible: true },
+    { property_id: comercioId, visible: true },
+    { property_id: estadoId, visible: true },
+    { property_id: categoriaId, visible: false }
+  ];
+  for (const name of ['Tipo', 'Moneda', 'Medio pago', 'Tarjeta', 'Banco / billetera', 'Cuotas', 'Descripción', 'Movimiento ID', 'Item ID']) {
+    if (properties[name]) cardProperties.push({ property_id: properties[name].id, visible: false });
+  }
+
+  const now = new Date();
+  const startOfMonth = new Date(Date.UTC(now.getFullYear(), now.getMonth(), 1)).toISOString().slice(0, 10);
+  const startOfNextMonth = new Date(Date.UTC(now.getFullYear(), now.getMonth() + 1, 1)).toISOString().slice(0, 10);
 
   const filtroGastoMes = {
     and: [
       { property: 'Tipo', select: { equals: 'gasto' } },
-      { property: 'Fecha', date: { this_month: {} } }
+      { property: 'Fecha', date: { on_or_after: startOfMonth } },
+      { property: 'Fecha', date: { before: startOfNextMonth } }
     ]
   };
   const filtroGasto = { property: 'Tipo', select: { equals: 'gasto' } };
 
-  // 1) Board agrupado por categoría (tab nueva en la base).
-  console.log('Creando board "Por categoría"...');
-  const board = await createView({
+  const existingViews = new Map<string, string>();
+  const existingViewsList = await notionFetch(`/views?database_id=${databaseId}`);
+  for (const ref of existingViewsList.results || []) {
+    try {
+      const full = await notionFetch(`/views/${ref.id}`);
+      if (full?.name) existingViews.set(full.name, full.id);
+    } catch (_) { /* ignorar vistas que no se puedan leer */ }
+  }
+
+  // Si la vista ya existe la actualiza (config/filtro nuevos pisan los viejos);
+  // si no, la crea. Así se puede correr el script de nuevo después de ajustar
+  // algo sin tener que borrar nada a mano en Notion primero.
+  async function upsertView(name: string, body: Record<string, any>) {
+    const existingId = existingViews.get(name);
+    if (existingId) {
+      console.log(`Actualizando "${name}"...`);
+      const { database_id, data_source_id, type, ...patchable } = body;
+      const view = await updateView(existingId, patchable);
+      console.log('  ->', view.url);
+      return view;
+    }
+    console.log(`Creando "${name}"...`);
+    const view = await createView(body);
+    console.log('  ->', view.url);
+    return view;
+  }
+
+  // 1) Board agrupado por categoría. card_layout "list" (en vez de "compact")
+  // muestra las propiedades debajo del título, no solo el nombre pelado.
+  await upsertView('Por categoría', {
     database_id: databaseId,
     data_source_id: dataSourceId,
     name: 'Por categoría',
@@ -82,24 +135,17 @@ async function main() {
     configuration: {
       type: 'board',
       group_by: { type: 'select', property_id: categoriaId, sort: { type: 'manual' } },
-      card_layout: 'compact'
+      card_layout: 'list',
+      properties: cardProperties
     }
   });
-  console.log('  ->', board.url);
 
-  // 2) Dashboard con 4 gráficos.
-  console.log('Creando dashboard "Panel financiero"...');
-  const dashboard = await createView({
+  // 2) Cuatro vistas de gráfico independientes (tabs en la base), en vez de un
+  // dashboard con widgets: Notion pide plan Business para agregar/editar widgets
+  // dentro de una vista tipo "dashboard", pero las vistas de gráfico sueltas no
+  // deberían estar detrás de ese mismo límite.
+  await upsertView('Gastado este mes', {
     database_id: databaseId,
-    data_source_id: dataSourceId,
-    name: 'Panel financiero',
-    type: 'dashboard'
-  });
-  console.log('  ->', dashboard.url);
-
-  console.log('Agregando widget: Gastado este mes (número)...');
-  await createView({
-    view_id: dashboard.id,
     data_source_id: dataSourceId,
     name: 'Gastado este mes',
     type: 'chart',
@@ -108,13 +154,11 @@ async function main() {
       type: 'chart',
       chart_type: 'number',
       value: { aggregator: 'sum', property_id: montoId }
-    },
-    placement: { type: 'new_row' }
+    }
   });
 
-  console.log('Agregando widget: Por categoría este mes (dona)...');
-  await createView({
-    view_id: dashboard.id,
+  await upsertView('Por categoría (este mes)', {
+    database_id: databaseId,
     data_source_id: dataSourceId,
     name: 'Por categoría (este mes)',
     type: 'chart',
@@ -126,13 +170,11 @@ async function main() {
       y_axis: { aggregator: 'sum', property_id: montoId },
       donut_labels: 'name_and_value',
       legend_position: 'side'
-    },
-    placement: { type: 'existing_row', row_index: 0 }
+    }
   });
 
-  console.log('Agregando widget: Gasto por categoría histórico (columnas)...');
-  await createView({
-    view_id: dashboard.id,
+  await upsertView('Gasto por categoría (histórico)', {
+    database_id: databaseId,
     data_source_id: dataSourceId,
     name: 'Gasto por categoría (histórico)',
     type: 'chart',
@@ -144,13 +186,11 @@ async function main() {
       y_axis: { aggregator: 'sum', property_id: montoId },
       color_by_value: true,
       show_data_labels: true
-    },
-    placement: { type: 'new_row' }
+    }
   });
 
-  console.log('Agregando widget: Cashflow mensual acumulado (línea)...');
-  await createView({
-    view_id: dashboard.id,
+  await upsertView('Cashflow mensual acumulado', {
+    database_id: databaseId,
     data_source_id: dataSourceId,
     name: 'Cashflow mensual acumulado',
     type: 'chart',
@@ -161,12 +201,12 @@ async function main() {
       y_axis: { aggregator: 'sum', property_id: montoId },
       cumulative: true,
       smooth_line: true
-    },
-    placement: { type: 'new_row' }
+    }
   });
 
   console.log('');
-  console.log('Listo. En "Finanzas - Movimientos" en Notion ahora hay dos tabs nuevas: "Por categoría" y "Panel financiero".');
+  console.log('Listo. En "Finanzas - Movimientos" en Notion: "Por categoría" (board) y 4 gráficos.');
+  console.log('Si tenías una tab vacía "Panel financiero" de un intento anterior (bloqueada por plan Business para dashboards), borrala a mano: abrila, "..." arriba a la derecha -> Eliminar vista.');
   console.log('Los montos de gasto están guardados en negativo (como en el resumen bancario), así que la dona/columnas/número van a mostrar números negativos. Es esperable, no un error.');
 }
 
