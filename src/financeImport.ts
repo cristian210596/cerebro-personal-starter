@@ -117,7 +117,7 @@ export async function importFinanceFile(input: {
     const pdfText = await tryExtractPdfText(input.buffer, fileName, mimeType);
     pdfTextLength = pdfText?.length || 0;
     if (pdfText && pdfText.length > 120) {
-      parsed = parseVisaGaliciaPdfText(pdfText, fileName);
+      parsed = parseVisaGaliciaPdfText(pdfText, fileName) || parseMercadoPagoPdfText(pdfText, fileName);
       console.log(`Importador financiero PDF: texto local ${pdfText.length} chars; movimientos locales ${parsed?.movimientos?.length || 0}`);
     } else {
       console.log('Importador financiero PDF: no se pudo extraer texto local usable. Intento fallback Gemini.');
@@ -752,6 +752,85 @@ function parseVisaDetailRows(text: string, referenceDate: string | null): Import
 
   return out;
 }
+function parseMercadoPagoPdfText(text: string, fileName: string): ParsedFinanceDocument | null {
+  const normalized = text.replace(/\r/g, '\n');
+  const lower = norm(normalized);
+  if (!/mercado\s*pago/.test(lower) || !/detalle de movimientos/.test(lower)) return null;
+
+  const cuenta = clean(normalized.match(/CVU:\s*([0-9]+)/i)?.[1]) || null;
+  const saldoFinal = parseAmountLoose(normalized.match(/Saldo final:\s*\$\s*(-?[\d.]+,\d{2})/i)?.[1] || '');
+
+  const movimientos = parseMercadoPagoDetailRows(normalized);
+  if (movimientos.length < 3) return null;
+
+  const primeraFecha = movimientos[0]?.fecha || null;
+  const ultimaFecha = movimientos[movimientos.length - 1]?.fecha || null;
+
+  return normalizeParsedDocument({
+    es_resumen_financiero: true,
+    tipo_fuente: 'resumen_cuenta_mercadopago',
+    proveedor: 'Mercado Pago',
+    cuenta,
+    tarjeta: null,
+    periodo: normalizePeriod(null, ultimaFecha, primeraFecha),
+    fecha_cierre: ultimaFecha,
+    fecha_vencimiento: null,
+    total_pesos: saldoFinal,
+    total_dolares: null,
+    pago_minimo: null,
+    movimientos
+  });
+}
+
+function parseMercadoPagoDetailRows(text: string): ImportedMovement[] {
+  const out: ImportedMovement[] = [];
+  const seen = new Set<string>();
+
+  // Cada fila, tal como la deja pdf-parse, queda como:
+  // "DD-MM-YYYY\n<descripción, 1 o 2 líneas>\n<id operación>$ <valor>$ <saldo>"
+  // Sin espacio entre el id y el primer "$", ni entre el valor y el segundo "$".
+  const re = /(\d{2}-\d{2}-\d{4})\n([\s\S]+?)\n(\d{6,15})\$\s*(-?[\d.]+,\d{2})\$\s*([\d.]+,\d{2})/g;
+
+  for (const m of text.matchAll(re)) {
+    const desc = clean(m[2].replace(/\s+/g, ' '));
+    if (!desc) continue;
+    const fecha = normalizeDate(m[1]);
+    const comprobante = clean(m[3]) || null;
+    const monto = parseAmountLoose(m[4]);
+    if (monto === null) continue;
+
+    const key = [fecha, comprobante].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const base: ImportedMovement = {
+      fecha,
+      descripcion_original: desc,
+      comercio: guessCommerce(desc),
+      comprobante,
+      monto,
+      moneda: 'ARS',
+      tipo: normalizeMovementType('', desc),
+      cuota_actual: null,
+      cuotas_totales: null,
+      categoria_sugerida: null,
+      subcategoria_sugerida: null,
+      confianza: 0.55,
+      raw: { text: m[0], parser: 'mercadopago_cuenta' }
+    };
+    const rule = builtInRuleFor(base);
+    out.push({
+      ...base,
+      comercio: rule?.comercio || base.comercio,
+      categoria_sugerida: rule?.categoria || null,
+      subcategoria_sugerida: rule?.subcategoria || null,
+      confianza: rule?.confianza || base.confianza
+    });
+  }
+
+  return out;
+}
+
 function normalizeDateFromStatement(value: string | null, referenceDate: string | null) {
   if (!value) return null;
   const s = clean(value);
