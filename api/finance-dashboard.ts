@@ -67,7 +67,7 @@ function renderHtml(data: FinanceDashboardData) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Finanzas — Panel</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #0f1115; --card: #171a21; --border: #2a2e38; --text: #e8e9ec; --muted: #9aa0ab;
