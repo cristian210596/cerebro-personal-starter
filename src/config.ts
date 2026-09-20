@@ -60,5 +60,6 @@ export const config = {
   notionToken: () => process.env.NOTION_TOKEN?.trim() || '',
   notionParentPageId: () => process.env.NOTION_PARENT_PAGE_ID?.trim() || '',
   notionItemsDatabaseId: () => process.env.NOTION_ITEMS_DATABASE_ID?.trim() || '',
-  supabaseStorageBucket: () => process.env.SUPABASE_STORAGE_BUCKET?.trim() || 'cerebro-archivos'
+  supabaseStorageBucket: () => process.env.SUPABASE_STORAGE_BUCKET?.trim() || 'cerebro-archivos',
+  dashboardSecret: () => process.env.DASHBOARD_SECRET?.trim() || ''
 };

@@ -14,6 +14,9 @@
     },
     "api/gmailIngest.ts": {
       "maxDuration": 30
+    },
+    "api/finance-dashboard.ts": {
+      "maxDuration": 15
     }
   },
   "crons": [

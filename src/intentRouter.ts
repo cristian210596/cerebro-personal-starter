@@ -43,6 +43,7 @@ type RouterArgs = {
   startPeriod?: string | null;
   endPeriod?: string | null;
   concept?: string | null;
+  excludeConcept?: boolean | null;
   financeTerms?: string[] | null;
   financeLabel?: string | null;
   query?: string | null;
@@ -86,7 +87,7 @@ export async function routeQuestionWithGemini(chatId: number, text: string): Pro
     'Decidí si la pregunta corresponde a alguna de estas funciones YA EXISTENTES del sistema, y con qué argumentos llamarla. NO inventes ni calcules ningún número vos: solo elegí la función y los argumentos, el cálculo lo hace el sistema contra la base de datos real.',
     '',
     'Funciones disponibles:',
-    '- salary_report: reporte/comparación de sueldo (neto, bruto, retenciones, o un concepto puntual como "horas extra", "presentismo", "ganancias") en un rango de períodos. Args: startPeriod, endPeriod (formato "YYYY-MM", resueltos a partir de HOY si la pregunta usa "mes pasado", "marzo", "mes 3", "entre el mes 3 y el 5", etc. — si preguntan por UN solo mes, startPeriod y endPeriod son el mismo mes), concept (nombre del concepto si preguntan por uno puntual, o null si preguntan por el total/neto/bruto).',
+    '- salary_report: reporte/comparación de sueldo (neto, bruto, retenciones, o un concepto puntual como "horas extra", "presentismo", "ganancias") en un rango de períodos. Args: startPeriod, endPeriod (formato "YYYY-MM", resueltos a partir de HOY si la pregunta usa "mes pasado", "marzo", "mes 3", "entre el mes 3 y el 5", etc. — si preguntan por UN solo mes, startPeriod y endPeriod son el mismo mes), concept (nombre del concepto si preguntan por uno puntual, o null si preguntan por el total/neto/bruto), excludeConcept (true si la pregunta pide el sueldo SIN/EXCLUYENDO/SACANDO ese concepto — ej "cuánto cobré sin las horas extra", "el neto sacando presentismo" — en ese caso "concept" sigue siendo el concepto a excluir; false o null si preguntan por el concepto en sí, ej "cuánto cobré DE horas extra").',
     '- salary_list: listar qué recibos de sueldo hay cargados (sin calcular nada), opcionalmente filtrado por período o texto. Args: startPeriod (si pregunta por un período puntual, si no null), listFilterText (texto libre para filtrar por empresa, o null).',
     '- salary_latest: el último recibo de sueldo cargado. Sin argumentos relevantes.',
     '- finance_report: gastos/consumos por comercio, categoría, tarjeta o medio de pago en un rango de fechas. Args: startPeriod, endPeriod ("YYYY-MM"), financeTerms (lista de palabras clave del comercio/categoría/tarjeta mencionados, ej ["visa"], ["uber"], ["supermercado"]), financeLabel (texto corto para mostrar como título, ej "tarjeta visa").',
@@ -97,7 +98,7 @@ export async function routeQuestionWithGemini(chatId: number, text: string): Pro
     '- none: si la pregunta no corresponde a ninguna función de arriba, o falta información imposible de inferir (ni siquiera con el contexto de arriba).',
     '',
     'Devolvé SOLO JSON válido, sin markdown, con esta forma exacta:',
-    '{ "tool": "salary_report"|"salary_list"|"salary_latest"|"finance_report"|"last_saved"|"search"|"equipos_vencimientos"|"equipo_info"|"none", "args": { "startPeriod": string|null, "endPeriod": string|null, "concept": string|null, "financeTerms": string[]|null, "financeLabel": string|null, "query": string|null, "listFilterText": string|null, "equipoCodigo": string|null, "excludeTerms": string[]|null, "includeTerms": string[]|null, "soloEstado": "vencido"|"por_vencer"|null } }'
+    '{ "tool": "salary_report"|"salary_list"|"salary_latest"|"finance_report"|"last_saved"|"search"|"equipos_vencimientos"|"equipo_info"|"none", "args": { "startPeriod": string|null, "endPeriod": string|null, "concept": string|null, "excludeConcept": boolean|null, "financeTerms": string[]|null, "financeLabel": string|null, "query": string|null, "listFilterText": string|null, "equipoCodigo": string|null, "excludeTerms": string[]|null, "includeTerms": string[]|null, "soloEstado": "vencido"|"por_vencer"|null } }'
   ].filter(Boolean).join('\n');
 
   try {
@@ -132,7 +133,8 @@ export async function executeRouterDecision(
         const overrides = {
           startPeriod: args.startPeriod || undefined,
           endPeriod: args.endPeriod || undefined,
-          concept: args.concept && String(args.concept).trim() ? String(args.concept).trim() : null
+          concept: args.concept && String(args.concept).trim() ? String(args.concept).trim() : null,
+          excludeConcept: !!args.excludeConcept
         };
         const result = await summarizeSalaryFromText(originalText, overrides);
         await sendMessage(chatId, formatSalarySummary(result));

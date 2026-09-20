@@ -388,7 +388,7 @@ export async function correctLastSalaryReceiptFromText(text: string) {
   return { ok: true as const, recibo: data, patch };
 }
 
-export async function summarizeSalaryFromText(text: string, overrides?: { startPeriod?: string; endPeriod?: string; concept?: string | null }) {
+export async function summarizeSalaryFromText(text: string, overrides?: { startPeriod?: string; endPeriod?: string; concept?: string | null; excludeConcept?: boolean }) {
   // El router de intencion (Gemini) puede resolver el periodo/concepto el mismo
   // y pasarlos ya normalizados (YYYY-MM), evitando los limites de
   // extractSalaryPeriodRange/extractConceptTarget (que no entienden rangos como
@@ -398,6 +398,7 @@ export async function summarizeSalaryFromText(text: string, overrides?: { startP
     ? { startPeriod: overrides.startPeriod, endPeriod: overrides.endPeriod }
     : extractSalaryPeriodRange(text);
   const targetConcept = overrides && overrides.concept !== undefined ? overrides.concept : extractConceptTarget(text);
+  const excludeConcept = !!overrides?.excludeConcept;
   const { data: receipts, error } = await supabase
     .from('sueldos_recibos')
     .select('*')
@@ -415,7 +416,7 @@ export async function summarizeSalaryFromText(text: string, overrides?: { startP
     concepts = (data || []).filter((c: any) => norm(c.concepto || '').includes(targetConcept));
   }
 
-  return { period, receipts: receipts || [], targetConcept, concepts };
+  return { period, receipts: receipts || [], targetConcept, excludeConcept, concepts };
 }
 
 export function formatSalaryImportResult(result: ImportSalaryResult) {
@@ -493,17 +494,24 @@ export function formatSalarySummary(summary: Awaited<ReturnType<typeof summarize
   lines.push(`Total retenciones: ${money(totalRet)}`);
 
   if (summary.targetConcept) {
-    lines.push('', `Concepto consultado: ${summary.targetConcept}`);
+    lines.push('', `Concepto consultado: ${summary.targetConcept}${summary.excludeConcept ? ' (excluido del total)' : ''}`);
     if (!summary.concepts.length) {
       // Antes: con 0 coincidencias igual mostraba "Total concepto: $0.00", indistinguible
       // de un concepto real en $0. Ahora se avisa explicitamente que no hubo coincidencias.
       lines.push('No encontre ese concepto en los recibos de este periodo (puede que el recibo lo nombre distinto, o que no lo haya tenido).');
+      if (summary.excludeConcept) lines.push(`Como no aparece en ningún recibo, el neto sin ese concepto es igual al total neto: ${money(totalNeto)}`);
     } else {
       const totalConcept = summary.concepts.reduce((a: number, c: any) => a + Number(c.importe || 0), 0);
-      lines.push(`Total concepto: ${money(totalConcept)}`);
+      if (summary.excludeConcept) {
+        lines.push(`Total neto SIN ${summary.targetConcept}: ${money(totalNeto - totalConcept)}`);
+        lines.push(`(Total neto con todo: ${money(totalNeto)} — ${summary.targetConcept}: ${money(totalConcept)})`);
+      } else {
+        lines.push(`Total concepto: ${money(totalConcept)}`);
+      }
       for (const c of summary.concepts.slice(0, 12)) {
         const periodo = c.sueldos_recibos?.periodo || '-';
-        lines.push(`• ${periodo}: ${c.concepto} — ${money(c.importe)}`);
+        const unidades = c.unidades ? ` (${c.unidades})` : '';
+        lines.push(`• ${periodo}: ${c.concepto}${unidades} — ${money(c.importe)}`);
       }
     }
   } else {
