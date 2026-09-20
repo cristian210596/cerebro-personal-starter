@@ -130,11 +130,16 @@ export async function executeRouterDecision(
     switch (decision.tool) {
       case 'salary_report': {
         await sendMessage(chatId, 'Calculando reporte de sueldos...');
+        const concept = args.concept && String(args.concept).trim() ? String(args.concept).trim() : null;
+        // No confiamos solo en que Gemini marque excludeConcept: "sin/excluyendo/
+        // sacando/descontando <concepto>" en el texto original alcanza, sin
+        // depender de que el modelo lo haya interpretado bien esta vez.
+        const excludeConcept = !!args.excludeConcept || (!!concept && /\b(sin|excluyendo|excluir|sacando|descontando)\b/i.test(originalText));
         const overrides = {
           startPeriod: args.startPeriod || undefined,
           endPeriod: args.endPeriod || undefined,
-          concept: args.concept && String(args.concept).trim() ? String(args.concept).trim() : null,
-          excludeConcept: !!args.excludeConcept
+          concept,
+          excludeConcept
         };
         const result = await summarizeSalaryFromText(originalText, overrides);
         await sendMessage(chatId, formatSalarySummary(result));
