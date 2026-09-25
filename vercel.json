@@ -23,6 +23,9 @@
     },
     "api/agentAction.ts": {
       "maxDuration": 20
+    },
+    "api/mcp.ts": {
+      "maxDuration": 30
     }
   },
   "crons": [
