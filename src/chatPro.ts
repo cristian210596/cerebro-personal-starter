@@ -111,9 +111,25 @@ function shortLabel(row: any) {
   return String(row.titulo || row.descripcion || row.nombre_archivo || row.afirmacion || row.comercio || row.persona || row.id || '-').slice(0, 80);
 }
 
+// Palabras que suelen colarse en una pregunta en lenguaje natural pero no
+// tienen nada que ver con lo que se busca de verdad (ej: "qué sabés sobre el
+// MAIL de..." — la palabra "mail" no aparece en el contenido real guardado).
+// Antes, exigir que TODAS las palabras de la pregunta aparezcan en el texto
+// guardado hacía que una sola de estas bastara para tirar "Sin resultados"
+// aunque las palabras que sí importaban (ej "control", "cambios") estuvieran.
+const SEARCH_STOPWORDS = new Set('que qué quien quién cual cuál sabes sabés sabe contame decime dime avisame che dale sobre acerca el la los las un una unos unas de del al en con por para y o u mail correo email tema cosa algo es fue son eso esto eso'.split(' '));
+
+function tokenizeSearchQuery(query: string): string[] {
+  const cleaned = norm(query).replace(/[^\p{L}\p{N}\s]/gu, ' ');
+  const all = cleaned.split(/\s+/).filter(Boolean);
+  const filtered = all.filter(t => !SEARCH_STOPWORDS.has(t));
+  // Si la pregunta era pura palabra de relleno (raro), mejor usar todo antes
+  // que buscar con una lista vacía (que matchearía cualquier fila).
+  return filtered.length ? filtered : all;
+}
+
 export async function unifiedSearch(query: string) {
-  const q = norm(query);
-  const tokens = q.split(/\s+/).filter(Boolean);
+  const tokens = tokenizeSearchQuery(query);
   const [items, archivos, pendientes, movimientos, deudas, presupuestos, memorias, sueldos, comprobantes, comprobanteItems] = await Promise.all([
     load('items', 80),
     load('archivos', 80, '*, items(titulo,categoria_principal,resumen,tags)'),
