@@ -61,5 +61,7 @@ export const config = {
   notionParentPageId: () => process.env.NOTION_PARENT_PAGE_ID?.trim() || '',
   notionItemsDatabaseId: () => process.env.NOTION_ITEMS_DATABASE_ID?.trim() || '',
   supabaseStorageBucket: () => process.env.SUPABASE_STORAGE_BUCKET?.trim() || 'cerebro-archivos',
-  dashboardSecret: () => process.env.DASHBOARD_SECRET?.trim() || ''
+  dashboardSecret: () => process.env.DASHBOARD_SECRET?.trim() || '',
+  notificationIngestSecret: () => process.env.NOTIFICATION_INGEST_SECRET?.trim() || '',
+  agentActionSecret: () => process.env.AGENT_ACTION_SECRET?.trim() || ''
 };

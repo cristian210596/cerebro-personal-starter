@@ -17,6 +17,12 @@
     },
     "api/finance-dashboard.ts": {
       "maxDuration": 15
+    },
+    "api/notificationIngest.ts": {
+      "maxDuration": 20
+    },
+    "api/agentAction.ts": {
+      "maxDuration": 20
     }
   },
   "crons": [
