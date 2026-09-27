@@ -80,16 +80,37 @@ export async function runAgentAction(action: string, params: any) {
       const cap = caption || '';
       const chatId = 0;
 
+      // Antes: "es PDF" mandaba SIEMPRE a resumen financiero, sin importar el
+      // contenido — un recibo de sueldo en PDF (formato normal para muchos
+      // recibos) nunca llegaba a probarse como sueldo. Ahora se prioriza por
+      // la pista del nombre/caption (looksLikeSalaryFile / looksLikeComprobanteFile),
+      // sea PDF o imagen, y si hay una pista fuerte NO se encadenan más
+      // intentos (cada llamada a Gemini puede tardar hasta 45s; encadenar 3-4
+      // en una sola ejecución supera el tiempo máximo de la función).
+      const salaryHint = looksLikeSalaryFile(filename, mt, cap);
+      const comprobanteHint = looksLikeComprobanteFile(filename, mt, cap);
+
+      if (salaryHint) {
+        const salary = await importSalaryReceiptFromFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId: String(chatId), archivoId: null, force: true });
+        return { kind: 'recibo_sueldo', recognized: salary.recognized, texto: salary.recognized ? formatSalaryImportResult(salary) : 'No pude leer este recibo de sueldo (el formato de la imagen/PDF no se reconoció).' };
+      }
+
+      if (comprobanteHint) {
+        const comp = await importComprobanteFromFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId, archivoId: null, force: true });
+        if (comp.recognized) await syncPendingImportedMovementsToNotion();
+        return { kind: 'comprobante', recognized: comp.recognized, texto: comp.recognized ? formatComprobanteImportResult(comp) : 'No pude leer este comprobante.' };
+      }
+
       if (isPdfOrSpreadsheet(filename, mt)) {
         const result = await importFinanceFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId });
         if (result.recognized) await syncPendingImportedMovementsToNotion();
         return { kind: 'resumen_financiero', recognized: result.recognized, texto: formatImportResult(result) || (result as any).reason };
       }
 
-      // Es imagen: probamos en el mismo orden que Telegram (comprobante ->
-      // sueldo -> captura de pago), nos quedamos con el primero que reconozca.
+      // Imagen sin ninguna pista clara: cascada liviana (comprobante -> sueldo
+      // -> captura de pago), como antes.
       try {
-        const comp = await importComprobanteFromFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId, archivoId: null, force: looksLikeComprobanteFile(filename, mt, cap) });
+        const comp = await importComprobanteFromFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId, archivoId: null, force: false });
         if (comp.recognized) {
           await syncPendingImportedMovementsToNotion();
           return { kind: 'comprobante', recognized: true, texto: formatComprobanteImportResult(comp) };
@@ -97,7 +118,7 @@ export async function runAgentAction(action: string, params: any) {
       } catch (e) { /* seguimos probando los otros tipos */ }
 
       try {
-        const salary = await importSalaryReceiptFromFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId: String(chatId), archivoId: null, force: looksLikeSalaryFile(filename, mt, cap) });
+        const salary = await importSalaryReceiptFromFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId: String(chatId), archivoId: null, force: false });
         if (salary.recognized) return { kind: 'recibo_sueldo', recognized: true, texto: formatSalaryImportResult(salary) };
       } catch (e) { /* seguimos probando */ }
 
