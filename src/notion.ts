@@ -4,6 +4,7 @@ import { Client } from '@notionhq/client';
 import { config } from './config.js';
 import { getAppConfigMap, setAppConfigValue, supabase } from './supabaseClient.js';
 import { createSignedFileUrl } from './storage.js';
+import { getUnsyncedImportedMovements } from './financeImport.js';
 
 type NotionDbConfig = {
   itemsDatabaseId?: string;
@@ -314,6 +315,19 @@ export async function syncNotionFinanceResult(result: any) {
   }
 
   return { movimientos, deudas, particiones };
+}
+
+export async function syncPendingImportedMovementsToNotion(): Promise<{ ok: boolean; synced: number; total: number; error?: string }> {
+  try {
+    const pending = await getUnsyncedImportedMovements();
+    if (!pending.length) return { ok: true, synced: 0, total: 0 };
+    if (!getNotionClient()) return { ok: false, synced: 0, total: pending.length, error: 'NOTION_TOKEN no configurado' };
+    const result = await syncNotionImportedMovements(pending);
+    return { ok: true, synced: result.movimientos, total: pending.length };
+  } catch (error: any) {
+    console.error('No se pudo sincronizar movimientos importados pendientes a Notion:', error);
+    return { ok: false, synced: 0, total: 0, error: error?.message || 'error desconocido' };
+  }
 }
 
 export async function syncNotionImportedMovements(movements: any[]) {

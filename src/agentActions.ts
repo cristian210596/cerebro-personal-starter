@@ -12,6 +12,7 @@ import { importComprobanteFromFile, formatComprobanteImportResult, looksLikeComp
 import { saveFinanceFromText, formatFinanceSaved } from './finance.js';
 import { classifyText } from './classifier.js';
 import { saveItem } from './supabaseClient.js';
+import { syncPendingImportedMovementsToNotion } from './notion.js';
 
 function isPdfOrSpreadsheet(filename: string, mimetype: string) {
   const f = (filename || '').toLowerCase();
@@ -39,7 +40,9 @@ export async function runAgentAction(action: string, params: any) {
       const { index, categoria, subcategoria, entidad, detalle, guardar_regla } = params;
       if (!index || !categoria) throw new Error('Faltan index y/o categoria.');
       const categoryText = subcategoria ? `${categoria} / ${subcategoria}` : String(categoria);
-      return await classifyGroupByIndex(Number(index), categoryText, !!guardar_regla, entidad || null, detalle || null);
+      const result = await classifyGroupByIndex(Number(index), categoryText, !!guardar_regla, entidad || null, detalle || null);
+      const notion = await syncPendingImportedMovementsToNotion();
+      return { ...result, notion };
     }
 
     case 'ignore_group': {
@@ -79,6 +82,7 @@ export async function runAgentAction(action: string, params: any) {
 
       if (isPdfOrSpreadsheet(filename, mt)) {
         const result = await importFinanceFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId });
+        if (result.recognized) await syncPendingImportedMovementsToNotion();
         return { kind: 'resumen_financiero', recognized: result.recognized, texto: formatImportResult(result) || (result as any).reason };
       }
 
@@ -86,7 +90,10 @@ export async function runAgentAction(action: string, params: any) {
       // sueldo -> captura de pago), nos quedamos con el primero que reconozca.
       try {
         const comp = await importComprobanteFromFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId, archivoId: null, force: looksLikeComprobanteFile(filename, mt, cap) });
-        if (comp.recognized) return { kind: 'comprobante', recognized: true, texto: formatComprobanteImportResult(comp) };
+        if (comp.recognized) {
+          await syncPendingImportedMovementsToNotion();
+          return { kind: 'comprobante', recognized: true, texto: formatComprobanteImportResult(comp) };
+        }
       } catch (e) { /* seguimos probando los otros tipos */ }
 
       try {
@@ -96,7 +103,10 @@ export async function runAgentAction(action: string, params: any) {
 
       const { importPaymentScreenshotFile } = await import('./financeImport.js');
       const payment = await importPaymentScreenshotFile({ buffer, fileName: filename, mimeType: mt, caption: cap, chatId });
-      if (payment.recognized) return { kind: 'captura_pago', recognized: true, texto: formatImportResult(payment) };
+      if (payment.recognized) {
+        await syncPendingImportedMovementsToNotion();
+        return { kind: 'captura_pago', recognized: true, texto: formatImportResult(payment) };
+      }
 
       return { kind: null, recognized: false, texto: 'No reconocí este documento como comprobante, recibo de sueldo, resumen financiero ni captura de pago.' };
     }

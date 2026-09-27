@@ -22,7 +22,7 @@ import {
   syncItemDerivedData,
   updateItemFields
 } from './supabaseClient.js';
-import { createNotionArchivoPage, createNotionItemPage, getNotionClient, syncNotionDerivedForItem, syncNotionFinanceResult, syncNotionImportedMovements, updateNotionItemPage } from './notion.js';
+import { createNotionArchivoPage, createNotionItemPage, getNotionClient, syncNotionDerivedForItem, syncNotionFinanceResult, syncNotionImportedMovements, syncPendingImportedMovementsToNotion, updateNotionItemPage } from './notion.js';
 import { config } from './config.js';
 import { getGeminiPoolStatus, testGeminiPoolOnce } from './geminiPool.js';
 import { getCerebrasPoolStatus, testCerebrasPoolOnce, getCerebrasConfiguredKeyCount } from './cerebrasPool.js';
@@ -1814,19 +1814,6 @@ async function executeBulkPendingActions(chatId: number, actions: BulkPendingAct
 // anterior (incluye datos de pruebas viejas hechas antes de este fix).
 // Devuelve el resultado (en vez de tragarse el error en silencio) para poder
 // mostrarlo en el mensaje del bot y diagnosticar sin depender de logs de Vercel.
-async function syncPendingImportedMovementsToNotion(): Promise<{ ok: boolean; synced: number; total: number; error?: string }> {
-  try {
-    const pending = await getUnsyncedImportedMovements();
-    if (!pending.length) return { ok: true, synced: 0, total: 0 };
-    if (!getNotionClient()) return { ok: false, synced: 0, total: pending.length, error: 'NOTION_TOKEN no configurado' };
-    const result = await syncNotionImportedMovements(pending);
-    return { ok: true, synced: result.movimientos, total: pending.length };
-  } catch (error: any) {
-    console.error('No se pudo sincronizar movimientos importados pendientes a Notion:', error);
-    return { ok: false, synced: 0, total: 0, error: error?.message || 'error desconocido' };
-  }
-}
-
 function formatNotionSyncLine(sync: { ok: boolean; synced: number; total: number; error?: string }) {
   if (!sync.ok) return `Notion: no pude sincronizar (${sync.error || 'error desconocido'}).`;
   if (!sync.total) return '';
