@@ -191,6 +191,141 @@ export async function importFinanceFile(input: {
   };
 }
 
+// Ingesta de notificaciones push de banco/billetera (ej: un atajo de iOS que
+// agarra la notificación de "Pagaste $X..." de Mercado Pago/Banco Galicia y
+// la manda acá). Mismo pipeline que una captura de pago (createImportation ->
+// normalizeImportedMovements -> insertImportedRows -> autoProcessImportedRowsWithRules),
+// solo que la fuente es un texto corto en vez de una imagen.
+export async function importBankNotificationText(input: { text: string; app?: string | null; chatId: number }) {
+  const text = String(input.text || '').trim();
+  const hash = sha256(Buffer.from(text));
+
+  const existing = await findExistingImport(hash);
+  if (existing) {
+    const processed = await processFinanceImportation(existing.id);
+    return {
+      recognized: true as const,
+      duplicate: true,
+      importacion: existing,
+      processed,
+      stats: await buildImportStats(existing.id),
+      nextPending: await getNextPendingImportedMovement(existing.id),
+      pendingList: await getPendingImportedMovements(8, existing.id)
+    };
+  }
+
+  const parsed = await extractBankNotificationWithGemini(text, input.app || null);
+  if (!parsed?.es_resumen_financiero || !Array.isArray(parsed.movimientos) || !parsed.movimientos.length) {
+    return { recognized: false as const, duplicate: false, reason: 'No parece una notificación de pago/transferencia.' };
+  }
+
+  const importacion = await createImportation(parsed, {
+    fileName: `notificacion-${(input.app || 'app').replace(/\s+/g, '_')}-${Date.now()}.txt`,
+    mimeType: 'text/plain',
+    hash,
+    chatId: input.chatId,
+    itemId: null,
+    archivoId: null
+  });
+
+  const rows = normalizeImportedMovements(parsed, importacion.id);
+  const inserted = await insertImportedRows(rows);
+  const processed = await autoProcessImportedRowsWithRules(inserted);
+  const stats = await buildImportStats(importacion.id);
+  const nextPending = await getNextPendingImportedMovement(importacion.id);
+  const pendingList = await getPendingImportedMovements(8, importacion.id);
+
+  await updateImportationState(importacion.id);
+
+  return {
+    recognized: true as const,
+    duplicate: false,
+    importacion,
+    processed,
+    stats,
+    nextPending,
+    pendingList
+  };
+}
+
+async function extractBankNotificationWithGemini(text: string, app: string | null): Promise<ParsedFinanceDocument | null> {
+  if (!process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEYS && !process.env.GEMINI_API_KEY_2) return null;
+
+  const prompt = [
+    'Analizá el texto de una notificación push del celular para un sistema personal de finanzas.',
+    'Puede ser una notificación de un banco (ej Banco Galicia) o billetera virtual (ej Mercado Pago) avisando un pago, transferencia o cobro.',
+    'Ejemplo real de formato de Banco Galicia: "Pagaste $35.610,77 A MONOTRIBUTO JURISDICCIONA con tu Visa Crédito: 1425 a las 18:56".',
+    'Si el texto NO es una notificación de movimiento de dinero (ej: recordatorios, promociones, "tu resumen ya está", noticias, otra app), devolvé es_resumen_financiero=false y movimientos=[].',
+    'No inventes datos: si un dato no está en el texto, usá null.',
+    'Devolvé SOLO JSON válido, sin markdown. Estructura exacta:',
+    '{',
+    '  "es_resumen_financiero": true|false,',
+    '  "tipo_fuente": "notificacion_push",',
+    '  "proveedor": string|null,',
+    '  "cuenta": null,',
+    '  "tarjeta": string|null,',
+    '  "periodo": null,',
+    '  "fecha_cierre": null,',
+    '  "fecha_vencimiento": null,',
+    '  "total_pesos": null,',
+    '  "total_dolares": null,',
+    '  "pago_minimo": null,',
+    '  "movimientos": [',
+    '    {',
+    '      "fecha": "YYYY-MM-DD"|null,',
+    '      "descripcion_original": string,',
+    '      "comercio": string|null,',
+    '      "comprobante": null,',
+    '      "monto": number,',
+    '      "moneda": "ARS"|"USD",',
+    '      "tipo": "gasto"|"transferencia"|"ingreso",',
+    '      "cuota_actual": null,',
+    '      "cuotas_totales": null,',
+    '      "categoria_sugerida": null,',
+    '      "subcategoria_sugerida": null,',
+    '      "confianza": number',
+    '    }',
+    '  ]',
+    '}',
+    'Reglas:',
+    '- "monto": siempre en positivo (el signo lo aplica el sistema después según "tipo").',
+    '- "tipo": "gasto" si pagaste/compraste, "ingreso" si recibiste dinero, "transferencia" si enviaste una transferencia (no pago con tarjeta/QR).',
+    '- "comercio": a quién le pagaste o quién te pagó, tal cual aparece en el texto, sin inventar ni generalizar.',
+    '- "tarjeta": si el texto menciona tarjeta y últimos dígitos (ej "Visa Crédito: 1425"), copialo tal cual.',
+    '- "fecha": null si el texto no trae fecha (solo hora); el sistema completa con la fecha de recepción.',
+    '- "proveedor": el banco/app que mandó la notificación (ej "Banco Galicia", "Mercado Pago"), si se identifica.',
+    '- "confianza": 0.2 a 0.4, salvo que el comercio sea una marca claramente reconocible (ej Uber, YPF, Netflix), ahí hasta 0.6. categoria_sugerida siempre null.',
+    app ? `App que mandó la notificación, según el celular: ${app}` : '',
+    'Texto de la notificación:',
+    text
+  ].filter(Boolean).join('\n');
+
+  try {
+    const response = await withGemini(ai => ai.models.generateContent({
+      model: config.geminiModel(),
+      contents: [{ role: 'user', parts: [{ text: prompt }] }]
+    }), { operationName: 'notificación de pago' });
+
+    const jsonText = extractJsonObject(response.text || '');
+    if (!jsonText) return null;
+    const parsed = JSON.parse(jsonText);
+    if (!parsed?.es_resumen_financiero) return null;
+    // El signo lo decide el sistema segun "tipo" (Gemini siempre manda el monto en positivo),
+    // para no depender de que interprete bien el signo cada vez.
+    if (Array.isArray(parsed.movimientos)) {
+      parsed.movimientos = parsed.movimientos.map((m: any) => ({
+        ...m,
+        fecha: m.fecha || new Date().toISOString().slice(0, 10),
+        monto: (m.tipo === 'gasto' || m.tipo === 'transferencia') ? -Math.abs(Number(m.monto || 0)) : Math.abs(Number(m.monto || 0))
+      }));
+    }
+    return normalizeParsedDocument(parsed);
+  } catch (error: any) {
+    console.error('No pude analizar notificación de pago con Gemini:', error?.message || error);
+    return null;
+  }
+}
+
 export async function importPaymentScreenshotFile(input: {
   buffer: Buffer;
   fileName?: string | null;
@@ -962,7 +1097,7 @@ ${textForPrompt}` }]
   }
 }
 
-function extractJsonObject(text: string) {
+export function extractJsonObject(text: string) {
   const raw = String(text || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
