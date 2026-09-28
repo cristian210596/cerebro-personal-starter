@@ -12,8 +12,8 @@ import { buildFinanceDashboardData } from './financeDashboardData.js';
 import { importComprobanteFromFile, formatComprobanteImportResult, looksLikeComprobanteFile } from './comprobantes.js';
 import { saveFinanceFromText, formatFinanceSaved } from './finance.js';
 import { classifyText } from './classifier.js';
-import { saveItem } from './supabaseClient.js';
-import { syncPendingImportedMovementsToNotion } from './notion.js';
+import { saveItem, supabase } from './supabaseClient.js';
+import { syncPendingImportedMovementsToNotion, createNotionItemPage, syncNotionDerivedForItem } from './notion.js';
 import { withGemini } from './geminiPool.js';
 import { config } from './config.js';
 
@@ -96,12 +96,26 @@ async function saveGenericFinancialDocumentAsNote(data: any, filename: string) {
   return item;
 }
 
+async function syncItemToNotion(item: any) {
+  try {
+    const notionPageId = await createNotionItemPage(item);
+    if (notionPageId) {
+      await supabase.from('items').update({ notion_page_id: notionPageId }).eq('id', item.id);
+      item.notion_page_id = notionPageId;
+    }
+    await syncNotionDerivedForItem(item);
+  } catch (error) {
+    console.error('No se pudo sincronizar a Notion el item del agente:', error);
+  }
+}
+
 async function tryGenericFallback(buffer: Buffer, mimeType: string, filename: string, caption: string) {
   const generic = await extractGenericFinancialDocument(buffer, mimeType, filename, caption).catch(() => null);
   if (!generic || !generic.es_financiero) {
     return { kind: null, recognized: false, texto: 'No reconocí contenido financiero en este documento.' };
   }
   const item = await saveGenericFinancialDocumentAsNote(generic, filename);
+  await syncItemToNotion(item);
   const partes = [
     generic.resumen_para_el_usuario || `Detecté: ${generic.tipo_documento || 'documento financiero'} de ${generic.entidad || 'entidad no identificada'}.`,
     generic.monto_a_pagar_ahora != null ? `Monto a pagar: ${generic.monto_a_pagar_ahora} ${generic.moneda || 'ARS'}.` : '',
@@ -253,6 +267,7 @@ export async function runAgentAction(action: string, params: any) {
         entidades_json: clasificacion.entidades,
         classifier_json: clasificacion
       } as any);
+      await syncItemToNotion(item);
       return { titulo: item.titulo, categoria: item.categoria_principal, id: item.id };
     }
 
