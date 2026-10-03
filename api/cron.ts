@@ -33,7 +33,17 @@ export default async function handler(req: any, res: any) {
       calibReminders = { ok: false, error: calibError?.message || 'error desconocido' };
     }
 
-    return res.status(200).json({ ...result, calibReminders });
+    // Catálogo de productos -> Notion (historial de precios). Acotado para no pasar el límite de Vercel.
+    let productos: any = null;
+    try {
+      const { syncProductosToNotion } = await import('../src/notion.js');
+      productos = await syncProductosToNotion(30);
+    } catch (prodError: any) {
+      console.error('Cron sync de productos falló:', prodError);
+      productos = { ok: false, error: prodError?.message || 'error desconocido' };
+    }
+
+    return res.status(200).json({ ...result, calibReminders, productos });
   } catch (error: any) {
     console.error('Cron mantenimiento falló:', error);
     return res.status(500).json({ ok: false, error: error?.message || 'error desconocido' });

@@ -1,3 +1,4 @@
+import { priceHistory, setComprobanteItemCodes } from './productCatalog.js';
 import {
   getGroupedPendingImportedMovements,
   classifyGroupByIndex,
@@ -13,7 +14,7 @@ import { importComprobanteFromFile, importComprobanteFromParsedData, formatCompr
 import { saveFinanceFromText, formatFinanceSaved } from './finance.js';
 import { classifyText } from './classifier.js';
 import { saveItem, supabase } from './supabaseClient.js';
-import { syncPendingImportedMovementsToNotion, createNotionItemPage, syncNotionDerivedForItem } from './notion.js';
+import { syncPendingImportedMovementsToNotion, createNotionItemPage, syncNotionDerivedForItem, syncProductosToNotion } from './notion.js';
 import { withGemini } from './geminiPool.js';
 import { config } from './config.js';
 import { downloadStorageRef } from './processingQueue.js';
@@ -344,9 +345,13 @@ export async function runAgentAction(action: string, params: any) {
     }
 
     case 'get_queue_file': {
-      const { queue_id } = params;
-      if (!queue_id) throw new Error('Falta queue_id.');
-      const { data: task, error } = await supabase.from('procesamiento_cola').select('*').eq('id', queue_id).single();
+      const { queue_id, nombre_archivo } = params;
+      if (!queue_id && !nombre_archivo) throw new Error('Falta queue_id o nombre_archivo.');
+      // Por nombre_archivo también trae tareas ya completadas (ej: otras fotos del mismo ticket).
+      const query = queue_id
+        ? supabase.from('procesamiento_cola').select('*').eq('id', queue_id).single()
+        : supabase.from('procesamiento_cola').select('*').eq('nombre_archivo', String(nombre_archivo)).order('created_at', { ascending: false }).limit(1).single();
+      const { data: task, error } = await query;
       if (error) throw error;
       if (!task.storage_ref) throw new Error('Esta tarea no tiene archivo asociado.');
       const buffer = await downloadStorageRef(task.storage_ref);
@@ -356,6 +361,23 @@ export async function runAgentAction(action: string, params: any) {
         mimeType: task.mime_type || 'image/jpeg',
         meta: { id: task.id, tipo: task.tipo, nombre_archivo: task.nombre_archivo, caption: task.caption, ultimo_error: task.ultimo_error }
       };
+    }
+
+    case 'price_history': {
+      // Historial de precios por producto (nombre, marca o código de barras).
+      return priceHistory(String(params.producto || ''), Number(params.limit || 60));
+    }
+
+    case 'set_item_codes': {
+      // Agrega/corrige códigos de barras de ítems de un comprobante ya cargado.
+      const { comprobante_id, codes } = params;
+      if (!comprobante_id || !Array.isArray(codes) || !codes.length) throw new Error('Faltan comprobante_id y codes.');
+      const r = await setComprobanteItemCodes(String(comprobante_id), codes.map((c: any) => ({ descripcion: String(c.descripcion || ''), codigo: String(c.codigo || '') })));
+      return { ok: true, ...r };
+    }
+
+    case 'sync_productos_notion': {
+      return { ok: true, ...(await syncProductosToNotion(Math.min(Number(params.limit || 15), 25))) };
     }
 
     case 'resolve_queue_item': {
@@ -459,7 +481,22 @@ export const AGENT_TOOLS = [
   {
     name: 'get_queue_file',
     description: 'Trae el archivo de un ítem atascado en la cola (de list_stuck_queue) para que lo analices vos mismo con tu propia visión, sin pasar por Gemini. Usar el "id" de list_stuck_queue como queue_id.',
-    inputSchema: { type: 'object', properties: { queue_id: { type: 'string' } }, required: ['queue_id'] }
+    inputSchema: { type: 'object', properties: { queue_id: { type: 'string' }, nombre_archivo: { type: 'string', description: 'Alternativa a queue_id: nombre del archivo (ej photo-3361.jpg), incluye tareas ya completadas' } } }
+  },
+  {
+    name: 'price_history',
+    description: 'Historial de precios de un producto comprado (de tickets cargados): precio unitario realmente pagado (con descuento) por fecha y comercio, último, mínimo, máximo y por comercio. Buscar por nombre, marca o código de barras (EAN). Usar para "cómo varió el precio de X", "dónde está más barato X", "cuánto pagué X la última vez".',
+    inputSchema: { type: 'object', properties: { producto: { type: 'string' }, limit: { type: 'number' } }, required: ['producto'] }
+  },
+  {
+    name: 'set_item_codes',
+    description: 'Agrega o corrige el código de barras (EAN) de productos de un comprobante ya cargado (ej: un ticket cargado sin códigos). codes: [{descripcion, codigo}] — descripcion tal cual está cargada. Revincula el catálogo de productos.',
+    inputSchema: { type: 'object', properties: { comprobante_id: { type: 'string' }, codes: { type: 'array', items: { type: 'object', properties: { descripcion: { type: 'string' }, codigo: { type: 'string' } }, required: ['descripcion', 'codigo'] } } }, required: ['comprobante_id', 'codes'] }
+  },
+  {
+    name: 'sync_productos_notion',
+    description: 'Sincroniza a Notion (base 🛒 Productos) los productos pendientes. Hasta 25 por llamada; devuelve cuántos quedan pendientes.',
+    inputSchema: { type: 'object', properties: { limit: { type: 'number' } } }
   },
   {
     name: 'resolve_queue_item',

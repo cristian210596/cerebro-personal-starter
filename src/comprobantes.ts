@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { linkComprobanteEntity } from './entityLinks.js';
+import { linkComprobanteItemsToProducts } from './productCatalog.js';
 import { createRequire } from 'node:module';
 import { config } from './config.js';
 import { withGemini } from './geminiPool.js';
@@ -437,6 +438,9 @@ async function persistComprobante(parsedInput: ParsedComprobante, context: Persi
   }
   // Vincular con la entidad (comercio) en Supabase; si el movimiento no tenía entidad, la hereda.
   await linkComprobanteEntity(comprobante);
+  // Catálogo de productos: cada ítem queda vinculado a su producto (por código de barras o nombre)
+  // con el precio unitario realmente pagado, para el historial de precios.
+  if (inserted) await linkComprobanteItemsToProducts(comprobante.id);
 
   return { recognized: true, duplicate: false, comprobante, movimiento: movimiento || null, itemsInserted: inserted, parsed };
 }

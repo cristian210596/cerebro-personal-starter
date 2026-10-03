@@ -1205,3 +1205,114 @@ async function resumenPageForImport(importacionId: string): Promise<string | nul
   resumenPageCache.set(importacionId, pageId);
   return pageId;
 }
+
+// ===================== Productos (historial de precios) =====================
+
+let productosDbId: string | null = null;
+async function ensureProductosDatabase(notion: Client): Promise<string> {
+  if (productosDbId) return productosDbId;
+  let id = '';
+  try { id = (await getAppConfigMap(['notion_productos_database_id'])).notion_productos_database_id || ''; } catch { id = ''; }
+  if (id && !(await notionDatabaseExists(notion, id))) id = '';
+  if (!id) {
+    const parentPageId = config.notionParentPageId();
+    if (!parentPageId) throw new Error('Falta NOTION_PARENT_PAGE_ID para crear la base de Productos.');
+    id = await createFinanceDatabase(notion, parentPageId, '🛒 Productos', {
+      'Nombre': { title: {} },
+      'EAN': { rich_text: {} },
+      'Marca': { select: { options: [] } },
+      'Categoría': { select: { options: [] } },
+      'Último precio': { number: { format: 'number' } },
+      'Precio mínimo': { number: { format: 'number' } },
+      'Precio máximo': { number: { format: 'number' } },
+      'Compras': { number: { format: 'number' } },
+      'Última compra': { date: {} },
+      'Último comercio': { rich_text: {} },
+      'Historial': { rich_text: {} },
+      'Producto ID': { rich_text: {} }
+    });
+    await setAppConfigValue('notion_productos_database_id', id);
+  }
+  productosDbId = id;
+  return id;
+}
+
+function money(n: unknown) {
+  const v = Number(n);
+  return Number.isFinite(v) ? `$${v.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '-';
+}
+
+// Crea/actualiza en Notion los productos marcados como pendientes (notion_sync_pending).
+// Se llama desde el cron diario, desde la tool sync_productos_notion y desde el backfill.
+export async function syncProductosToNotion(limit = 40): Promise<{ synced: number; pending: number }> {
+  const notion = getNotionClient();
+  if (!notion) return { synced: 0, pending: 0 };
+  const cfg = loadNotionDbConfig();
+  const dbId = await ensureProductosDatabase(notion);
+  const relOk = cfg.entidadesDatabaseId ? await ensureRelationProperty(notion, dbId, 'Entidades', cfg.entidadesDatabaseId, 'Productos') : false;
+
+  const { data: products, error } = await supabase.from('productos').select('*').eq('notion_sync_pending', true).limit(limit);
+  if (error) throw error;
+  const entities = await loadEntities();
+  let synced = 0;
+
+  for (const p of products || []) {
+    try {
+      const { data: rows } = await supabase
+        .from('finanzas_comprobante_items')
+        .select('precio_unitario_neto, importe, descuento, cantidad, finanzas_comprobantes!inner(fecha_emision, comercio, entidad_id)')
+        .eq('producto_id', p.id)
+        .limit(500);
+      const puntos = (rows || []).map((r: any) => ({
+        fecha: r.finanzas_comprobantes?.fecha_emision || null,
+        comercio: r.finanzas_comprobantes?.comercio || null,
+        entidad: r.finanzas_comprobantes?.entidad_id || null,
+        precio: r.precio_unitario_neto != null ? Number(r.precio_unitario_neto) : null
+      })).sort((a: any, b: any) => String(a.fecha).localeCompare(String(b.fecha)));
+      const precios = puntos.map((x: any) => x.precio).filter((x: any) => typeof x === 'number');
+      const ultimo = puntos[puntos.length - 1];
+      const historial = puntos.slice(-30).reverse().map((x: any) => `${x.fecha || '?'} · ${x.comercio || '?'} · ${money(x.precio)}`).join('\n').slice(0, 1900);
+
+      const base: any = {
+        'Nombre': { title: [{ text: { content: cleanNotionText(p.nombre, 180) || 'Producto' } }] },
+        'EAN': richTextProp(p.ean),
+        'Marca': selectProp(p.marca),
+        'Categoría': selectProp(p.categoria),
+        'Último precio': { number: precios.length ? precios[precios.length - 1] : null },
+        'Precio mínimo': { number: precios.length ? Math.min(...precios) : null },
+        'Precio máximo': { number: precios.length ? Math.max(...precios) : null },
+        'Compras': { number: puntos.length },
+        'Última compra': ultimo?.fecha ? { date: { start: ultimo.fecha } } : { date: null },
+        'Último comercio': richTextProp(ultimo?.comercio || null),
+        'Historial': richTextProp(historial),
+        'Producto ID': richTextProp(p.id)
+      };
+
+      const relations: Record<string, any> = {};
+      if (relOk && cfg.entidadesDatabaseId) {
+        const ents = [...new Set([...puntos.map((x: any) => x.entidad).filter(Boolean), p.marca_entidad_id].filter(Boolean))]
+          .map(id => entities.find(e => e.id === id) || null);
+        const ids = await entityPagesFor(notion, ents, cfg.entidadesDatabaseId);
+        if (ids.length) relations['Entidades'] = { relation: ids.slice(0, 100).map(id => ({ id })) };
+      }
+
+      const icon = { type: 'emoji', emoji: '🛒' } as any;
+      let pageId: string | null = p.notion_page_id || null;
+      if (pageId) {
+        try { await updatePageWithRelations(notion, pageId, icon, base, relations); }
+        catch (e) { if (!isArchivedOrMissing(e)) throw e; pageId = null; }
+      }
+      if (!pageId) {
+        const page = await createPageWithRelations(notion, dbId, icon, base, relations, [calloutBlock('🛒', 'Producto del catálogo de Cerebro. El historial se actualiza solo con cada ticket.')]);
+        pageId = page.id;
+      }
+      await supabase.from('productos').update({ notion_page_id: pageId, notion_sync_pending: false, updated_at: new Date().toISOString() }).eq('id', p.id);
+      synced += 1;
+      await new Promise(r => setTimeout(r, 300));
+    } catch (error) {
+      console.error(`No pude sincronizar el producto ${p.nombre} a Notion:`, (error as any)?.message || error);
+    }
+  }
+  const { count } = await supabase.from('productos').select('id', { count: 'exact', head: true }).eq('notion_sync_pending', true);
+  return { synced, pending: count || 0 };
+}

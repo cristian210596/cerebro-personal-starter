@@ -18,6 +18,7 @@
     "cleanup:entidades": "tsx src/scripts/cleanupEntidades.ts",
     "dedupe:entidades": "tsx src/scripts/dedupeEntidades.ts",
     "cleanup:movimientos-basura": "tsx src/scripts/cleanupMovimientosBasura.ts",
+    "productos:backfill": "tsx src/scripts/backfillProductos.ts",
     "set:webhook": "tsx src/scripts/setWebhook.ts"
   },
   "dependencies": {
