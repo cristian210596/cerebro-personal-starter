@@ -938,6 +938,12 @@ async function movementRelationProps(notion: Client, movimientosDbId: string, ro
         if (pageId) out['Entidad'] = { relation: [{ id: pageId }] };
       }
     }
+    if (row.importacion_id && cfg.archivosDatabaseId) {
+      const archivoPage = await resumenPageForImport(row.importacion_id);
+      if (archivoPage && await ensureRelationProperty(notion, movimientosDbId, 'Resumen', cfg.archivosDatabaseId, 'Movimientos del resumen')) {
+        out['Resumen'] = { relation: [{ id: archivoPage }] };
+      }
+    }
     if (row.item_id && cfg.itemsDatabaseId && await ensureRelationProperty(notion, movimientosDbId, 'Item origen', cfg.itemsDatabaseId, 'Movimientos')) {
       const { data } = await supabase.from('items').select('notion_page_id').eq('id', row.item_id).maybeSingle();
       if (data?.notion_page_id) out['Item origen'] = { relation: [{ id: data.notion_page_id }] };
@@ -1104,11 +1110,9 @@ async function archivoRelationProps(notion: Client, archivosDbId: string, archiv
       const { data: mov } = await supabase.from('finanzas_movimientos').select('notion_page_id').eq('id', movementId).maybeSingle();
       if (mov?.notion_page_id) movPages.push(mov.notion_page_id);
     }
-    if (importIds.length) {
-      // Notion acepta hasta 100 páginas por relación en una actualización.
-      const { data: movs } = await supabase.from('finanzas_movimientos').select('notion_page_id').in('importacion_id', importIds).not('notion_page_id', 'is', null).order('fecha_movimiento', { ascending: true }).limit(100);
-      for (const m of movs || []) if (m.notion_page_id && !movPages.includes(m.notion_page_id)) movPages.push(m.notion_page_id);
-    }
+    // Los movimientos de un resumen NO se cargan acá: Notion acepta como máximo 100 páginas por
+    // relación en cada actualización. Se vinculan desde cada movimiento (propiedad "Resumen"),
+    // y la columna espejo "Movimientos del resumen" del archivo los muestra a todos, sin tope.
     if (movPages.length) {
       const dbs = await ensureFinanceDatabases(notion);
       if (await ensureRelationProperty(notion, archivosDbId, 'Movimiento', dbs.finanzasMovimientosDatabaseId, 'Archivos')) {
@@ -1183,4 +1187,21 @@ export async function relinkCalendarioInNotion(): Promise<number> {
     cursor = res.has_more ? res.next_cursor : undefined;
   } while (cursor);
   return n;
+}
+
+
+// importacion_id -> página de Notion del archivo del resumen (cacheado por proceso).
+const resumenPageCache = new Map<string, string | null>();
+async function resumenPageForImport(importacionId: string): Promise<string | null> {
+  if (resumenPageCache.has(importacionId)) return resumenPageCache.get(importacionId) || null;
+  let pageId: string | null = null;
+  try {
+    const { data: imp } = await supabase.from('finanzas_importaciones').select('archivo_id').eq('id', importacionId).maybeSingle();
+    if (imp?.archivo_id) {
+      const { data: arch } = await supabase.from('archivos').select('notion_page_id').eq('id', imp.archivo_id).maybeSingle();
+      pageId = arch?.notion_page_id || null;
+    }
+  } catch { pageId = null; }
+  resumenPageCache.set(importacionId, pageId);
+  return pageId;
 }
