@@ -1,0 +1,19 @@
+{
+  "comprobante_id": "a88c9a01-9a64-4722-a8df-f232e5da1a69",
+  "codes": [
+    {"descripcion": "MANTECA SIN SALCONAPROLE PAQ 200 GRM", "codigo": "00000077306197"},
+    {"descripcion": "ROLLO D/COCINA CLASICO 3X 50PA20S SUSSEX PAQ 6,3", "codigo": "07790250056881"},
+    {"descripcion": "FRANELA MR.TR", "codigo": "07798024458183"},
+    {"descripcion": "LECHE ENT.LV UATCONAPROLE TTB 1 LTR", "codigo": "07730105821752"},
+    {"descripcion": "LECHE LV.ENTERA UAT CLASICA 3% LA SERENISIMA TTB", "codigo": "07790742363008"},
+    {"descripcion": "PAN ARTESANO", "codigo": "07793890260885"},
+    {"descripcion": "GALL.DULC MANTEC.FLOR.ROJASCREMICA LAT 144 GRM", "codigo": "08906078269306"},
+    {"descripcion": "GALL.DULC MANTEC.BUTT.COOK.CREMICA LAT 144 GRM", "codigo": "08906078269313"},
+    {"descripcion": "CEPILLO DENTAL GUMCLASSIC 311 BLI 1 UNI", "codigo": "00070942003117"},
+    {"descripcion": "MAYONESANATURA POU 500 CC", "codigo": "07791866001364"},
+    {"descripcion": "TALCO CORPORAL CLASICOHIPOALERG. ALGABO DOY 200", "codigo": "07791274198052"},
+    {"descripcion": "P.HIGIENICO DOBLE HOJAPLUS HIGIENOL PAQ X4 UNI 3", "codigo": "07790250015536"},
+    {"descripcion": "JABON TOCADOR DOVE EXFOLIANTE CJA 1 UNI 90 GRM", "codigo": "07898422746827"},
+    {"descripcion": "ANTITRANSPIRANTE NIVEASENSITIVE PROTECT ROL 50 M", "codigo": "04005808257621"}
+  ]
+}

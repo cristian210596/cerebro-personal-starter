@@ -128,30 +128,136 @@ function tokenizeSearchQuery(query: string): string[] {
   return filtered.length ? filtered : all;
 }
 
+// ---------------------------------------------------------------------------
+// Búsqueda unificada V01
+// Antes: traía las últimas 80 filas de cada tabla y filtraba en memoria, así
+// que todo lo que no estuviera entre lo más reciente (ej. mails importados en
+// lote) era invisible. Ahora el filtro va a Supabase (ilike sobre columnas de
+// texto, sin límite previo por fecha) y después se refina en memoria con todas
+// las palabras (sin tildes). También busca en `entidades` (personas, empresas,
+// equipos...) y trae los items vinculados a la entidad encontrada.
+// ---------------------------------------------------------------------------
+
+// Columnas de texto donde se aplica el ilike en el servidor. Solo text (no
+// arrays/numéricos) para que PostgREST no tire error.
+const SEARCH_TABLES: Record<string, { cols: string[]; select?: string; limit: number }> = {
+  items: { cols: ['titulo', 'resumen', 'texto_original', 'categoria_principal', 'tipo_item'], select: 'id,created_at,fecha_evento,fuente,titulo,resumen,texto_original,categoria_principal,subcategorias,tipo_item,estado,importancia,accion_futura,tags,url,notion_page_id', limit: 300 },
+  archivos: { cols: ['nombre_archivo', 'transcripcion', 'descripcion_ia'], select: '*, items(titulo,categoria_principal,resumen,tags)', limit: 100 },
+  pendientes: { cols: ['titulo', 'descripcion', 'categoria'], limit: 100 },
+  finanzas_movimientos: { cols: ['descripcion', 'comercio', 'categoria_financiera', 'subcategoria_financiera', 'medio_pago'], limit: 200 },
+  finanzas_deudas: { cols: ['persona', 'concepto'], limit: 100 },
+  finanzas_presupuestos: { cols: ['categoria_financiera', 'notas'], limit: 100 },
+  memorias: { cols: ['afirmacion', 'categoria'], limit: 100 },
+  sueldos_recibos: { cols: ['empresa', 'empleado', 'periodo'], limit: 100 },
+  finanzas_comprobantes: { cols: ['comercio', 'razon_social', 'numero_comprobante'], limit: 100 },
+  finanzas_comprobante_items: { cols: ['descripcion', 'descripcion_normalizada', 'marca', 'categoria'], limit: 200 }
+};
+
+// "producción" en la base vs "produccion" en la consulta: ilike no ignora
+// tildes, así que cada vocal se reemplaza por "_" (comodín de 1 carácter).
+// Los falsos positivos se descartan después con filterRows (que sí normaliza).
+function accentLoosePattern(token: string) {
+  return '%' + token.replace(/[%_\\]/g, '').replace(/[aeiou]/g, '_') + '%';
+}
+
+async function searchTable(table: string, tokens: string[]) {
+  const cfg = SEARCH_TABLES[table];
+  const select = cfg.select || '*';
+  // Token más largo = más selectivo para el prefiltro del servidor.
+  const key = [...tokens].sort((a, b) => b.length - a.length)[0];
+  if (!key || key.length < 2) return load(table, cfg.limit, select);
+  const pattern = accentLoosePattern(key);
+  const orExpr = cfg.cols.map(c => `${c}.ilike.${pattern}`).join(',');
+  const { data, error } = await supabase.from(table).select(select).or(orExpr).order('created_at', { ascending: false }).limit(cfg.limit);
+  if (error) {
+    // Si una columna no existe en esta tabla, no perder la tabla entera:
+    // volver al comportamiento viejo (últimas N filas + filtro en memoria).
+    console.warn(`[unifiedSearch] ${table}: ${error.message} — fallback a load()`);
+    return load(table, cfg.limit, select);
+  }
+  return data || [];
+}
+
+async function loadAllEntidades() {
+  const rows: any[] = [];
+  for (let from = 0; from < 10000; from += 1000) {
+    const { data, error } = await supabase.from('entidades').select('id,created_at,tipo,nombre,alias,descripcion,categoria_relacionada,notion_page_id').range(from, from + 999);
+    if (error) {
+      console.warn(`[unifiedSearch] entidades: ${error.message}`);
+      break;
+    }
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return rows;
+}
+
+// Fecha real del mail (línea "Fecha: ..." que arma gmailIntake), para ordenar
+// por fecha del correo y no por fecha de importación.
+function itemDate(row: any): string {
+  const m = String(row.texto_original || '').match(/^Fecha:\s*(\S+)/m);
+  return (m && m[1]) || row.fecha_evento || row.created_at || '';
+}
+
+function slimItem(row: any) {
+  const texto = String(row.texto_original || '');
+  return {
+    ...row,
+    fecha: itemDate(row),
+    texto_original: texto.length > 1500 ? texto.slice(0, 1500) + ' […recortado]' : texto
+  };
+}
+
 export async function unifiedSearch(query: string) {
   const tokens = tokenizeSearchQuery(query);
-  const [items, archivos, pendientes, movimientos, deudas, presupuestos, memorias, sueldos, comprobantes, comprobanteItems] = await Promise.all([
-    load('items', 80),
-    load('archivos', 80, '*, items(titulo,categoria_principal,resumen,tags)'),
-    load('pendientes', 80),
-    load('finanzas_movimientos', 120),
-    load('finanzas_deudas', 80),
-    load('finanzas_presupuestos', 80),
-    load('memorias', 80),
-    load('sueldos_recibos', 80),
-    load('finanzas_comprobantes', 80),
-    load('finanzas_comprobante_items', 120)
+  const [items, archivos, pendientes, movimientos, deudas, presupuestos, memorias, sueldos, comprobantes, comprobanteItems, entidadesAll] = await Promise.all([
+    searchTable('items', tokens),
+    searchTable('archivos', tokens),
+    searchTable('pendientes', tokens),
+    searchTable('finanzas_movimientos', tokens),
+    searchTable('finanzas_deudas', tokens),
+    searchTable('finanzas_presupuestos', tokens),
+    searchTable('memorias', tokens),
+    searchTable('sueldos_recibos', tokens),
+    searchTable('finanzas_comprobantes', tokens),
+    searchTable('finanzas_comprobante_items', tokens),
+    loadAllEntidades()
   ]);
+
+  const entidades = filterRows(entidadesAll, tokens, r => [r.nombre, r.tipo, r.descripcion, r.categoria_relacionada, ...(r.alias || [])]).slice(0, 10);
+
+  // Items vinculados a las entidades encontradas (ej. buscar "daverio" trae
+  // los mails donde la entidad Daniel Daverio quedó vinculada aunque el texto
+  // diga solo "Daniel").
+  let linkedItems: any[] = [];
+  if (entidades.length) {
+    const { data: links, error: linkErr } = await supabase.from('item_entidades').select('item_id').in('entidad_id', entidades.map(e => e.id)).limit(500);
+    if (linkErr) console.warn(`[unifiedSearch] item_entidades: ${linkErr.message}`);
+    const ids = [...new Set((links || []).map((l: any) => l.item_id))];
+    if (ids.length) {
+      const { data, error } = await supabase.from('items').select(SEARCH_TABLES.items.select!).in('id', ids.slice(0, 200));
+      if (error) console.warn(`[unifiedSearch] items vinculados: ${error.message}`);
+      linkedItems = data || [];
+    }
+  }
+
+  const textItems = filterRows(items, tokens, r => [r.titulo, r.resumen, r.texto_original, r.categoria_principal, r.tipo_item, r.estado, ...(r.tags || [])]);
+  const seen = new Set<string>();
+  const mergedItems = [...textItems, ...linkedItems]
+    .filter(r => (seen.has(r.id) ? false : (seen.add(r.id), true)))
+    .sort((a, b) => itemDate(b).localeCompare(itemDate(a)));
 
   return {
     query,
-    items: filterRows(items, tokens, r => [r.titulo, r.resumen, r.texto_original, r.categoria_principal, r.tipo_item, r.estado, ...(r.tags || [])]).slice(0, 5),
-    archivos: filterRows(archivos, tokens, r => [r.nombre_archivo, r.tipo_archivo, r.mime_type, r.transcripcion, r.descripcion_ia, r.items?.titulo, r.items?.resumen, ...(r.items?.tags || [])]).slice(0, 4),
-    pendientes: filterRows(pendientes, tokens, r => [r.titulo, r.descripcion, r.categoria, r.estado, r.prioridad, ...(r.tags || [])]).slice(0, 5),
-    movimientos: filterRows(movimientos, tokens, r => [r.descripcion, r.comercio, r.categoria_financiera, r.subcategoria_financiera, r.medio_pago, r.tarjeta, r.tipo, r.estado, r.fecha_movimiento]).slice(0, 5),
+    totales: { items: mergedItems.length, entidades: entidades.length },
+    entidades,
+    items: mergedItems.slice(0, 15).map(slimItem),
+    archivos: filterRows(archivos, tokens, r => [r.nombre_archivo, r.tipo_archivo, r.mime_type, r.transcripcion, r.descripcion_ia, r.items?.titulo, r.items?.resumen, ...(r.items?.tags || [])]).slice(0, 6),
+    pendientes: filterRows(pendientes, tokens, r => [r.titulo, r.descripcion, r.categoria, r.estado, r.prioridad, ...(r.tags || [])]).slice(0, 10),
+    movimientos: filterRows(movimientos, tokens, r => [r.descripcion, r.comercio, r.categoria_financiera, r.subcategoria_financiera, r.medio_pago, r.tarjeta, r.tipo, r.estado, r.fecha_movimiento]).slice(0, 10),
     deudas: filterRows(deudas, tokens, r => [r.persona, r.concepto, r.tipo, r.estado]).slice(0, 5),
     presupuestos: filterRows(presupuestos, tokens, r => [r.categoria_financiera, r.periodo, r.frecuencia, r.notas]).slice(0, 5),
-    memorias: filterRows(memorias, tokens, r => [r.afirmacion, r.categoria, r.confianza]).slice(0, 5),
+    memorias: filterRows(memorias, tokens, r => [r.afirmacion, r.categoria, r.confianza]).slice(0, 10),
     sueldos: filterRows(sueldos, tokens, r => [r.empresa, r.empleado, r.periodo, r.estado, r.fecha_pago]).slice(0, 5),
     comprobantes: filterRows(comprobantes, tokens, r => [r.comercio, r.razon_social, r.numero_comprobante, r.fecha_emision, r.medio_pago, r.tarjeta, r.estado]).slice(0, 5),
     comprobanteItems: filterRows(comprobanteItems, tokens, r => [r.descripcion, r.descripcion_normalizada, r.marca, r.categoria, r.subcategoria]).slice(0, 8)
@@ -174,7 +280,8 @@ function filterRows(rows: any[], tokens: string[], fields: (row: any) => any[]) 
 
 export function formatUnifiedSearch(result: Awaited<ReturnType<typeof unifiedSearch>>) {
   const lines = [`Búsqueda unificada: ${result.query}`, ''];
-  addSection(lines, 'Items', result.items, r => [`• ${r.titulo || '-'}`, `  ${r.categoria_principal || '-'} / ${r.tipo_item || '-'}`, r.resumen ? `  ${String(r.resumen).slice(0, 180)}` : ''].filter(Boolean));
+  addSection(lines, 'Entidades', result.entidades, r => [`• ${r.nombre || '-'} (${r.tipo || '-'})`, r.descripcion ? `  ${String(r.descripcion).slice(0, 180)}` : ''].filter(Boolean));
+  addSection(lines, 'Items', result.items, r => [`• ${r.fecha ? String(r.fecha).slice(0, 10) + ' — ' : ''}${r.titulo || '-'}`, `  ${r.categoria_principal || '-'} / ${r.tipo_item || '-'}`, r.resumen ? `  ${String(r.resumen).slice(0, 180)}` : ''].filter(Boolean));
   addSection(lines, 'Pendientes', result.pendientes, r => [`• ${r.titulo || '-'}`, `  ${r.estado || '-'} / ${r.prioridad || '-'}${r.fecha_vencimiento ? ` / vence ${r.fecha_vencimiento}` : ''}`]);
   addSection(lines, 'Finanzas', result.movimientos, r => [`• ${r.fecha_movimiento || '-'} — ${money(r.monto)} — ${r.comercio || r.descripcion || '-'}`, `  ${r.categoria_financiera || '-'} / ${r.medio_pago || '-'}`]);
   addSection(lines, 'Deudas', result.deudas, r => [`• ${r.persona || '-'} — ${money(r.saldo_pendiente)}`, `  ${r.concepto || '-'} / ${r.estado || '-'}`]);
