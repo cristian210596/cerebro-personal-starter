@@ -305,7 +305,7 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'search',
-    description: 'Busca en todo lo guardado (notas, pendientes de tareas, movimientos financieros, deudas, presupuestos, memorias, sueldos, comprobantes) por palabra clave. Mandar solo 2-4 palabras clave del tema, sin relleno.',
+    description: 'Busca en TODO lo que ya está guardado en el sistema: notas, pendientes de tareas, movimientos financieros, deudas, presupuestos, memorias, sueldos, comprobantes, Y TAMBIÉN mails/correos que ya fueron procesados (llegan etiquetados desde Gmail y se guardan acá como notas). Si preguntan algo sobre "mails" o "correos", usar esta tool — no asumir que hace falta un conector de Gmail aparte, los mails ya ingeridos viven en este mismo sistema. Mandar solo 2-4 palabras clave del tema, sin relleno; si la pregunta es muy genérica (ej "mis últimos mails" sin tema), probar igual con alguna palabra razonable antes de decir que no se puede.',
     inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }
   },
   {
