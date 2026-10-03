@@ -161,7 +161,7 @@ async function findOrCreateEntidad(entidad: EntidadClasificada, categoriaRelacio
   // "María de los Ángeles Mendoza"), sin importar el tipo. Evita duplicados en Notion.
   try {
     const { loadEntities, pickEntity } = await import('./entityLinks.js');
-    const fuzzy = pickEntity(normalized.nombre, await loadEntities());
+    const fuzzy = pickEntity(normalized.nombre, await loadEntities(), normalized.tipo);
     if (fuzzy) {
       const alias = mergeAlias(fuzzy.entity.alias || [], normalized.originalNombre, normalized.nombre);
       if (aliasChanged(fuzzy.entity.alias || [], alias)) {

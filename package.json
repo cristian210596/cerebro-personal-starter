@@ -15,6 +15,7 @@
     "test:classify": "tsx src/scripts/testClassifier.ts",
     "repair:conciliaciones": "tsx src/scripts/repairConciliaciones.ts",
     "link:entidades": "tsx src/scripts/linkEntidades.ts",
+    "cleanup:entidades": "tsx src/scripts/cleanupEntidades.ts",
     "set:webhook": "tsx src/scripts/setWebhook.ts"
   },
   "dependencies": {

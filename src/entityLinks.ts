@@ -27,7 +27,7 @@ const PREFIX = /^(transferencia\s+(enviada|recibida)|pago\s+con\s+qr|pago\s+qr|p
 const GENERIC_FULL = /^(rendimientos?|ingreso\s+de\s+dinero|pago\s+de\s+estado\s+de\s+cuenta|devoluci[oó]n\s+de\s+dinero\s+compra\s+protegida|compra\s+protegida)\b/i;
 // Lo que queda después de sacar el prefijo y sigue sin ser un nombre.
 const GENERIC_REST = /^(transferencia|devoluci[oó]n|compra\s+protegida|tarjeta|de\s+estado\s+de\s+cuenta)\b/i;
-const BUSINESS = /\b(kiosco|kiosko|tienda|ferreter[ií]a|shop|pet|pizza|pizzer[ií]a|carnes|carnicer[ií]a|srl|sa|sas|sh|almac[eé]n|super|supermercado|mercado|farmacia|panader[ií]a|verduler[ií]a|bar|resto|restaurante|caf[eé]|librer[ií]a|[oó]ptica|lavadero|estaci[oó]n|club|gym|gimnasio|fotos|lac|plaza|asamblea|distribuidora|comercial|store|market|hotel|taxi|remis|parrilla|helader[ií]a|cerveceri[aá]|bazar|cotill[oó]n)\b/i;
+const BUSINESS = /\b(kiosco|kiosko|tienda|ferreter[ií]a|shop|pet|pizza|pizzer[ií]a|carnes|carnicer[ií]a|srl|sa|sas|sh|almac[eé]n|super|supermercado|mercado|farmacia|panader[ií]a|verduler[ií]a|bar|resto|restaurante|caf[eé]|librer[ií]a|[oó]ptica|lavadero|estaci[oó]n|club|gym|gimnasio|fotos|lac|plaza|asamblea|distribuidora|comercial|store|market|hotel|taxi|remis|parrilla|helader[ií]a|cerveceri[aá]|bazar|cotill[oó]n|delivery|express|resto|grill|burger|sushi|empanadas|rotiser[ií]a|bebidas|vinoteca|indumentaria|deportes|motos|autos|tecnolog[ií]a|inform[aá]tica)\b/i;
 
 const DEFAULT_SELF = ['Cristian', 'Cristian Santillan', 'Cristian Gabriel Santillan', 'Santillan Cristian Gabriel', 'Garantia Calidad', 'Garantía de Calidad'];
 
@@ -55,6 +55,64 @@ export function isSelf(name: unknown) {
   return selfNames().some(s => tokensOf(s).sort().join(' ') === key);
 }
 
+// Comercios conocidos que llegan con mil variantes en los resúmenes de tarjeta.
+// Se evalúan sobre el texto ya limpio (sin "PAYU*AR*", códigos, etc.).
+export const CANONICAL_MERCHANTS: { name: string; tipo: string; re: RegExp }[] = [
+  { name: 'Uber', tipo: 'Empresa', re: /\buber\b/i },
+  { name: 'Rappi', tipo: 'Empresa', re: /\brappi\b/i },
+  { name: 'Cabify', tipo: 'Empresa', re: /\bcabify\b/i },
+  { name: 'DiDi', tipo: 'Empresa', re: /^didi\b/i },
+  { name: 'PedidosYa', tipo: 'Empresa', re: /\bpedidos\s*ya\b/i },
+  { name: 'SUBE', tipo: 'Empresa', re: /^sube\b/i },
+  { name: 'Emova (Subte)', tipo: 'Empresa', re: /\bemova\b/i },
+  { name: 'Apple', tipo: 'Empresa', re: /\bapple\s*\.?\s*com\b|^apple\b/i },
+  { name: 'Anthropic / Claude', tipo: 'Empresa', re: /\banthropic\b|\bclaude\s*\.?\s*ai\b/i },
+  { name: 'OpenAI / ChatGPT', tipo: 'Empresa', re: /\bopenai\b|\bchatgpt\b/i },
+  { name: 'Google One', tipo: 'Empresa', re: /\bgoogle\s*one\b|^google\s+google\s+o\b|^google\s+o$/i },
+  { name: 'YouTube Premium', tipo: 'Empresa', re: /\byoutube(p|premium)?\b/i },
+  { name: 'Mercado Libre', tipo: 'Empresa', re: /^mercado\s*libre\b/i },
+  { name: 'DIA', tipo: 'Comercio', re: /^(supermercados?\s+)?dia(\s+(supermercado|tienda))?$/i },
+  { name: 'Coto', tipo: 'Comercio', re: /^coto\b/i },
+  { name: 'Disco', tipo: 'Comercio', re: /^disco\b/i },
+  { name: 'Farmacity', tipo: 'Comercio', re: /^farmacity\b/i },
+  { name: 'Mackito', tipo: 'Comercio', re: /^mackito\b/i },
+  { name: 'La Candela Resto', tipo: 'Comercio', re: /^la\s*candela\s*resto\b/i },
+  { name: 'Médicos Sin Fronteras', tipo: 'Empresa', re: /^medicos\s+sin\s+fron/i },
+  { name: 'Movistar', tipo: 'Empresa', re: /\bmovistar\b/i },
+  { name: 'Personal (Telecom)', tipo: 'Empresa', re: /^personal$/i },
+  { name: 'Universidad Kennedy', tipo: 'Empresa', re: /\bkennedy\b/i },
+  { name: 'ARCA (ex AFIP)', tipo: 'Empresa', re: /^(afip|arca)$|\barca\b|^db\s*rg\b|^iva\s*rg\b/i },
+  { name: 'AGIP (IIBB CABA)', tipo: 'Empresa', re: /^iibb\b|\bagip\b/i },
+  { name: 'McDonald\'s (Arcos Dorados)', tipo: 'Comercio', re: /\barcos\s+dorados\b|\bmc\s*donald/i },
+  { name: 'Productos Farmacéuticos Dr. Gray', tipo: 'Empresa', re: /\bdr\.?\s*gray\b/i }
+];
+
+// Prefijos de procesadores de pago que no son el comercio real.
+const PROCESSOR_PREFIX = /^(payu\s*\*?\s*ar\s*\*?|merpago\s*\*|mercadopago\s*\*|dlo\s*\*|propina\s*\*|paypal\s*\*?|google\s*\*|sp\s*\*|k\s+(?=anthropic))\s*/i;
+// Textos que nunca son una contraparte (restos de parseo de PDF, leyendas, impuestos sueltos).
+const NOT_A_NAME = /(\d{1,2}\/\d{1,2}\/\d{2,4})|^(fecha|intervalo|se\s+utiliz|comercio\s+sin\s+identificar|saldo|total|subtotal|resumen|vencimiento|cierre|p[aá]gina)\b|^(puchos|cigarrillos|yerba|yerba\s+y\s+puchos|caf[eé]|comida|almuerzo|cena|desayuno|merienda|nafta|varios|gasto|compra|regalo|propina)$/i;
+
+export function cleanMerchantText(value: string): string {
+  let t = String(value || '').trim();
+  for (let i = 0; i < 3; i++) t = t.replace(PROCESSOR_PREFIX, '');
+  t = t.replace(/\*/g, ' ');
+  // Códigos de referencia al final: tokens alfanuméricos mezclados (in1TaL88B, MTZ4ML8H2, 26223ECGO32X) y "USD".
+  const words = t.split(/\s+/).filter(Boolean);
+  while (words.length > 1) {
+    const last = words[words.length - 1];
+    const mixed = /[a-z]/i.test(last) && /\d/.test(last) && last.length >= 5;
+    if (mixed || /^(usd|ars|ar)$/i.test(last)) words.pop(); else break;
+  }
+  return words.join(' ').replace(/\s+-\s+/g, ' - ').trim();
+}
+
+export function canonicalMerchant(value: string): { name: string; tipo: string } | null {
+  const t = cleanMerchantText(value);
+  const n = normalizeText(t);
+  for (const c of CANONICAL_MERCHANTS) if (c.re.test(t) || c.re.test(n)) return { name: c.name, tipo: c.tipo };
+  return null;
+}
+
 // Extrae la contraparte de un texto de movimiento ("Transferencia enviada X — detalle [importado: ...]").
 export function counterpartFromText(raw: unknown): string | null {
   let text = String(raw || '');
@@ -63,9 +121,15 @@ export function counterpartFromText(raw: unknown): string | null {
   text = text.replace(/\s+/g, ' ').trim();
   if (!text) return null;
   if (/cuit|www\.|mercadopago\.com/i.test(text)) return null;
-  const stripped = text.replace(PREFIX, '').trim();
-  if (GENERIC_FULL.test(text) || !stripped || GENERIC_REST.test(stripped)) return null;
-  if (tokensOf(stripped).length === 0) return null;
+  if (GENERIC_FULL.test(text) || NOT_A_NAME.test(text)) return null;
+  let stripped = text.replace(PREFIX, '').trim();
+  if (!stripped || GENERIC_REST.test(stripped)) return null;
+  stripped = stripped.replace(/^de\s+servicio\s+/i, '');
+  const canon = canonicalMerchant(stripped);
+  if (canon) return canon.name;
+  stripped = cleanMerchantText(stripped);
+  if (!stripped || NOT_A_NAME.test(stripped) || tokensOf(stripped).length === 0) return null;
+  if (!/[a-z]{2,}/i.test(stripped)) return null;
   return stripped;
 }
 
@@ -89,32 +153,47 @@ export function displayName(value: string) {
   return base.replace(/(^|[\s'(-])([a-záéíóúñü])/g, (_m, p, c) => p + c.toUpperCase());
 }
 
+function compactKey(v: unknown) { return tokensOf(v).join(''); }
+
+function tokenHit(t: string, pool: string[]) {
+  return pool.some(p => p === t || (t.length >= 4 && p.length >= 4 && (p.startsWith(t) || t.startsWith(p))));
+}
+
 // Devuelve puntaje >0 si el nombre candidato corresponde a la contraparte, 0 si no.
-export function nameMatchScore(counterpart: string, candidate: string): number {
+// loose=true (solo comercios/empresas, nunca personas): un único token alcanza si es el
+// primero del otro nombre ("Mackito" ~ "Mackito Srl Jamonjamonem", "Sube" ~ "Sube Viajes").
+export function nameMatchScore(counterpart: string, candidate: string, loose = false): number {
   const a = tokensOf(counterpart);
   const b = tokensOf(candidate);
   if (!a.length || !b.length) return 0;
   if (a.slice().sort().join(' ') === b.slice().sort().join(' ')) return 100;
+  if (compactKey(counterpart) === compactKey(candidate) && compactKey(counterpart).length >= 5) return 95; // "Lacandelaresto" = "La Candelaresto"
   const small = a.length <= b.length ? a : b;
   const large = a.length <= b.length ? b : a;
-  if (small.length < 2) return 0; // un solo token: solo igualdad exacta (arriba)
-  const contained = small.every(t => large.includes(t));
+  if (small.length < 2) {
+    if (loose && small[0].length >= 4 && large[0] === small[0]) return 40;
+    return 0;
+  }
+  const contained = small.every(t => tokenHit(t, large));
   if (!contained) return 0;
   return 50 + small.length * 10 - (large.length - small.length);
 }
 
-export function pickEntity(counterpart: string, entities: EntityRow[]): { entity: EntityRow; score: number } | null {
+const isPersona = (tipo: unknown) => normalizeText(tipo) === 'persona';
+
+export function pickEntity(counterpart: string, entities: EntityRow[], counterpartTipo?: string | null): { entity: EntityRow; score: number } | null {
   let best: { entity: EntityRow; score: number } | null = null;
   let tie = false;
   for (const e of entities) {
+    const loose = !isPersona(counterpartTipo) && !isPersona(e.tipo) && Boolean(counterpartTipo);
     const names = [e.nombre || '', ...(e.alias || [])].filter(Boolean);
-    let s = 0;
-    for (const n of names) s = Math.max(s, nameMatchScore(counterpart, n));
-    if (!s) continue;
-    if (!best || s > best.score) { best = { entity: e, score: s }; tie = false; }
-    else if (s === best.score && best.entity.id !== e.id) tie = true;
+    let sc = 0;
+    for (const n of names) sc = Math.max(sc, nameMatchScore(counterpart, n, loose));
+    if (!sc) continue;
+    if (!best || sc > best.score) { best = { entity: e, score: sc }; tie = false; }
+    else if (sc === best.score && best.entity.id !== e.id) tie = true;
   }
-  if (!best || (tie && best.score < 100)) return null;
+  if (!best || (tie && best.score < 95)) return null;
   return best;
 }
 
@@ -150,13 +229,14 @@ export async function resolveEntityByName(
   const name = String(rawName || '').trim();
   if (!name || isSelf(name)) return null;
   const entities = await loadEntities();
-  const hit = pickEntity(name, entities);
+  const guessed = opts.tipo || guessTipo(opts.rawText || name, name);
+  const hit = pickEntity(name, entities, guessed);
   if (hit) {
     await addAlias(hit.entity, name).catch(() => undefined);
     return { entity: hit.entity, created: false };
   }
   if (opts.create === false) return null;
-  const tipo = opts.tipo || guessTipo(opts.rawText || name, name);
+  const tipo = guessed;
   const nombre = displayName(name);
   const { data, error } = await supabase
     .from('entidades')
@@ -183,6 +263,8 @@ export async function counterpartForMovement(m: any): Promise<{ name: string; ti
   }
   const counterpart = counterpartFromText(raw);
   if (!counterpart) return null;
+  const canon = CANONICAL_MERCHANTS.find(c => c.name === counterpart);
+  if (canon) return { name: canon.name, tipo: canon.tipo, raw };
   try {
     const master = await resolveMasterEntity(counterpart);
     if (master?.entidad?.nombre && master.score >= 0.75) {

@@ -503,8 +503,14 @@ async function createOrUpdateNotionMovimiento(notion: Client, databaseId: string
   const relations = await movementRelationProps(notion, databaseId, row);
   const icon = { type: 'emoji', emoji: emojiForMovimiento(row.tipo) } as any;
   if (row.notion_page_id) {
-    await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
-    return row.notion_page_id;
+    try {
+      await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
+      return row.notion_page_id;
+    } catch (error) {
+      // Página archivada/borrada en Notion: se crea una nueva en vez de fallar para siempre.
+      if (!isArchivedOrMissing(error)) throw error;
+      console.warn(`La página ${row.notion_page_id} está archivada o no existe; se crea una nueva.`);
+    }
   }
   const page = await createPageWithRelations(notion, databaseId, icon, base, relations, financeMovimientoChildren(row));
   await supabase.from('finanzas_movimientos').update({ notion_page_id: page.id }).eq('id', row.id);
@@ -517,8 +523,14 @@ async function createOrUpdateNotionDeuda(notion: Client, databaseId: string, row
   const relations = await personaRelationProps(notion, databaseId, row, 'finanzas_deudas', 'Deudas');
   const icon = { type: 'emoji', emoji: row.tipo === 'yo_debo' ? '📤' : '📥' } as any;
   if (row.notion_page_id) {
-    await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
-    return row.notion_page_id;
+    try {
+      await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
+      return row.notion_page_id;
+    } catch (error) {
+      // Página archivada/borrada en Notion: se crea una nueva en vez de fallar para siempre.
+      if (!isArchivedOrMissing(error)) throw error;
+      console.warn(`La página ${row.notion_page_id} está archivada o no existe; se crea una nueva.`);
+    }
   }
   const page = await createPageWithRelations(notion, databaseId, icon, base, relations, financeDebtChildren(row));
   await supabase.from('finanzas_deudas').update({ notion_page_id: page.id }).eq('id', row.id);
@@ -531,8 +543,14 @@ async function createOrUpdateNotionParticion(notion: Client, databaseId: string,
   const relations = await personaRelationProps(notion, databaseId, row, null, 'Gastos compartidos');
   const icon = { type: 'emoji', emoji: '🍕' } as any;
   if (row.notion_page_id) {
-    await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
-    return row.notion_page_id;
+    try {
+      await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
+      return row.notion_page_id;
+    } catch (error) {
+      // Página archivada/borrada en Notion: se crea una nueva en vez de fallar para siempre.
+      if (!isArchivedOrMissing(error)) throw error;
+      console.warn(`La página ${row.notion_page_id} está archivada o no existe; se crea una nueva.`);
+    }
   }
   const page = await createPageWithRelations(notion, databaseId, icon, base, relations, [calloutBlock('🍕', `Parte de gasto compartido para ${row.persona || '-'}.`)]);
   await supabase.from('finanzas_particiones').update({ notion_page_id: page.id }).eq('id', row.id);
@@ -958,12 +976,26 @@ async function personaRelationProps(notion: Client, dbId: string, row: any, tabl
 
 // Si la relación falla (página de entidad borrada, permisos, etc.) no se pierde la
 // actualización principal: se reintenta sin relaciones.
+class PageGoneError extends Error {}
+function isArchivedOrMissing(error: any) { return error instanceof PageGoneError; }
+
+// Distingue "la página a actualizar está archivada/borrada" de "falló una relación".
+async function pageIsGone(notion: Client, pageId: string) {
+  try {
+    const page: any = await notion.pages.retrieve({ page_id: pageId });
+    return Boolean(page?.archived || page?.in_trash);
+  } catch (error: any) {
+    return error?.code === 'object_not_found' || error?.status === 404;
+  }
+}
+
 async function updatePageWithRelations(notion: Client, pageId: string, icon: any, base: any, relations: Record<string, any>) {
   try {
     await notion.pages.update({ page_id: pageId, icon, properties: { ...base, ...relations } as any });
   } catch (error) {
+    if (await pageIsGone(notion, pageId)) throw new PageGoneError(String((error as any)?.message || error));
     if (!Object.keys(relations).length) throw error;
-    console.warn('Falló la actualización con relaciones; reintento sin relaciones:', error);
+    console.warn('Falló la actualización con relaciones; reintento sin relaciones:', (error as any)?.message || error);
     await notion.pages.update({ page_id: pageId, icon, properties: base });
   }
 }

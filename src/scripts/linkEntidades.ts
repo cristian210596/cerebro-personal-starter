@@ -37,7 +37,7 @@ async function main() {
   for (const m of movimientos) {
     const cp = await counterpartForMovement(m);
     if (!cp || isSelf(cp.name)) { plan.sin += 1; continue; }
-    const hit = pickEntity(cp.name, entities);
+    const hit = pickEntity(cp.name, entities, cp.tipo || guessTipo(cp.raw, cp.name));
     if (hit) {
       plan.vincular += 1;
       if (!APPLY) console.log(`  ${m.fecha_movimiento} ${String(m.monto).padStart(10)} ${cp.name}  ->  ${hit.entity.nombre}`);
