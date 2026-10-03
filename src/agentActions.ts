@@ -16,6 +16,7 @@ import { saveItem, supabase } from './supabaseClient.js';
 import { syncPendingImportedMovementsToNotion, createNotionItemPage, syncNotionDerivedForItem } from './notion.js';
 import { withGemini } from './geminiPool.js';
 import { config } from './config.js';
+import { downloadStorageRef } from './processingQueue.js';
 
 function isPdfOrSpreadsheet(filename: string, mimetype: string) {
   const f = (filename || '').toLowerCase();
@@ -247,6 +248,51 @@ export async function runAgentAction(action: string, params: any) {
       return { ok: result.ok, texto: result.ok ? formatFinanceSaved(result) : `No lo reconocí como un gasto/finanza (${(result as any).reason || 'motivo desconocido'}).` };
     }
 
+    // Las 3 tools siguientes son para cuando Telegram/Gemini no pudo procesar
+    // algo y lo dejó reintentando ("Gemini sin cuota"). En vez de esperar a
+    // que se libere la cuota, Cristian le pide a Claude unas veces por día
+    // "procesá lo de Telegram" — Claude mira el archivo con su propia visión
+    // (sin pasar por Gemini, sin gastar API aparte) y carga el dato posta con
+    // las tools que ya existen (import_document / add_manual_expense).
+    case 'list_stuck_queue': {
+      const { data, error } = await supabase
+        .from('procesamiento_cola')
+        .select('id, tipo, nombre_archivo, caption, motivo, ultimo_error, intentos, created_at')
+        .in('estado', ['pendiente', 'reintentar'])
+        .order('created_at', { ascending: true })
+        .limit(30);
+      if (error) throw error;
+      return { items: data || [] };
+    }
+
+    case 'get_queue_file': {
+      const { queue_id } = params;
+      if (!queue_id) throw new Error('Falta queue_id.');
+      const { data: task, error } = await supabase.from('procesamiento_cola').select('*').eq('id', queue_id).single();
+      if (error) throw error;
+      if (!task.storage_ref) throw new Error('Esta tarea no tiene archivo asociado.');
+      const buffer = await downloadStorageRef(task.storage_ref);
+      return {
+        __image: true,
+        data: buffer.toString('base64'),
+        mimeType: task.mime_type || 'image/jpeg',
+        meta: { id: task.id, tipo: task.tipo, nombre_archivo: task.nombre_archivo, caption: task.caption, ultimo_error: task.ultimo_error }
+      };
+    }
+
+    case 'resolve_queue_item': {
+      const { queue_id, descartado } = params;
+      if (!queue_id) throw new Error('Falta queue_id.');
+      const { error } = await supabase.from('procesamiento_cola').update({
+        estado: 'completado',
+        resultado: { via: 'claude', descartado: !!descartado },
+        procesado_en: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }).eq('id', queue_id);
+      if (error) throw error;
+      return { ok: true };
+    }
+
     case 'save_note': {
       const { text } = params;
       if (!text) throw new Error('Falta text.');
@@ -326,6 +372,21 @@ export const AGENT_TOOLS = [
     name: 'finance_overview',
     description: 'Panorama financiero general: gastado/ingresos/saldo del mes actual, gasto por categoría (este mes e histórico últimos 12 meses), serie mensual de cashflow, y últimos movimientos.',
     inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'list_stuck_queue',
+    description: 'Lista los archivos que Telegram/Gemini NO pudo procesar y quedaron reintentando (típicamente por cuota de Gemini agotada). Usar cuando Cristian pida "procesá lo de Telegram" o similar. Devuelve {items:[{id, tipo, nombre_archivo, caption, ultimo_error, created_at}]}.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_queue_file',
+    description: 'Trae el archivo de un ítem atascado en la cola (de list_stuck_queue) para que lo analices vos mismo con tu propia visión, sin pasar por Gemini. Usar el "id" de list_stuck_queue como queue_id.',
+    inputSchema: { type: 'object', properties: { queue_id: { type: 'string' } }, required: ['queue_id'] }
+  },
+  {
+    name: 'resolve_queue_item',
+    description: 'Marca un ítem de la cola atascada como resuelto, para que deje de reintentar. Llamar DESPUÉS de haber cargado el dato real con import_document o add_manual_expense (o con descartado:true si no correspondía cargar nada).',
+    inputSchema: { type: 'object', properties: { queue_id: { type: 'string' }, descartado: { type: 'boolean' } }, required: ['queue_id'] }
   },
   {
     name: 'import_document',

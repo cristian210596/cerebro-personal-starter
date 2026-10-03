@@ -69,7 +69,18 @@ export default async function handler(req: any, res: any) {
       const toolArgs = params?.arguments || {};
       try {
         const actionResult = await runAgentAction(toolName, toolArgs);
-        result = { content: [{ type: 'text', text: JSON.stringify(actionResult) }] };
+        if (actionResult && actionResult.__image) {
+          // Imagen de verdad en el content, no texto con el base64 adentro —
+          // si no, Claude nunca la "ve", solo leería un string gigante.
+          result = {
+            content: [
+              { type: 'image', data: actionResult.data, mimeType: actionResult.mimeType },
+              { type: 'text', text: JSON.stringify(actionResult.meta || {}) }
+            ]
+          };
+        } else {
+          result = { content: [{ type: 'text', text: JSON.stringify(actionResult) }] };
+        }
       } catch (toolError: any) {
         result = { content: [{ type: 'text', text: `Error: ${toolError?.message || toolError}` }], isError: true };
       }

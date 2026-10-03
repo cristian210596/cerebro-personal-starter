@@ -189,7 +189,7 @@ async function processOneTask(task: any) {
   }
 }
 
-async function downloadStorageRef(storageRef: string) {
+export async function downloadStorageRef(storageRef: string) {
   const parsed = parseStorageRef(storageRef);
   if (!parsed) throw new Error('storage_ref inválido.');
   const { data, error } = await supabase.storage.from(parsed.bucket).download(parsed.path);
