@@ -23,7 +23,10 @@ export type EntityRow = {
 
 const STOPWORDS = new Set(['de', 'del', 'la', 'las', 'los', 'el', 'y', 'e', 'a', 'sa', 'srl', 'sas', 'sh', 'saci', 'cicsa', 'sacif', 'sociedad']);
 const PREFIX = /^(transferencia\s+(enviada|recibida)|pago\s+con\s+qr|pago\s+qr|pago\s+a|pago|devoluci[oó]n\s+de\s+dinero|cobro|d[eé]bito\s+autom[aá]tico)\s+/i;
-const GENERIC = /^(rendimientos?|ingreso\s+de\s+dinero|pago\s+de\s+estado\s+de\s+cuenta|transferencia|devoluci[oó]n|compra\s+protegida|tarjeta)\b/i;
+// Textos que no tienen contraparte (se evalúan sobre el texto completo, antes de sacar prefijos).
+const GENERIC_FULL = /^(rendimientos?|ingreso\s+de\s+dinero|pago\s+de\s+estado\s+de\s+cuenta|devoluci[oó]n\s+de\s+dinero\s+compra\s+protegida|compra\s+protegida)\b/i;
+// Lo que queda después de sacar el prefijo y sigue sin ser un nombre.
+const GENERIC_REST = /^(transferencia|devoluci[oó]n|compra\s+protegida|tarjeta|de\s+estado\s+de\s+cuenta)\b/i;
 const BUSINESS = /\b(kiosco|kiosko|tienda|ferreter[ií]a|shop|pet|pizza|pizzer[ií]a|carnes|carnicer[ií]a|srl|sa|sas|sh|almac[eé]n|super|supermercado|mercado|farmacia|panader[ií]a|verduler[ií]a|bar|resto|restaurante|caf[eé]|librer[ií]a|[oó]ptica|lavadero|estaci[oó]n|club|gym|gimnasio|fotos|lac|plaza|asamblea|distribuidora|comercial|store|market|hotel|taxi|remis|parrilla|helader[ií]a|cerveceri[aá]|bazar|cotill[oó]n)\b/i;
 
 const DEFAULT_SELF = ['Cristian', 'Cristian Santillan', 'Cristian Gabriel Santillan', 'Santillan Cristian Gabriel', 'Garantia Calidad', 'Garantía de Calidad'];
@@ -61,7 +64,7 @@ export function counterpartFromText(raw: unknown): string | null {
   if (!text) return null;
   if (/cuit|www\.|mercadopago\.com/i.test(text)) return null;
   const stripped = text.replace(PREFIX, '').trim();
-  if (!stripped || GENERIC.test(stripped) || GENERIC.test(text) && stripped === text) return null;
+  if (GENERIC_FULL.test(text) || !stripped || GENERIC_REST.test(stripped)) return null;
   if (tokensOf(stripped).length === 0) return null;
   return stripped;
 }
@@ -77,7 +80,10 @@ export function guessTipo(rawText: unknown, counterpart: string): 'Persona' | 'C
 }
 
 export function displayName(value: string) {
-  const v = value.replace(/\s+/g, ' ').trim();
+  let v = value.replace(/\s+/g, ' ').trim();
+  // "LEDEZMA, KEVIN" (formato banco Apellido, Nombre) -> "KEVIN LEDEZMA"
+  const parts = v.split(',').map(p => p.trim()).filter(Boolean);
+  if (parts.length === 2) v = `${parts[1]} ${parts[0]}`;
   const isAllCaps = v === v.toUpperCase();
   const base = isAllCaps ? v.toLowerCase() : v;
   return base.replace(/(^|[\s'(-])([a-záéíóúñü])/g, (_m, p, c) => p + c.toUpperCase());

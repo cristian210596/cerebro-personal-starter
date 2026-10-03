@@ -156,6 +156,24 @@ async function findOrCreateEntidad(entidad: EntidadClasificada, categoriaRelacio
     return existing;
   }
 
+  // Antes de crear una entidad nueva, buscar la misma con otro formato de nombre
+  // ("Daniel Daverio" vs "Daverio Daniel Emilio", "M. de los Ángeles Mendoza" vs
+  // "María de los Ángeles Mendoza"), sin importar el tipo. Evita duplicados en Notion.
+  try {
+    const { loadEntities, pickEntity } = await import('./entityLinks.js');
+    const fuzzy = pickEntity(normalized.nombre, await loadEntities());
+    if (fuzzy) {
+      const alias = mergeAlias(fuzzy.entity.alias || [], normalized.originalNombre, normalized.nombre);
+      if (aliasChanged(fuzzy.entity.alias || [], alias)) {
+        await supabase.from('entidades').update({ alias }).eq('id', fuzzy.entity.id);
+        fuzzy.entity.alias = alias;
+      }
+      return fuzzy.entity as EntidadRow;
+    }
+  } catch (fuzzyError) {
+    console.warn('No pude buscar entidad equivalente (sigo creando una nueva):', fuzzyError);
+  }
+
   const { data, error } = await supabase
     .from('entidades')
     .insert({

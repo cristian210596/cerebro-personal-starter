@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { getAppConfigMap, setAppConfigValue, supabase } from './supabaseClient.js';
 import { createSignedFileUrl } from './storage.js';
 import { getUnsyncedImportedMovements } from './financeImport.js';
+import { isSelf, loadEntities, resolveEntityByName, resolveEntityForMovement, saveEntityLink, saveEntityNotionPage, type EntityRow } from './entityLinks.js';
 
 type NotionDbConfig = {
   itemsDatabaseId?: string;
@@ -166,14 +167,7 @@ export async function syncNotionDerivedForItem(item: any) {
   let memorias = 0;
 
   if (dbConfig.entidadesDatabaseId && Array.isArray(item.entidades_json)) {
-    for (const entidad of item.entidades_json) {
-      if (!entidad?.tipo || !entidad?.nombre) continue;
-      await createOrUpdateNotionEntidad(notion, dbConfig.entidadesDatabaseId, {
-        ...entidad,
-        categoria_relacionada: item.categoria_principal
-      });
-      entidades += 1;
-    }
+    entidades = await linkItemEntitiesInNotion(notion, item, dbConfig);
   }
 
   const memoriasSugeridas = item.classifier_json?.memorias_sugeridas || [];
@@ -354,7 +348,18 @@ export async function setupFinanceNotionDatabases(options: { force?: boolean } =
   return ensureFinanceDatabases(notion, options);
 }
 
+// Cache por proceso: antes cada sync de UN movimiento verificaba las 3 bases con 3 llamadas a
+// Notion. En un lote (o en el backfill de vínculos) eso multiplicaba las llamadas sin sentido.
+let financeDbsCache: { at: number; dbs: { finanzasMovimientosDatabaseId: string; finanzasDeudasDatabaseId: string; finanzasParticionesDatabaseId: string } } | null = null;
+
 async function ensureFinanceDatabases(notion: Client, options: { force?: boolean } = {}) {
+  if (!options.force && financeDbsCache && Date.now() - financeDbsCache.at < 10 * 60_000) return financeDbsCache.dbs;
+  const dbs = await ensureFinanceDatabasesUncached(notion, options);
+  financeDbsCache = { at: Date.now(), dbs };
+  return dbs;
+}
+
+async function ensureFinanceDatabasesUncached(notion: Client, options: { force?: boolean } = {}) {
   const fileCfg = loadNotionDbConfig();
   let dbs: Required<Pick<NotionDbConfig, 'finanzasMovimientosDatabaseId' | 'finanzasDeudasDatabaseId' | 'finanzasParticionesDatabaseId'>> = {
     finanzasMovimientosDatabaseId: options.force ? '' : (fileCfg.finanzasMovimientosDatabaseId || ''),
@@ -494,51 +499,42 @@ function financeSplitProperties() {
 
 async function createOrUpdateNotionMovimiento(notion: Client, databaseId: string, row: any) {
   if (!databaseId || !row?.id) return null;
-  const properties = notionMovimientoProperties(row);
+  const base = notionMovimientoProperties(row);
+  const relations = await movementRelationProps(notion, databaseId, row);
+  const icon = { type: 'emoji', emoji: emojiForMovimiento(row.tipo) } as any;
   if (row.notion_page_id) {
-    await notion.pages.update({ page_id: row.notion_page_id, icon: { type: 'emoji', emoji: emojiForMovimiento(row.tipo) }, properties });
+    await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
     return row.notion_page_id;
   }
-  const page = await notion.pages.create({
-    parent: { database_id: databaseId },
-    icon: { type: 'emoji', emoji: emojiForMovimiento(row.tipo) },
-    properties,
-    children: financeMovimientoChildren(row) as any
-  });
+  const page = await createPageWithRelations(notion, databaseId, icon, base, relations, financeMovimientoChildren(row));
   await supabase.from('finanzas_movimientos').update({ notion_page_id: page.id }).eq('id', row.id);
   return page.id;
 }
 
 async function createOrUpdateNotionDeuda(notion: Client, databaseId: string, row: any) {
   if (!databaseId || !row?.id) return null;
-  const properties = notionDeudaProperties(row);
+  const base = notionDeudaProperties(row);
+  const relations = await personaRelationProps(notion, databaseId, row, 'finanzas_deudas', 'Deudas');
+  const icon = { type: 'emoji', emoji: row.tipo === 'yo_debo' ? '📤' : '📥' } as any;
   if (row.notion_page_id) {
-    await notion.pages.update({ page_id: row.notion_page_id, icon: { type: 'emoji', emoji: row.tipo === 'yo_debo' ? '📤' : '📥' }, properties });
+    await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
     return row.notion_page_id;
   }
-  const page = await notion.pages.create({
-    parent: { database_id: databaseId },
-    icon: { type: 'emoji', emoji: row.tipo === 'yo_debo' ? '📤' : '📥' },
-    properties,
-    children: financeDebtChildren(row) as any
-  });
+  const page = await createPageWithRelations(notion, databaseId, icon, base, relations, financeDebtChildren(row));
   await supabase.from('finanzas_deudas').update({ notion_page_id: page.id }).eq('id', row.id);
   return page.id;
 }
 
 async function createOrUpdateNotionParticion(notion: Client, databaseId: string, row: any) {
   if (!databaseId || !row?.id) return null;
-  const properties = notionParticionProperties(row);
+  const base = notionParticionProperties(row);
+  const relations = await personaRelationProps(notion, databaseId, row, null, 'Gastos compartidos');
+  const icon = { type: 'emoji', emoji: '🍕' } as any;
   if (row.notion_page_id) {
-    await notion.pages.update({ page_id: row.notion_page_id, icon: { type: 'emoji', emoji: '🍕' }, properties });
+    await updatePageWithRelations(notion, row.notion_page_id, icon, base, relations);
     return row.notion_page_id;
   }
-  const page = await notion.pages.create({
-    parent: { database_id: databaseId },
-    icon: { type: 'emoji', emoji: '🍕' },
-    properties,
-    children: [calloutBlock('🍕', `Parte de gasto compartido para ${row.persona || '-'}.`)] as any
-  });
+  const page = await createPageWithRelations(notion, databaseId, icon, base, relations, [calloutBlock('🍕', `Parte de gasto compartido para ${row.persona || '-'}.`)]);
   await supabase.from('finanzas_particiones').update({ notion_page_id: page.id }).eq('id', row.id);
   return page.id;
 }
@@ -834,4 +830,196 @@ function cleanNotionText(value: unknown, max = 1900) {
 
 function removeAccents(value: string) {
   return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+
+// ===================== Vínculos con entidades (relaciones de Notion) =====================
+//
+// Cada movimiento, deuda, gasto compartido e item queda vinculado con su página en la base
+// "Entidades" mediante una relación de Notion de doble vía. Así la página de una persona o
+// comercio (ej: "Daniel Daverio") muestra sola todos sus movimientos, deudas y mails.
+// Las propiedades de relación se crean solas la primera vez (no hace falta tocar Notion).
+
+const relationReady = new Map<string, boolean>();
+
+async function ensureRelationProperty(notion: Client, dbId: string, prop: string, targetDbId: string, syncedName: string): Promise<boolean> {
+  const key = `${dbId}:${prop}`;
+  if (relationReady.has(key)) return relationReady.get(key)!;
+  try {
+    const db: any = await notion.databases.retrieve({ database_id: dbId });
+    const existing = db.properties?.[prop];
+    if (existing) {
+      const ok = existing.type === 'relation';
+      if (!ok) console.warn(`La propiedad "${prop}" existe en Notion pero no es una relación; no se vincula.`);
+      relationReady.set(key, ok);
+      return ok;
+    }
+    await notion.databases.update({
+      database_id: dbId,
+      properties: { [prop]: { relation: { database_id: targetDbId, type: 'dual_property', dual_property: {} } } }
+    } as any);
+    // Renombrar la propiedad espejo que Notion crea en la base destino ("Related to ...").
+    try {
+      const after: any = await notion.databases.retrieve({ database_id: dbId });
+      const synced = after.properties?.[prop]?.relation?.dual_property?.synced_property_name;
+      if (synced && synced !== syncedName) {
+        await notion.databases.update({ database_id: targetDbId, properties: { [synced]: { name: syncedName } } } as any);
+      }
+    } catch (renameError) {
+      console.warn(`No pude renombrar la relación espejo a "${syncedName}" (no es grave):`, renameError);
+    }
+    relationReady.set(key, true);
+    return true;
+  } catch (error) {
+    console.error(`No pude crear la relación "${prop}" en Notion:`, error);
+    relationReady.set(key, false);
+    return false;
+  }
+}
+
+async function notionPageForEntity(notion: Client, entity: EntityRow, entidadesDbId: string): Promise<string | null> {
+  if (entity.notion_page_id) return entity.notion_page_id;
+  const nombre = cleanNotionText(entity.nombre, 180);
+  if (!nombre) return null;
+  let pageId = await findPageByTitle(notion, entidadesDbId, 'Nombre', nombre);
+  if (!pageId) {
+    const page = await notion.pages.create({
+      parent: { database_id: entidadesDbId },
+      icon: { type: 'emoji', emoji: emojiForEntity(entity.tipo) },
+      properties: {
+        'Nombre': { title: [{ text: { content: nombre } }] },
+        'Tipo': selectProp(entity.tipo),
+        'Alias': richTextProp((entity.alias || []).join(', ')),
+        'Categoría relacionada': selectProp(entity.categoria_relacionada)
+      } as any,
+      children: [calloutBlock('🧩', 'Entidad creada automáticamente por Cerebro al vincular movimientos/mails.')] as any
+    });
+    pageId = page.id;
+  }
+  entity.notion_page_id = pageId;
+  await saveEntityNotionPage(entity.id, pageId);
+  return pageId;
+}
+
+async function entityById(id: string | null | undefined) {
+  if (!id) return null;
+  const rows = await loadEntities();
+  return rows.find(r => r.id === id) || null;
+}
+
+async function movementRelationProps(notion: Client, movimientosDbId: string, row: any): Promise<Record<string, any>> {
+  const out: Record<string, any> = {};
+  try {
+    const cfg = loadNotionDbConfig();
+    if (cfg.entidadesDatabaseId && await ensureRelationProperty(notion, movimientosDbId, 'Entidad', cfg.entidadesDatabaseId, 'Movimientos')) {
+      // Si ya tiene entidad asignada en Supabase (fuente de verdad) se respeta; si no, se resuelve.
+      let entity = await entityById(row.entidad_id);
+      if (!entity) {
+        const res = await resolveEntityForMovement(row);
+        entity = res?.entity || null;
+        if (entity) await saveEntityLink('finanzas_movimientos', row.id, entity.id);
+      }
+      if (entity) {
+        const pageId = await notionPageForEntity(notion, entity, cfg.entidadesDatabaseId);
+        if (pageId) out['Entidad'] = { relation: [{ id: pageId }] };
+      }
+    }
+    if (row.item_id && cfg.itemsDatabaseId && await ensureRelationProperty(notion, movimientosDbId, 'Item origen', cfg.itemsDatabaseId, 'Movimientos')) {
+      const { data } = await supabase.from('items').select('notion_page_id').eq('id', row.item_id).maybeSingle();
+      if (data?.notion_page_id) out['Item origen'] = { relation: [{ id: data.notion_page_id }] };
+    }
+  } catch (error) {
+    console.error('No pude vincular el movimiento con su entidad/item:', error);
+  }
+  return out;
+}
+
+async function personaRelationProps(notion: Client, dbId: string, row: any, table: 'finanzas_deudas' | null, syncedName: string): Promise<Record<string, any>> {
+  const out: Record<string, any> = {};
+  try {
+    const cfg = loadNotionDbConfig();
+    if (!row?.persona || !cfg.entidadesDatabaseId) return out;
+    if (!(await ensureRelationProperty(notion, dbId, 'Entidad', cfg.entidadesDatabaseId, syncedName))) return out;
+    let entity = await entityById(row.entidad_id);
+    if (!entity) {
+      const res = await resolveEntityByName(row.persona, { tipo: 'Persona' });
+      entity = res?.entity || null;
+      if (entity && table) await saveEntityLink(table, row.id, entity.id);
+    }
+    if (entity) {
+      const pageId = await notionPageForEntity(notion, entity, cfg.entidadesDatabaseId);
+      if (pageId) out['Entidad'] = { relation: [{ id: pageId }] };
+    }
+  } catch (error) {
+    console.error('No pude vincular la persona con su entidad:', error);
+  }
+  return out;
+}
+
+// Si la relación falla (página de entidad borrada, permisos, etc.) no se pierde la
+// actualización principal: se reintenta sin relaciones.
+async function updatePageWithRelations(notion: Client, pageId: string, icon: any, base: any, relations: Record<string, any>) {
+  try {
+    await notion.pages.update({ page_id: pageId, icon, properties: { ...base, ...relations } as any });
+  } catch (error) {
+    if (!Object.keys(relations).length) throw error;
+    console.warn('Falló la actualización con relaciones; reintento sin relaciones:', error);
+    await notion.pages.update({ page_id: pageId, icon, properties: base });
+  }
+}
+
+async function createPageWithRelations(notion: Client, databaseId: string, icon: any, base: any, relations: Record<string, any>, children: any[]) {
+  try {
+    return await notion.pages.create({ parent: { database_id: databaseId }, icon, properties: { ...base, ...relations } as any, children: children as any });
+  } catch (error) {
+    if (!Object.keys(relations).length) throw error;
+    console.warn('Falló la creación con relaciones; reintento sin relaciones:', error);
+    return await notion.pages.create({ parent: { database_id: databaseId }, icon, properties: base, children: children as any });
+  }
+}
+
+export async function linkItemEntitiesInNotion(notion: Client, item: any, dbConfig: NotionDbConfig = loadNotionDbConfig()): Promise<number> {
+  if (!dbConfig.entidadesDatabaseId || !Array.isArray(item?.entidades_json)) return 0;
+  const pageIds: string[] = [];
+  for (const entidad of item.entidades_json) {
+    if (!entidad?.nombre || isSelf(entidad.nombre)) continue;
+    try {
+      const res = await resolveEntityByName(entidad.nombre, { tipo: entidad.tipo || null, categoria: item.categoria_principal || null });
+      if (!res) continue;
+      const pageId = await notionPageForEntity(notion, res.entity, dbConfig.entidadesDatabaseId);
+      if (pageId && !pageIds.includes(pageId)) pageIds.push(pageId);
+    } catch (error) {
+      console.error(`No pude vincular la entidad "${entidad.nombre}" del item:`, error);
+    }
+  }
+  if (item.notion_page_id && pageIds.length && dbConfig.itemsDatabaseId &&
+      await ensureRelationProperty(notion, dbConfig.itemsDatabaseId, 'Entidades vinculadas', dbConfig.entidadesDatabaseId, 'Items')) {
+    try {
+      await notion.pages.update({ page_id: item.notion_page_id, properties: { 'Entidades vinculadas': { relation: pageIds.map(id => ({ id })) } } as any });
+    } catch (error) {
+      console.error('No pude actualizar las entidades vinculadas del item en Notion:', error);
+    }
+  }
+  return pageIds.length;
+}
+
+export async function getFinanceNotionDatabaseIds() {
+  const notion = getNotionClient();
+  if (!notion) return null;
+  return ensureFinanceDatabases(notion);
+}
+
+export async function syncNotionDebtsAndSplits(deudas: any[], particiones: any[]) {
+  const notion = getNotionClient();
+  if (!notion) return { deudas: 0, particiones: 0 };
+  const dbs = await ensureFinanceDatabases(notion);
+  let d = 0;
+  let p = 0;
+  for (const row of deudas || []) {
+    try { if (await createOrUpdateNotionDeuda(notion, dbs.finanzasDeudasDatabaseId, row)) d += 1; } catch (error) { console.error('No se pudo sincronizar deuda:', error); }
+  }
+  for (const row of particiones || []) {
+    try { if (await createOrUpdateNotionParticion(notion, dbs.finanzasParticionesDatabaseId, row)) p += 1; } catch (error) { console.error('No se pudo sincronizar gasto compartido:', error); }
+  }
+  return { deudas: d, particiones: p };
 }
