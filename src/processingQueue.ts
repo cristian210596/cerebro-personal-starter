@@ -64,7 +64,22 @@ export async function listQueue(filter = '', limit = 20) {
   }).slice(0, limit);
 }
 
+// Devuelve a la cola las tareas que quedaron en "procesando" más de 10 minutos: la función que
+// las tomaba murió a mitad (timeout de Vercel) y antes quedaban colgadas para siempre.
+export async function requeueStaleProcessing() {
+  const staleBefore = new Date(Date.now() - 10 * 60_000).toISOString();
+  const { data, error } = await supabase
+    .from('procesamiento_cola')
+    .update({ estado: 'reintentar', reintentar_desde: new Date().toISOString(), ultimo_error: 'Quedó colgada en procesando (timeout); se reintenta.', updated_at: new Date().toISOString() })
+    .eq('estado', 'procesando')
+    .lt('updated_at', staleBefore)
+    .select('id');
+  if (error) throw error;
+  return (data || []).length;
+}
+
 export async function processQueue(limit = 5, force = false) {
+  try { await requeueStaleProcessing(); } catch (e) { console.error('No pude reencolar tareas colgadas:', e); }
   const now = new Date().toISOString();
   let q = supabase
     .from('procesamiento_cola')

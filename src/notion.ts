@@ -5,7 +5,7 @@ import { config } from './config.js';
 import { getAppConfigMap, setAppConfigValue, supabase } from './supabaseClient.js';
 import { createSignedFileUrl } from './storage.js';
 import { getUnsyncedImportedMovements } from './financeImport.js';
-import { isSelf, linkComprobanteEntity, linkSueldoEntity, loadEntities, resolveEntityByName, resolveEntityForMovement, saveEntityLink, saveEntityNotionPage, type EntityRow } from './entityLinks.js';
+import { isSelf, linkComprobanteEntity, linkSueldoEntity, loadEntities, resolveEntityByName, resolveIssuerEntity, resolveEntityForMovement, saveEntityLink, saveEntityNotionPage, type EntityRow } from './entityLinks.js';
 
 type NotionDbConfig = {
   itemsDatabaseId?: string;
@@ -1071,12 +1071,20 @@ async function archivoRelationProps(notion: Client, archivosDbId: string, archiv
     const cfg = loadNotionDbConfig();
     const entities: (EntityRow | null)[] = [];
     let movementId: string | null = null;
+    const importIds: string[] = [];
 
     if (archivo?.id) {
       const { data: comps } = await supabase.from('finanzas_comprobantes').select('*').eq('archivo_id', archivo.id).limit(5);
       for (const c of comps || []) { entities.push(await linkComprobanteEntity(c)); movementId ||= c.movimiento_financiero_id || null; }
       const { data: recibos } = await supabase.from('sueldos_recibos').select('*').eq('archivo_id', archivo.id).limit(5);
       for (const r of recibos || []) { entities.push(await linkSueldoEntity(r)); movementId ||= r.movimiento_financiero_id || null; }
+      // Resúmenes de tarjeta / cuenta: el emisor como entidad y los movimientos del resumen.
+      const { data: imps } = await supabase.from('finanzas_importaciones').select('id,proveedor,tarjeta').eq('archivo_id', archivo.id).limit(3);
+      for (const imp of imps || []) {
+        entities.push(await resolveIssuerEntity(imp.proveedor));
+        if (imp.tarjeta) entities.push(await resolveIssuerEntity(imp.tarjeta));
+        importIds.push(imp.id);
+      }
     }
     if (archivo?.item_id) {
       const { data: links } = await supabase.from('item_entidades').select('entidad_id').eq('item_id', archivo.item_id);
@@ -1091,11 +1099,20 @@ async function archivoRelationProps(notion: Client, archivosDbId: string, archiv
       const ids = await entityPagesFor(notion, entities, cfg.entidadesDatabaseId);
       if (ids.length) out['Entidades'] = { relation: ids.map(id => ({ id })) };
     }
+    const movPages: string[] = [];
     if (movementId) {
       const { data: mov } = await supabase.from('finanzas_movimientos').select('notion_page_id').eq('id', movementId).maybeSingle();
+      if (mov?.notion_page_id) movPages.push(mov.notion_page_id);
+    }
+    if (importIds.length) {
+      // Notion acepta hasta 100 páginas por relación en una actualización.
+      const { data: movs } = await supabase.from('finanzas_movimientos').select('notion_page_id').in('importacion_id', importIds).not('notion_page_id', 'is', null).order('fecha_movimiento', { ascending: true }).limit(100);
+      for (const m of movs || []) if (m.notion_page_id && !movPages.includes(m.notion_page_id)) movPages.push(m.notion_page_id);
+    }
+    if (movPages.length) {
       const dbs = await ensureFinanceDatabases(notion);
-      if (mov?.notion_page_id && await ensureRelationProperty(notion, archivosDbId, 'Movimiento', dbs.finanzasMovimientosDatabaseId, 'Archivos')) {
-        out['Movimiento'] = { relation: [{ id: mov.notion_page_id }] };
+      if (await ensureRelationProperty(notion, archivosDbId, 'Movimiento', dbs.finanzasMovimientosDatabaseId, 'Archivos')) {
+        out['Movimiento'] = { relation: movPages.slice(0, 100).map(id => ({ id })) };
       }
     }
   } catch (error) {

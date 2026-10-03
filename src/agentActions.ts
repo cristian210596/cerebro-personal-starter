@@ -331,12 +331,16 @@ export async function runAgentAction(action: string, params: any) {
     case 'list_stuck_queue': {
       const { data, error } = await supabase
         .from('procesamiento_cola')
-        .select('id, tipo, nombre_archivo, caption, motivo, ultimo_error, intentos, created_at')
-        .in('estado', ['pendiente', 'reintentar'])
+        .select('id, tipo, estado, nombre_archivo, caption, motivo, ultimo_error, intentos, created_at, updated_at')
+        .in('estado', ['pendiente', 'reintentar', 'procesando'])
         .order('created_at', { ascending: true })
-        .limit(30);
+        .limit(50);
       if (error) throw error;
-      return { items: data || [] };
+      // "procesando" solo cuenta como atascado si lleva >10 min sin cambios: la función que lo
+      // tomaba murió a mitad (timeout de Vercel) y nunca lo devolvió a la cola.
+      const staleBefore = Date.now() - 10 * 60_000;
+      const items = (data || []).filter((t: any) => t.estado !== 'procesando' || Date.parse(t.updated_at || t.created_at) < staleBefore);
+      return { items };
     }
 
     case 'get_queue_file': {

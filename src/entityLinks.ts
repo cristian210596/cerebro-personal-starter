@@ -85,7 +85,11 @@ export const CANONICAL_MERCHANTS: { name: string; tipo: string; re: RegExp }[] =
   { name: 'ARCA (ex AFIP)', tipo: 'Empresa', re: /^(afip|arca)$|\barca\b|^db\s*rg\b|^iva\s*rg\b/i },
   { name: 'AGIP (IIBB CABA)', tipo: 'Empresa', re: /^iibb\b|\bagip\b/i },
   { name: 'McDonald\'s (Arcos Dorados)', tipo: 'Comercio', re: /\barcos\s+dorados\b|\bmc\s*donald/i },
-  { name: 'Productos Farmacéuticos Dr. Gray', tipo: 'Empresa', re: /\bdr\.?\s*gray\b/i }
+  { name: 'Productos Farmacéuticos Dr. Gray', tipo: 'Empresa', re: /\bdr\.?\s*gray\b/i },
+  { name: 'Mercado Pago', tipo: 'Empresa', re: /^mercado\s*pago$/i },
+  { name: 'Banco Galicia', tipo: 'Empresa', re: /\bgalicia\b/i },
+  { name: 'Visa', tipo: 'Empresa', re: /^visa(\s+cr[eé]dito)?$/i },
+  { name: 'Mastercard', tipo: 'Empresa', re: /^master\s*card(\s+cr[eé]dito)?$/i }
 ];
 
 // Prefijos de procesadores de pago que no son el comercio real.
@@ -396,4 +400,13 @@ export function planEntityMerges(entities: EntityRow[], links: Map<string, numbe
     return { keeper, losers: members.filter(m => m.id !== keeper.id) };
   });
   return { merges, ambiguos };
+}
+
+
+// Entidad para el emisor de un resumen (banco/billetera/tarjeta): "Mercado Pago", "Visa", "Banco Galicia".
+export async function resolveIssuerEntity(name: string | null | undefined): Promise<EntityRow | null> {
+  const raw = String(name || '').trim();
+  if (!raw) return null;
+  const canon = canonicalMerchant(raw);
+  return (await resolveEntityByName(canon?.name || raw, { tipo: 'Empresa' }))?.entity || null;
 }
