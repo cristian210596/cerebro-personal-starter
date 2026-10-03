@@ -385,6 +385,7 @@ export async function runAgentAction(action: string, params: any) {
       if (!queue_id) throw new Error('Falta queue_id.');
       const { error } = await supabase.from('procesamiento_cola').update({
         estado: 'completado',
+        ultimo_error: null,
         resultado: { via: 'claude', descartado: !!descartado },
         procesado_en: new Date().toISOString(),
         updated_at: new Date().toISOString()

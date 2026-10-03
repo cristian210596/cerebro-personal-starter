@@ -59,7 +59,8 @@ export async function listQueue(filter = '', limit = 20) {
   const { data, error } = await query;
   if (error) throw error;
   return (data || []).filter((r: any) => {
-    if (!f) return true;
+    // Sin filtro: solo lo que de verdad está pendiente. Los completados se ven con "/cola completado".
+    if (!f) return r.estado !== 'completado';
     return norm(`${r.tipo} ${r.estado} ${r.motivo} ${r.nombre_archivo} ${r.caption}`).includes(f);
   }).slice(0, limit);
 }
@@ -214,15 +215,22 @@ export async function downloadStorageRef(storageRef: string) {
 }
 
 export function formatQueue(rows: any[]) {
-  if (!rows.length) return 'Cola de procesamiento\n\nSin pendientes.';
+  if (!rows.length) return 'Cola de procesamiento\n\nSin pendientes. (Para ver los ya resueltos: /cola completado)';
   const lines = ['Cola de procesamiento', ''];
   rows.forEach((r, i) => {
+    const done = r.estado === 'completado';
     lines.push(`${i + 1}. ${r.tipo} — ${r.estado}`);
     lines.push(`   Archivo: ${r.nombre_archivo || '-'}`);
-    lines.push(`   Motivo: ${r.motivo || '-'}`);
-    lines.push(`   Intentos: ${r.intentos || 0}`);
-    if (r.reintentar_desde) lines.push(`   Reintentar desde: ${r.reintentar_desde}`);
-    if (r.ultimo_error) lines.push(`   Error: ${String(r.ultimo_error).slice(0, 180)}`);
+    if (done) {
+      // En los resueltos no se muestra el error viejo ni el "reintentar desde": confundía.
+      const via = r.resultado?.via === 'claude' ? (r.resultado?.descartado ? 'descartado por Claude (ya estaba cargado)' : 'resuelto por Claude') : 'procesado';
+      lines.push(`   Resultado: ${via}${r.procesado_en ? ` el ${String(r.procesado_en).slice(0, 16).replace('T', ' ')}` : ''}`);
+    } else {
+      lines.push(`   Motivo: ${r.motivo || '-'}`);
+      lines.push(`   Intentos: ${r.intentos || 0}`);
+      if (r.reintentar_desde) lines.push(`   Reintentar desde: ${r.reintentar_desde}`);
+      if (r.ultimo_error) lines.push(`   Error: ${String(r.ultimo_error).slice(0, 180)}`);
+    }
     lines.push('');
   });
   return lines.join('\n');

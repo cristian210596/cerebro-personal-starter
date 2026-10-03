@@ -19,6 +19,7 @@
     "dedupe:entidades": "tsx src/scripts/dedupeEntidades.ts",
     "cleanup:movimientos-basura": "tsx src/scripts/cleanupMovimientosBasura.ts",
     "productos:backfill": "tsx src/scripts/backfillProductos.ts",
+    "productos:codes": "tsx src/scripts/productosCodes.ts",
     "set:webhook": "tsx src/scripts/setWebhook.ts"
   },
   "dependencies": {

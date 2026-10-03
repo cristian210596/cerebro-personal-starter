@@ -1233,6 +1233,17 @@ async function ensureProductosDatabase(notion: Client): Promise<string> {
     });
     await setAppConfigValue('notion_productos_database_id', id);
   }
+  // Propiedades agregadas después de crear la base (V2): se suman solas si faltan.
+  try {
+    const db: any = await notion.databases.retrieve({ database_id: id });
+    const extra: Record<string, any> = {};
+    if (!db.properties?.['Tipo']) extra['Tipo'] = { select: { options: [] } };
+    if (!db.properties?.['Contenido']) extra['Contenido'] = { rich_text: {} };
+    if (!db.properties?.['Precio por L/kg/u']) extra['Precio por L/kg/u'] = { number: { format: 'number' } };
+    if (Object.keys(extra).length) await notion.databases.update({ database_id: id, properties: extra } as any);
+  } catch (error) {
+    console.warn('No pude agregar propiedades nuevas a la base de Productos:', (error as any)?.message || error);
+  }
   productosDbId = id;
   return id;
 }
@@ -1285,7 +1296,11 @@ export async function syncProductosToNotion(limit = 40): Promise<{ synced: numbe
         'Última compra': ultimo?.fecha ? { date: { start: ultimo.fecha } } : { date: null },
         'Último comercio': richTextProp(ultimo?.comercio || null),
         'Historial': richTextProp(historial),
-        'Producto ID': richTextProp(p.id)
+        'Producto ID': richTextProp(p.id),
+        // Tipo genérico: agrupa marcas distintas del mismo producto (ej: todas las "Leche").
+        'Tipo': selectProp(p.tipo_producto),
+        'Contenido': richTextProp(p.contenido ? `${Number(p.contenido)} ${p.unidad || ''}`.trim() : null),
+        'Precio por L/kg/u': { number: precios.length && p.contenido ? Math.round((precios[precios.length - 1] / Number(p.contenido)) * 100) / 100 : null }
       };
 
       const relations: Record<string, any> = {};

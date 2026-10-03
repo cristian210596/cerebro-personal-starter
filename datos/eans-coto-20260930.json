@@ -1,0 +1,22 @@
+{
+  "comprobante_id": "a88c9a01-9a64-4722-a8df-f232e5da1a69",
+  "codes": [
+    {"descripcion": "LAVANDINA TRIPLE PODERPUREZA GLAC AYUDIN BIO 4 L", "codigo": "07793253003760"},
+    {"descripcion": "VINO BLANCO TORRONTESDCE TARDIO CAFAYATE BOT 750", "codigo": "07790093521805"},
+    {"descripcion": "FIDEOS RIGATONIPALLANTE PAQ 500 GRM", "codigo": "08008857112244"},
+    {"descripcion": "ACEITE GIRASOL NATURABOT 1,5 LTR", "codigo": "07790272001029"},
+    {"descripcion": "AGUA MINERAL SIN GASVILLA DEL SUR PET 2250 CMQ", "codigo": "07798062547559"},
+    {"descripcion": "YERBA MATE 4 FLEXTARAGUI PAQ 1 KGM", "codigo": "07790387013610"},
+    {"descripcion": "FIDEOS D/SEMOLA FUSILLIDIAMOND PAQ 500 GRM", "codigo": "05304000222673"},
+    {"descripcion": "GALLETITAS CRACKERS ORIGINALTRAVIATA PAQ 108 GRM", "codigo": "07790040144071"},
+    {"descripcion": "SENSODYNE", "codigo": "07896009499128"},
+    {"descripcion": "GUANTES MEDIANO PLISSE MAPA PAR 1 UNI", "codigo": "07794440994205"},
+    {"descripcion": "LIM.CR.CIF", "codigo": "07791290794221"},
+    {"descripcion": "CREMA LECHE PARA COCINARLA SERENISIMA POT 200 ML", "codigo": "07790742141606"},
+    {"descripcion": "TORTA CHOCOLATEAGUILA CJA 450 GRM", "codigo": "07790580122300"},
+    {"descripcion": "ANTITRAN.REXONA", "codigo": "07791293049595"},
+    {"descripcion": "PURE DE TOMATELA CAMPAGNOLA TTB 530 GRM", "codigo": "07790580138868"},
+    {"descripcion": "GUANTE GRANDE PLISSE MAPAPAR 1 UNI", "codigo": "07794440994212"},
+    {"descripcion": "DOVE", "codigo": "07891150095700"}
+  ]
+}

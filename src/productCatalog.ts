@@ -22,6 +22,9 @@ export type ProductRow = {
   categoria: string | null;
   subcategoria: string | null;
   notion_page_id: string | null;
+  tipo_producto?: string | null;
+  contenido?: number | null;
+  unidad?: string | null;
 };
 
 const STOP = new Set(['de', 'del', 'la', 'el', 'los', 'las', 'y', 'con', 'sin', 'para', 'x']);
@@ -115,8 +118,10 @@ export async function resolveProduct(item: any): Promise<ProductRow | null> {
     if (productKey(found.nombre) !== clave && ![...alias].some(a => productKey(a) === clave)) { alias.add(desc); patch.alias = [...alias].slice(0, 30); }
     if (!found.marca && item.marca) { patch.marca = item.marca; patch.marca_entidad_id = await brandEntityId(item.marca); }
     if (!found.categoria && item.categoria) { patch.categoria = item.categoria; patch.subcategoria = item.subcategoria || null; }
+    if (!found.tipo_producto) { const tipo = productTipo(desc); if (tipo) patch.tipo_producto = tipo; }
+    if (found.contenido == null) { const c = productContent(desc); if (c) { patch.contenido = c.contenido; patch.unidad = c.unidad; } }
     if (Object.keys(patch).length) {
-      const { data } = await supabase.from('productos').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', found.id).select().single();
+      const { data } = await supabase.from('productos').update({ ...patch, notion_sync_pending: true, updated_at: new Date().toISOString() }).eq('id', found.id).select().single();
       if (data) Object.assign(found, data);
     }
     return found;
@@ -129,7 +134,10 @@ export async function resolveProduct(item: any): Promise<ProductRow | null> {
     marca: item.marca || null,
     marca_entidad_id: await brandEntityId(item.marca),
     categoria: item.categoria || null,
-    subcategoria: item.subcategoria || null
+    subcategoria: item.subcategoria || null,
+    tipo_producto: productTipo(desc),
+    contenido: productContent(desc)?.contenido ?? null,
+    unidad: productContent(desc)?.unidad ?? null
   }).select().single();
   if (error) {
     const fresh = await loadProducts(true);
@@ -175,12 +183,12 @@ export async function priceHistory(query: string, limit = 60) {
     ? products.filter(p => p.ean === ean)
     : products.filter(p => {
         const k = productKey(q);
-        return [p.nombre, ...(p.alias || [])].some(n => productKey(n).includes(k)) || (p.marca && productKey(p.marca).includes(k));
+        return [p.nombre, ...(p.alias || [])].some(n => productKey(n).includes(k)) || (p.marca && productKey(p.marca).includes(k)) || (p.tipo_producto && productKey(p.tipo_producto).includes(k));
       });
   if (!matches.length) return { ok: true, productos: [], message: `No encontré productos para "${q}".` };
 
   const out = [] as any[];
-  for (const p of matches.slice(0, 10)) {
+  for (const p of matches.slice(0, 20)) {
     const { data, error } = await supabase
       .from('finanzas_comprobante_items')
       .select('cantidad, precio_unitario, descuento, precio_unitario_neto, importe, finanzas_comprobantes!inner(fecha_emision, comercio, sucursal)')
@@ -207,8 +215,12 @@ export async function priceHistory(query: string, limit = 60) {
       if (pt.precio != null) e.minimo = e.minimo == null ? pt.precio : Math.min(e.minimo, pt.precio);
       porComercio[k] = e;
     }
+    const ultimo = precios.length ? precios[precios.length - 1] : null;
     out.push({
       producto: p.nombre, ean: p.ean, marca: p.marca, categoria: p.categoria,
+      tipo_producto: p.tipo_producto || null,
+      contenido: p.contenido ?? null, unidad: p.unidad ?? null,
+      precio_por_unidad_base: ultimo != null && p.contenido ? Math.round((ultimo / Number(p.contenido)) * 100) / 100 : null,
       compras: puntos.length,
       ultimo_precio: precios.length ? precios[precios.length - 1] : null,
       precio_minimo: precios.length ? Math.min(...precios) : null,
@@ -236,4 +248,71 @@ export async function setComprobanteItemCodes(comprobanteId: string, codes: { de
   cache = null;
   const linked = await linkComprobanteItemsToProducts(comprobanteId);
   return { updated, linked, sinMatch };
+}
+
+
+// ---------- Tipo genérico y contenido ----------
+// El tipo agrupa marcas distintas del mismo producto ("LECHE ... CONAPROLE" y "LECHE ... SERENISIMA"
+// son "Leche"). Se evalúa en orden: lo más específico primero ("Crema de leche" antes que "Leche").
+const TIPOS: [RegExp, string][] = [
+  [/\bcrema\b.*\bleche\b|\bcrema de leche\b/, 'Crema de leche'],
+  [/\bdulce de leche\b/, 'Dulce de leche'],
+  [/\bleche\b/, 'Leche'],
+  [/\byogur|\byogh?urt/, 'Yogur'],
+  [/\bmanteca\b/, 'Manteca'],
+  [/\bqueso\b/, 'Queso'],
+  [/\byerba\b/, 'Yerba mate'],
+  [/\bfideos?\b|\bspaghetti|\bmostachol|\btallarin/, 'Fideos'],
+  [/\barroz\b/, 'Arroz'],
+  [/\baceite\b/, 'Aceite'],
+  [/\bagua\b/, 'Agua'],
+  [/\bgaseosa|\bcoca cola\b|\bsprite\b|\bpepsi\b/, 'Gaseosa'],
+  [/\bvino\b/, 'Vino'],
+  [/\bcerveza\b/, 'Cerveza'],
+  [/\bgalletitas?\b|\bgall\b|\bcrackers?\b/, 'Galletitas'],
+  [/\bpan\b/, 'Pan'],
+  [/\btorta\b|\bbizcochuelo\b/, 'Torta / bizcochuelo'],
+  [/\bmayonesa/, 'Mayonesa'],
+  [/\bpure de tomate|\bpure tomate|\bpure de tomatela\b|\btomate triturado/, 'Puré de tomate'],
+  [/\blavandina\b/, 'Lavandina'],
+  [/\bdetergente\b/, 'Detergente'],
+  [/\blim cr\b|\blimpiador\b|\bcif\b/, 'Limpiador'],
+  [/\bguantes?\b/, 'Guantes de limpieza'],
+  [/\bfranela\b|\bpano\b|\brejilla\b/, 'Paños / franelas'],
+  [/\brollo d?\s*cocina\b|\brollo de cocina\b/, 'Rollo de cocina'],
+  [/\bp higienico\b|\bpapel higienico\b/, 'Papel higiénico'],
+  [/\bsensodyne\b|\bcrema dental\b|\bpasta dental\b|\bcolgate\b/, 'Pasta dental'],
+  [/\bcepillo dental\b/, 'Cepillo dental'],
+  [/\bantitran|\bantitranspirante\b|\bdesodorante\b|\brexona\b/, 'Desodorante / antitranspirante'],
+  [/\bjabon\b/, 'Jabón'],
+  [/\bshampoo\b|\bacondicionador\b/, 'Shampoo / acondicionador'],
+  [/\btalco\b/, 'Talco'],
+  [/\bcafe\b/, 'Café'],
+  [/\bazucar\b/, 'Azúcar'],
+  [/\bharina\b/, 'Harina'],
+  [/\bhuevos?\b/, 'Huevos']
+];
+
+export function productTipo(desc: unknown): string | null {
+  const t = norm(desc);
+  for (const [re, tipo] of TIPOS) if (re.test(t)) return tipo;
+  return null;
+}
+
+// Contenido en unidad base: "1,5 LTR" -> 1.5 l; "500 GRM" -> 0.5 kg; "2250 CMQ" -> 2.25 l; "X4 UNI" -> 4 u.
+export function productContent(desc: unknown): { contenido: number; unidad: 'l' | 'kg' | 'u' } | null {
+  const t = String(desc || '').toUpperCase().replace(/(\d),(\d)/g, '$1.$2');
+  const m = t.match(/(\d+(?:\.\d+)?)\s*(LTR|LTS|LT|L|ML|CC|CMQ|KGM|KG|KGS|GRM|GR|G|GRS)\b/);
+  if (m) {
+    const n = Number(m[1]);
+    const u = m[2];
+    if (!Number.isFinite(n) || n <= 0) return null;
+    if (['LTR', 'LTS', 'LT', 'L'].includes(u)) return { contenido: n, unidad: 'l' };
+    if (['ML', 'CC', 'CMQ'].includes(u)) return { contenido: n / 1000, unidad: 'l' };
+    if (['KGM', 'KG', 'KGS'].includes(u)) return { contenido: n, unidad: 'kg' };
+    return { contenido: n / 1000, unidad: 'kg' };
+  }
+  const u = t.match(/\bX\s?(\d+)\s*(UNI|U)\b/);
+  if (u) return { contenido: Number(u[1]), unidad: 'u' };
+  return null;
 }
