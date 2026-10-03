@@ -13,6 +13,7 @@
     "resync:finance-categories": "tsx src/scripts/resyncFinanceCategories.ts",
     "setup:calendario-notion": "tsx src/scripts/setupCalendarioNotion.ts",
     "test:classify": "tsx src/scripts/testClassifier.ts",
+    "repair:conciliaciones": "tsx src/scripts/repairConciliaciones.ts",
     "set:webhook": "tsx src/scripts/setWebhook.ts"
   },
   "dependencies": {

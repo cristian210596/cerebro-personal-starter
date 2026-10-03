@@ -1447,6 +1447,13 @@ async function findManualMatch(row: any): Promise<null | { movement: any; score:
   let best: { movement: any; score: number; reason: string } | null = null;
   for (const movement of data || []) {
     if (movement.external_hash && movement.external_hash === row.external_hash) continue;
+    // Un movimiento que ya quedó vinculado a OTRA fila importada representa otra operación
+    // real: unirlo pisaba datos (ej: dos rendimientos de días seguidos fundidos en uno).
+    if (movement.movimiento_importado_id && movement.movimiento_importado_id !== row.id) continue;
+    // Si ambos traen ID de operación del banco/billetera y no coinciden, son operaciones distintas.
+    if (row.comprobante && movement.comprobante && String(row.comprobante) !== String(movement.comprobante)) continue;
+    // Signo opuesto (ingreso vs gasto) nunca es el mismo movimiento.
+    if (Number(row.monto || 0) * Number(movement.monto || 0) < 0) continue;
     const score = matchScore(row, movement);
     if (score.score >= 0.82 && (!best || score.score > best.score)) best = { movement, score: score.score, reason: score.reason };
   }
@@ -1457,7 +1464,9 @@ function matchScore(row: any, movement: any) {
   const amountA = Number(row.monto || 0);
   const amountB = Number(movement.monto || 0);
   const amountDiff = Math.abs(amountA - amountB);
-  const amountTol = Math.max(60, Math.abs(amountA) * 0.035);
+  // Antes: max(60, 3,5%) — demasiado laxo (187,62 vs 246,17 o 36.000 vs 37.000 contaban como
+  // "monto parecido"). Ahora la diferencia tolerada es chica: hasta 1 peso o 1%, lo que sea mayor.
+  const amountTol = Math.max(1, Math.abs(amountA) * 0.01);
   let score = 0;
   const reasons: string[] = [];
   if (amountDiff <= amountTol) { score += 0.55; reasons.push('monto parecido'); }
@@ -1484,8 +1493,12 @@ async function mergeImportedIntoMovement(row: any, match: { movement: any; score
     medio_pago: current.medio_pago || (row.tarjeta ? `${row.tarjeta} crédito` : row.proveedor || null),
     tarjeta: current.tarjeta || row.tarjeta || null,
     banco_billetera: current.banco_billetera || row.proveedor || null,
-    categoria_financiera: current.categoria_financiera || row.categoria_confirmada || row.categoria_sugerida || null,
-    subcategoria_financiera: current.subcategoria_financiera || row.subcategoria_confirmada || row.subcategoria_sugerida || null,
+    // La categoría que el usuario confirma al clasificar tiene prioridad sobre la que tenía el
+    // movimiento existente (antes se ignoraba y quedaba, por ejemplo, "Otros").
+    categoria_financiera: row.categoria_confirmada || current.categoria_financiera || row.categoria_sugerida || null,
+    subcategoria_financiera: row.categoria_confirmada
+      ? (row.subcategoria_confirmada || null)
+      : (current.subcategoria_financiera || row.subcategoria_sugerida || null),
     cuotas: current.cuotas || row.cuotas_totales || null,
     origen: current.origen || 'manual_conciliado',
     importacion_id: row.importacion_id,
@@ -1500,6 +1513,17 @@ async function mergeImportedIntoMovement(row: any, match: { movement: any; score
   };
   const { data, error } = await supabase.from('finanzas_movimientos').update(patch).eq('id', current.id).select().single();
   if (error) throw error;
+  // syncPendingImportedMovementsToNotion solo toma movimientos sin notion_page_id, así que
+  // un movimiento ya sincronizado que se modifica al conciliar quedaba viejo en Notion.
+  // Se actualiza su página acá mismo (una sola llamada liviana a Notion, sin Gemini).
+  if (data?.notion_page_id) {
+    try {
+      const { syncNotionImportedMovements } = await import('./notion.js');
+      await syncNotionImportedMovements([data]);
+    } catch (notionError) {
+      console.error('No pude actualizar en Notion el movimiento conciliado:', notionError);
+    }
+  }
   return data;
 }
 

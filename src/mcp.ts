@@ -68,7 +68,7 @@ export default async function handler(req: any, res: any) {
       const toolName = params?.name;
       const toolArgs = params?.arguments || {};
       try {
-        const actionResult = await runAgentAction(toolName, toolArgs);
+        const actionResult: any = await runAgentAction(toolName, toolArgs);
         if (actionResult && actionResult.__image) {
           // Imagen de verdad en el content, no texto con el base64 adentro —
           // si no, Claude nunca la "ve", solo leería un string gigante.
