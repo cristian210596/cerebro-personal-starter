@@ -1288,7 +1288,7 @@ function normalizeImportedMovements(parsed: ParsedFinanceDocument, importacionId
       return {
         importacion_id: importacionId,
         external_hash: externalHash,
-        fecha_movimiento: m.fecha,
+        fecha_movimiento: fixStatementYear(m.fecha, parsed.fecha_vencimiento || parsed.fecha_cierre || null),
         descripcion_original: m.descripcion_original,
         descripcion_normalizada: normalizeMerchantText(m.descripcion_original),
         comercio_detectado: rule?.comercio || m.comercio,
@@ -1312,9 +1312,30 @@ function normalizeImportedMovements(parsed: ParsedFinanceDocument, importacionId
 
 function shouldKeepImportedMovement(m: ImportedMovement) {
   if (!m || m.monto === null || !m.descripcion_original) return false;
+  if (Number(m.monto) === 0) return false;
   const d = norm(m.descripcion_original);
   if (/saldo anterior|total a pagar|pago minimo|pago mínimo|limite|l[ií]mite/.test(d)) return false;
+  // Restos del PDF que el parser tomaba como movimientos (encabezados, leyendas, una fecha suelta):
+  // "03/08/2026" $3, "Fecha Actual: 3/9/2026" $2, "Intervalo de Consulta: del / al /" $3,
+  // "Se utilizó Mercado Pago como medio de pago." $0.
+  const raw = String(m.descripcion_original).trim();
+  if (/^\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}$/.test(raw)) return false;
+  if (/^(fecha actual|intervalo de consulta|se utilizo mercado pago|pagina \d|hoja \d|detalle de movimientos|fecha descripcion)/.test(d)) return false;
   return true;
+}
+
+// Corrige años mal leídos del PDF (ej: 2027-08-26 en un resumen de 2026): si la fecha queda
+// más de 60 días después del cierre/vencimiento del resumen, se le resta un año.
+function fixStatementYear(fecha: string | null, ref: string | null): string | null {
+  if (!fecha || !ref) return fecha;
+  const f = Date.parse(fecha);
+  const r = Date.parse(ref);
+  if (Number.isNaN(f) || Number.isNaN(r)) return fecha;
+  if (f - r > 60 * 86400000) {
+    const prev = `${Number(fecha.slice(0, 4)) - 1}${fecha.slice(4)}`;
+    if (!Number.isNaN(Date.parse(prev)) && Math.abs(Date.parse(prev) - r) < 400 * 86400000) return prev;
+  }
+  return fecha;
 }
 
 async function insertImportedRows(rows: any[]) {

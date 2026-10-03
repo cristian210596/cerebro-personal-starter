@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { linkSueldoEntity } from './entityLinks.js';
 import { config } from './config.js';
 import { withGemini } from './geminiPool.js';
 import { supabase } from './supabaseClient.js';
@@ -247,6 +248,8 @@ export async function persistSalaryReceipt(parsedInput: ParsedSalaryReceipt, con
     await supabase.from('sueldos_recibos').update({ movimiento_financiero_id: movimiento.id, updated_at: new Date().toISOString() }).eq('id', recibo.id);
     recibo.movimiento_financiero_id = movimiento.id;
   }
+  // Vincular con la entidad empleadora (ej: Dr. Gray) en Supabase y en el movimiento de ingreso.
+  await linkSueldoEntity(recibo);
 
   return { recognized: true, duplicate: false, recibo, movimiento, conceptsInserted, parsed };
 }

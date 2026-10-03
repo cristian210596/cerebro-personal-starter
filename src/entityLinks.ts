@@ -19,6 +19,7 @@ export type EntityRow = {
   alias?: string[] | null;
   categoria_relacionada?: string | null;
   notion_page_id?: string | null;
+  created_at?: string | null;
 };
 
 const STOPWORDS = new Set(['de', 'del', 'la', 'las', 'los', 'el', 'y', 'e', 'a', 'sa', 'srl', 'sas', 'sh', 'saci', 'cicsa', 'sacif', 'sociedad']);
@@ -282,11 +283,12 @@ export async function resolveEntityForMovement(m: any, create = true) {
 }
 
 let warnedMissingColumn = false;
-export async function saveEntityLink(table: 'finanzas_movimientos' | 'finanzas_deudas', rowId: string, entityId: string) {
+export type LinkTable = 'finanzas_movimientos' | 'finanzas_deudas' | 'finanzas_comprobantes' | 'sueldos_recibos';
+export async function saveEntityLink(table: LinkTable, rowId: string, entityId: string) {
   const { error } = await supabase.from(table).update({ entidad_id: entityId }).eq('id', rowId);
   if (error && !warnedMissingColumn) {
     warnedMissingColumn = true;
-    console.warn(`No pude guardar entidad_id en ${table} (¿falta correr supabase/vinculos_entidades.sql?):`, error.message);
+    console.warn(`No pude guardar entidad_id en ${table} (¿falta correr supabase/vinculos_entidades.sql / vinculos_entidades_v2.sql?):`, error.message);
   }
 }
 
@@ -297,4 +299,101 @@ export async function saveEntityNotionPage(entityId: string, pageId: string) {
     warnedNotionColumn = true;
     console.warn('No pude guardar notion_page_id en entidades (¿falta correr supabase/vinculos_entidades.sql?):', error.message);
   }
+}
+
+
+// ---------- Comprobantes y recibos de sueldo ----------
+
+function merchantNameFor(raw: string) {
+  const canon = canonicalMerchant(raw);
+  if (canon) return { name: canon.name, tipo: canon.tipo };
+  const cleaned = cleanMerchantText(raw);
+  return cleaned && !NOT_A_NAME.test(cleaned) ? { name: cleaned, tipo: 'Comercio' } : null;
+}
+
+async function propagateToMovement(movementId: string | null | undefined, entityId: string) {
+  if (!movementId) return;
+  const { data } = await supabase.from('finanzas_movimientos').select('id,entidad_id').eq('id', movementId).maybeSingle();
+  if (data && !data.entidad_id) await saveEntityLink('finanzas_movimientos', data.id, entityId);
+}
+
+export async function linkComprobanteEntity(c: any): Promise<EntityRow | null> {
+  if (!c?.id) return null;
+  try {
+    if (c.entidad_id) return (await loadEntities()).find(e => e.id === c.entidad_id) || null;
+    const base = merchantNameFor(String(c.comercio || c.razon_social || ''));
+    if (!base) return null;
+    const res = await resolveEntityByName(base.name, { tipo: base.tipo, categoria: c.categoria_sugerida || c.categoria || null });
+    if (!res) return null;
+    if (c.razon_social && normalizeText(c.razon_social) !== normalizeText(res.entity.nombre)) await addAlias(res.entity, String(c.razon_social)).catch(() => undefined);
+    await saveEntityLink('finanzas_comprobantes', c.id, res.entity.id);
+    await propagateToMovement(c.movimiento_financiero_id, res.entity.id);
+    return res.entity;
+  } catch (error) {
+    console.error('No pude vincular el comprobante con su entidad:', error);
+    return null;
+  }
+}
+
+export async function linkSueldoEntity(r: any): Promise<EntityRow | null> {
+  if (!r?.id || !r.empresa) return null;
+  try {
+    if (r.entidad_id) return (await loadEntities()).find(e => e.id === r.entidad_id) || null;
+    const canon = canonicalMerchant(String(r.empresa));
+    const res = await resolveEntityByName(canon?.name || String(r.empresa), { tipo: 'Empresa', categoria: 'Ingreso laboral' });
+    if (!res) return null;
+    await saveEntityLink('sueldos_recibos', r.id, res.entity.id);
+    await propagateToMovement(r.movimiento_financiero_id, res.entity.id);
+    return res.entity;
+  } catch (error) {
+    console.error('No pude vincular el recibo de sueldo con su entidad:', error);
+    return null;
+  }
+}
+
+
+// ---------- Plan de unión de duplicados (puro, testeable) ----------
+const ORG_TIPOS = new Set(['empresa', 'comercio', 'marca', 'organizacion', 'institucion', 'laboratorio', 'proveedor', 'banco', 'entidad', 'organismo']);
+export function entityFamily(tipo: unknown) {
+  const t = normalizeText(tipo);
+  if (t === 'persona') return 'persona';
+  if (ORG_TIPOS.has(t)) return 'org';
+  return `tipo:${t}`;
+}
+
+export function planEntityMerges(entities: EntityRow[], links: Map<string, number>) {
+  const sorted = entities
+    .filter(e => tokensOf(e.nombre).length > 0)
+    .sort((a, b) => tokensOf(b.nombre).length - tokensOf(a.nombre).length || (links.get(b.id) || 0) - (links.get(a.id) || 0));
+  const index = new Map<string, EntityRow[]>();
+  const clusters = new Map<string, EntityRow[]>();
+  let ambiguos = 0;
+  for (const e of sorted) {
+    const fam = entityFamily(e.tipo);
+    const toks = tokensOf(e.nombre);
+    const seen = new Set<string>();
+    const matches: EntityRow[] = [];
+    for (const t of toks) {
+      for (const c of index.get(t) || []) {
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        if (entityFamily(c.tipo) !== fam) continue;
+        const names = [c.nombre || '', ...(c.alias || [])];
+        if (names.some(n => nameMatchScore(e.nombre || '', n, false) > 0)) matches.push(c);
+      }
+    }
+    if (matches.length === 1) clusters.get(matches[0].id)!.push(e);
+    else if (matches.length === 0) {
+      clusters.set(e.id, [e]);
+      for (const t of toks) { const arr = index.get(t) || []; arr.push(e); index.set(t, arr); }
+    } else ambiguos += 1;
+  }
+  const merges = [...clusters.values()].filter(c => c.length > 1).map(members => {
+    const keeper = [...members].sort((a, b) =>
+      (links.get(b.id) || 0) - (links.get(a.id) || 0) ||
+      String(a.created_at || '').localeCompare(String(b.created_at || ''))
+    )[0];
+    return { keeper, losers: members.filter(m => m.id !== keeper.id) };
+  });
+  return { merges, ambiguos };
 }

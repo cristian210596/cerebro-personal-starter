@@ -5,7 +5,7 @@ import { config } from './config.js';
 import { getAppConfigMap, setAppConfigValue, supabase } from './supabaseClient.js';
 import { createSignedFileUrl } from './storage.js';
 import { getUnsyncedImportedMovements } from './financeImport.js';
-import { isSelf, loadEntities, resolveEntityByName, resolveEntityForMovement, saveEntityLink, saveEntityNotionPage, type EntityRow } from './entityLinks.js';
+import { isSelf, linkComprobanteEntity, linkSueldoEntity, loadEntities, resolveEntityByName, resolveEntityForMovement, saveEntityLink, saveEntityNotionPage, type EntityRow } from './entityLinks.js';
 
 type NotionDbConfig = {
   itemsDatabaseId?: string;
@@ -89,20 +89,20 @@ export async function createNotionArchivoPage(archivo: any) {
     'Item ID Supabase': archivo.item_id ? { rich_text: [{ text: { content: String(archivo.item_id).slice(0, 1900) } }] } : { rich_text: [] }
   };
 
-  const page = await notion.pages.create({
-    parent: { database_id: databaseId },
-    icon: { type: 'emoji', emoji: emojiForArchivo(archivo.tipo_archivo) },
-    properties,
-    children: [
+  const relations = await archivoRelationProps(notion, databaseId, archivo);
+  const page = await createPageWithRelations(notion, databaseId, { type: 'emoji', emoji: emojiForArchivo(archivo.tipo_archivo) }, properties, relations, [
       calloutBlock('📎', `Archivo guardado en Supabase Storage. Referencia interna permanente: ${archivo.storage_url || '-'}`),
       signedUrl ? paragraphBlock(`Link temporal de descarga: ${signedUrl}`) : null,
       archivo.transcripcion ? headingBlock('Transcripción') : null,
       archivo.transcripcion ? paragraphBlock(String(archivo.transcripcion).slice(0, 1900)) : null,
       archivo.descripcion_ia ? headingBlock('Descripción IA') : null,
       archivo.descripcion_ia ? paragraphBlock(String(archivo.descripcion_ia).slice(0, 1900)) : null
-    ].filter(Boolean) as any
-  });
+    ].filter(Boolean) as any);
 
+  if (archivo.id) {
+    const { error } = await supabase.from('archivos').update({ notion_page_id: page.id }).eq('id', archivo.id);
+    if (error) console.warn('No pude guardar notion_page_id del archivo (¿falta vinculos_entidades_v2.sql?):', error.message);
+  }
   return page.id;
 }
 
@@ -125,12 +125,8 @@ export async function createNotionCalendarioPage(evento: { titulo: string; fecha
     'Origen': selectProp('manual')
   };
 
-  const page = await notion.pages.create({
-    parent: { database_id: databaseId },
-    icon: { type: 'emoji', emoji: emojiForCalendarCategory(evento.categoria) },
-    properties,
-    children: [calloutBlock('📅', `Texto original: ${textoOriginal}`)] as any
-  });
+  const relations = await calendarioRelationProps(notion, databaseId, evento.proveedor, evento.equipoCodigo);
+  const page = await createPageWithRelations(notion, databaseId, { type: 'emoji', emoji: emojiForCalendarCategory(evento.categoria) }, properties, relations, [calloutBlock('📅', `Texto original: ${textoOriginal}`)]);
 
   return page.id;
 }
@@ -1054,4 +1050,120 @@ export async function syncNotionDebtsAndSplits(deudas: any[], particiones: any[]
     try { if (await createOrUpdateNotionParticion(notion, dbs.finanzasParticionesDatabaseId, row)) p += 1; } catch (error) { console.error('No se pudo sincronizar gasto compartido:', error); }
   }
   return { deudas: d, particiones: p };
+}
+
+
+// ----- Archivos y calendario -----
+
+async function entityPagesFor(notion: Client, entities: (EntityRow | null | undefined)[], entidadesDbId: string) {
+  const ids: string[] = [];
+  for (const e of entities) {
+    if (!e || isSelf(e.nombre)) continue;
+    const pid = await notionPageForEntity(notion, e, entidadesDbId);
+    if (pid && !ids.includes(pid)) ids.push(pid);
+  }
+  return ids;
+}
+
+async function archivoRelationProps(notion: Client, archivosDbId: string, archivo: any): Promise<Record<string, any>> {
+  const out: Record<string, any> = {};
+  try {
+    const cfg = loadNotionDbConfig();
+    const entities: (EntityRow | null)[] = [];
+    let movementId: string | null = null;
+
+    if (archivo?.id) {
+      const { data: comps } = await supabase.from('finanzas_comprobantes').select('*').eq('archivo_id', archivo.id).limit(5);
+      for (const c of comps || []) { entities.push(await linkComprobanteEntity(c)); movementId ||= c.movimiento_financiero_id || null; }
+      const { data: recibos } = await supabase.from('sueldos_recibos').select('*').eq('archivo_id', archivo.id).limit(5);
+      for (const r of recibos || []) { entities.push(await linkSueldoEntity(r)); movementId ||= r.movimiento_financiero_id || null; }
+    }
+    if (archivo?.item_id) {
+      const { data: links } = await supabase.from('item_entidades').select('entidad_id').eq('item_id', archivo.item_id);
+      const all = await loadEntities();
+      for (const l of links || []) entities.push(all.find(e => e.id === l.entidad_id) || null);
+      if (cfg.itemsDatabaseId && await ensureRelationProperty(notion, archivosDbId, 'Item', cfg.itemsDatabaseId, 'Archivos')) {
+        const { data: item } = await supabase.from('items').select('notion_page_id').eq('id', archivo.item_id).maybeSingle();
+        if (item?.notion_page_id) out['Item'] = { relation: [{ id: item.notion_page_id }] };
+      }
+    }
+    if (cfg.entidadesDatabaseId && entities.some(Boolean) && await ensureRelationProperty(notion, archivosDbId, 'Entidades', cfg.entidadesDatabaseId, 'Archivos')) {
+      const ids = await entityPagesFor(notion, entities, cfg.entidadesDatabaseId);
+      if (ids.length) out['Entidades'] = { relation: ids.map(id => ({ id })) };
+    }
+    if (movementId) {
+      const { data: mov } = await supabase.from('finanzas_movimientos').select('notion_page_id').eq('id', movementId).maybeSingle();
+      const dbs = await ensureFinanceDatabases(notion);
+      if (mov?.notion_page_id && await ensureRelationProperty(notion, archivosDbId, 'Movimiento', dbs.finanzasMovimientosDatabaseId, 'Archivos')) {
+        out['Movimiento'] = { relation: [{ id: mov.notion_page_id }] };
+      }
+    }
+  } catch (error) {
+    console.error('No pude vincular el archivo con entidades/movimiento:', error);
+  }
+  return out;
+}
+
+async function calendarioRelationProps(notion: Client, calendarioDbId: string, proveedor: string | null | undefined, equipoCodigo: string | null | undefined): Promise<Record<string, any>> {
+  const out: Record<string, any> = {};
+  try {
+    const cfg = loadNotionDbConfig();
+    if (!cfg.entidadesDatabaseId || (!proveedor && !equipoCodigo)) return out;
+    if (!(await ensureRelationProperty(notion, calendarioDbId, 'Entidades', cfg.entidadesDatabaseId, 'Calendario'))) return out;
+    const entities: (EntityRow | null)[] = [];
+    if (proveedor) entities.push((await resolveEntityByName(proveedor, { tipo: 'Empresa' }))?.entity || null);
+    if (equipoCodigo) entities.push((await resolveEntityByName(equipoCodigo, { tipo: 'Equipo' }))?.entity || null);
+    const ids = await entityPagesFor(notion, entities, cfg.entidadesDatabaseId);
+    if (ids.length) out['Entidades'] = { relation: ids.map(id => ({ id })) };
+  } catch (error) {
+    console.error('No pude vincular el evento de calendario con entidades:', error);
+  }
+  return out;
+}
+
+// Backfill: vincula una página de Archivos ya existente (busca por notion_page_id o por título).
+export async function relinkArchivoInNotion(archivo: any): Promise<boolean> {
+  const notion = getNotionClient();
+  const cfg = loadNotionDbConfig();
+  if (!notion || !cfg.archivosDatabaseId) return false;
+  let pageId: string | null = archivo.notion_page_id || null;
+  if (!pageId && archivo.nombre_archivo) {
+    const res: any = await notion.databases.query({ database_id: cfg.archivosDatabaseId, filter: { property: 'Nombre', title: { equals: cleanNotionText(archivo.nombre_archivo, 180) } }, page_size: 2 });
+    if (res.results?.length === 1) pageId = res.results[0].id;
+  }
+  if (!pageId) return false;
+  const relations = await archivoRelationProps(notion, cfg.archivosDatabaseId, archivo);
+  if (!Object.keys(relations).length) return false;
+  try {
+    await notion.pages.update({ page_id: pageId, properties: relations as any });
+    if (!archivo.notion_page_id && archivo.id) await supabase.from('archivos').update({ notion_page_id: pageId }).eq('id', archivo.id);
+    return true;
+  } catch (error) {
+    console.error(`No pude vincular el archivo ${archivo.nombre_archivo}:`, (error as any)?.message || error);
+    return false;
+  }
+}
+
+// Backfill: vincula todas las páginas del calendario con sus entidades (proveedor y equipo).
+export async function relinkCalendarioInNotion(): Promise<number> {
+  const notion = getNotionClient();
+  const cfg = loadNotionDbConfig();
+  if (!notion || !cfg.calendarioDatabaseId) return 0;
+  let cursor: string | undefined;
+  let n = 0;
+  do {
+    const res: any = await notion.databases.query({ database_id: cfg.calendarioDatabaseId, start_cursor: cursor, page_size: 100 });
+    for (const page of res.results || []) {
+      const text = (p: any) => (p?.rich_text || []).map((t: any) => t.plain_text).join('').trim() || null;
+      const proveedor = text(page.properties?.['Proveedor']);
+      const equipo = text(page.properties?.['Equipo']);
+      const relations = await calendarioRelationProps(notion, cfg.calendarioDatabaseId, proveedor, equipo);
+      if (Object.keys(relations).length) {
+        try { await notion.pages.update({ page_id: page.id, properties: relations as any }); n += 1; } catch (error) { console.error('No pude vincular evento:', (error as any)?.message || error); }
+        await new Promise(r => setTimeout(r, 350));
+      }
+    }
+    cursor = res.has_more ? res.next_cursor : undefined;
+  } while (cursor);
+  return n;
 }

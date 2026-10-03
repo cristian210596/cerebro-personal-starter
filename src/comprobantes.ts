@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { linkComprobanteEntity } from './entityLinks.js';
 import { createRequire } from 'node:module';
 import { config } from './config.js';
 import { withGemini } from './geminiPool.js';
@@ -434,6 +435,8 @@ async function persistComprobante(parsedInput: ParsedComprobante, context: Persi
     await supabase.from('finanzas_comprobantes').update({ movimiento_financiero_id: movimiento.id, estado: movimiento.__linked ? 'conciliado' : 'confirmado', updated_at: new Date().toISOString() }).eq('id', comprobante.id);
     comprobante.movimiento_financiero_id = movimiento.id;
   }
+  // Vincular con la entidad (comercio) en Supabase; si el movimiento no tenía entidad, la hereda.
+  await linkComprobanteEntity(comprobante);
 
   return { recognized: true, duplicate: false, comprobante, movimiento: movimiento || null, itemsInserted: inserted, parsed };
 }

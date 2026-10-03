@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { supabase } from '../supabaseClient.js';
-import { getNotionClient, linkItemEntitiesInNotion, syncNotionDebtsAndSplits, syncNotionImportedMovements } from '../notion.js';
-import { counterpartForMovement, isSelf, loadEntities, pickEntity, guessTipo, displayName } from '../entityLinks.js';
+import { getNotionClient, linkItemEntitiesInNotion, relinkArchivoInNotion, relinkCalendarioInNotion, syncNotionDebtsAndSplits, syncNotionImportedMovements } from '../notion.js';
+import { counterpartForMovement, isSelf, loadEntities, pickEntity, guessTipo, displayName, linkComprobanteEntity, linkSueldoEntity } from '../entityLinks.js';
 
 // Vincula TODO lo que ya existe con sus entidades (Supabase + relaciones en Notion):
 // movimientos, deudas, gastos compartidos e items (mails, notas).
@@ -13,6 +13,10 @@ import { counterpartForMovement, isSelf, loadEntities, pickEntity, guessTipo, di
 // notion_page_id). Sin eso igual vincula en Notion, pero no queda guardado en Supabase.
 
 const APPLY = process.argv.includes('--apply');
+// --solo=movimientos,items,deudas,comprobantes,sueldos,archivos,calendario  (por defecto: todo)
+const soloArg = process.argv.find(a => a.startsWith('--solo='));
+const SOLO = soloArg ? new Set(soloArg.split('=')[1].split(',').map(x => x.trim())) : null;
+const fase = (name: string) => !SOLO || SOLO.has(name);
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 async function fetchAll(table: string, apply: (q: any) => any = q => q) {
@@ -34,7 +38,7 @@ async function main() {
   // ---- Movimientos ----
   const movimientos = await fetchAll('finanzas_movimientos', q => q.order('fecha_movimiento', { ascending: true }));
   const plan = { vincular: 0, crear: new Map<string, string>(), sin: 0 };
-  for (const m of movimientos) {
+  for (const m of fase('movimientos') ? movimientos : []) {
     const cp = await counterpartForMovement(m);
     if (!cp || isSelf(cp.name)) { plan.sin += 1; continue; }
     const hit = pickEntity(cp.name, entities, cp.tipo || guessTipo(cp.raw, cp.name));
@@ -55,7 +59,12 @@ async function main() {
   const particiones = await fetchAll('finanzas_particiones').catch(() => []);
   const items = await fetchAll('items', q => q.not('notion_page_id', 'is', null));
   const itemsConEntidades = items.filter(i => Array.isArray(i.entidades_json) && i.entidades_json.some((e: any) => e?.nombre && !isSelf(e.nombre)));
+  const comprobantes = await fetchAll('finanzas_comprobantes').catch(() => []);
+  const sueldos = await fetchAll('sueldos_recibos').catch(() => []);
+  const archivos = await fetchAll('archivos').catch(() => []);
   console.log(`Deudas: ${deudas.length} | Gastos compartidos: ${particiones.length} | Items con entidades: ${itemsConEntidades.length}`);
+  console.log(`Comprobantes: ${comprobantes.length} | Recibos de sueldo: ${sueldos.length} | Archivos: ${archivos.length} | Calendario: se recorre en Notion`);
+  if (SOLO) console.log(`Fases: ${[...SOLO].join(', ')}`);
 
   if (!APPLY) {
     console.log('\nNada se escribió. Para aplicar: npm run link:entidades -- --apply');
@@ -66,7 +75,7 @@ async function main() {
   if (!notion) throw new Error('Falta NOTION_TOKEN.');
 
   let n = 0;
-  for (const m of movimientos) {
+  for (const m of fase('movimientos') ? movimientos : []) {
     await syncNotionImportedMovements([m]);
     n += 1;
     if (n % 25 === 0) console.log(`  movimientos: ${n}/${movimientos.length}`);
@@ -74,17 +83,40 @@ async function main() {
   }
   console.log(`Movimientos procesados: ${n}`);
 
-  const ds = await syncNotionDebtsAndSplits(deudas, particiones);
+  const ds = fase('deudas') ? await syncNotionDebtsAndSplits(deudas, particiones) : { deudas: 0, particiones: 0 };
   console.log(`Deudas: ${ds.deudas} | Gastos compartidos: ${ds.particiones}`);
 
   let it = 0;
-  for (const item of itemsConEntidades) {
+  for (const item of fase('items') ? itemsConEntidades : []) {
     await linkItemEntitiesInNotion(notion, item);
     it += 1;
     if (it % 25 === 0) console.log(`  items: ${it}/${itemsConEntidades.length}`);
     await sleep(350);
   }
   console.log(`Items vinculados: ${it}`);
+
+  if (fase('comprobantes')) {
+    let c = 0;
+    for (const comp of comprobantes) { if (await linkComprobanteEntity(comp)) c += 1; }
+    console.log(`Comprobantes vinculados: ${c}/${comprobantes.length}`);
+  }
+  if (fase('sueldos')) {
+    let r = 0;
+    for (const rec of sueldos) { if (await linkSueldoEntity(rec)) r += 1; }
+    console.log(`Recibos de sueldo vinculados: ${r}/${sueldos.length}`);
+  }
+  if (fase('archivos')) {
+    let a = 0;
+    for (const arch of archivos) {
+      if (await relinkArchivoInNotion(arch)) a += 1;
+      await sleep(350);
+      if ((a + 1) % 25 === 0) console.log(`  archivos: ${a}`);
+    }
+    console.log(`Archivos vinculados en Notion: ${a}/${archivos.length}`);
+  }
+  if (fase('calendario')) {
+    console.log(`Eventos de calendario vinculados: ${await relinkCalendarioInNotion()}`);
+  }
   console.log('Listo.');
 }
 
