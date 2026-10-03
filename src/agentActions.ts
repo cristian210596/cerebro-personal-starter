@@ -9,7 +9,7 @@ import {
 import { unifiedSearch } from './chatPro.js';
 import { summarizeSalaryFromText, importSalaryReceiptFromFile, formatSalaryImportResult, looksLikeSalaryFile } from './salary.js';
 import { buildFinanceDashboardData } from './financeDashboardData.js';
-import { importComprobanteFromFile, formatComprobanteImportResult, looksLikeComprobanteFile } from './comprobantes.js';
+import { importComprobanteFromFile, importComprobanteFromParsedData, formatComprobanteImportResult, looksLikeComprobanteFile } from './comprobantes.js';
 import { saveFinanceFromText, formatFinanceSaved } from './finance.js';
 import { classifyText } from './classifier.js';
 import { saveItem, supabase } from './supabaseClient.js';
@@ -232,6 +232,80 @@ export async function runAgentAction(action: string, params: any) {
       return { kind: null, recognized: false, texto: 'No lo reconocí como comprobante, recibo de sueldo, resumen ni captura de pago. Probá con analyze_unknown_document para ver qué es en general.' };
     }
 
+    case 'import_comprobante_data': {
+      // Ticket/factura ya leído por Claude (sin Gemini). Guarda cabecera +
+      // items con precio por producto, y vincula/crea el gasto.
+      const { fecha, total, items } = params;
+      if (!fecha || !/^\d{4}-\d{2}-\d{2}$/.test(String(fecha))) throw new Error('Falta fecha en formato YYYY-MM-DD.');
+      const totalNum = Number(total);
+      if (!Number.isFinite(totalNum) || totalNum <= 0) throw new Error('Falta total (número positivo).');
+      if (!Array.isArray(items) || !items.length) throw new Error('Falta items (al menos un producto).');
+      for (const [i, it] of items.entries()) {
+        if (!it || !String(it.descripcion || '').trim()) throw new Error(`Item ${i + 1} sin descripcion.`);
+        if (!Number.isFinite(Number(it.importe))) throw new Error(`Item ${i + 1} (${it.descripcion}) sin importe numérico.`);
+      }
+      const round2 = (n: number) => Math.round(n * 100) / 100;
+      const sumImportes = round2(items.reduce((a: number, it: any) => a + Number(it.importe || 0), 0));
+      const sumDescuentos = round2(items.reduce((a: number, it: any) => a + Math.abs(Number(it.descuento || 0)), 0));
+      const subtotalNum = params.subtotal != null ? Number(params.subtotal) : null;
+      const descuentosNum = params.descuentos != null ? Math.abs(Number(params.descuentos)) : null;
+      const avisos: string[] = [];
+      if (subtotalNum != null && Math.abs(sumImportes - subtotalNum) > 1) avisos.push(`La suma de importes (${sumImportes}) no coincide con el subtotal (${subtotalNum}).`);
+      if (descuentosNum != null && sumDescuentos > 0 && Math.abs(sumDescuentos - descuentosNum) > 1) avisos.push(`La suma de descuentos por item (${sumDescuentos}) no coincide con descuentos (${descuentosNum}).`);
+      if (subtotalNum != null && descuentosNum != null && Math.abs(subtotalNum - descuentosNum - totalNum) > 1) avisos.push(`subtotal - descuentos (${round2(subtotalNum - descuentosNum)}) no coincide con total (${totalNum}).`);
+      if (avisos.length && !params.forzar) {
+        return { ok: false, guardado: false, avisos, texto: 'No guardé nada: los números no cierran. Revisá la lectura o reenviá con forzar:true si el ticket realmente es así.' };
+      }
+      const result = await importComprobanteFromParsedData({
+        is_comprobante: true,
+        tipo_comprobante: params.tipo_comprobante || 'ticket',
+        confidence: 0.95,
+        comercio: params.comercio || null,
+        razon_social: params.razon_social || null,
+        cuit: params.cuit || null,
+        sucursal: params.sucursal || null,
+        punto_venta: params.punto_venta || null,
+        numero_comprobante: params.numero_comprobante || null,
+        fecha: String(fecha),
+        total: totalNum,
+        subtotal: subtotalNum,
+        descuentos: descuentosNum,
+        impuestos: params.impuestos != null ? Number(params.impuestos) : null,
+        moneda: params.moneda || 'ARS',
+        medio_pago: params.medio_pago || null,
+        tarjeta: params.tarjeta || null,
+        tarjeta_ultimos_4: params.tarjeta_ultimos_4 || null,
+        cuotas: params.cuotas != null ? Number(params.cuotas) : null,
+        importe_cuota: params.importe_cuota != null ? Number(params.importe_cuota) : null,
+        items: items.map((it: any) => ({
+          codigo: it.codigo || null,
+          descripcion: String(it.descripcion),
+          marca: it.marca || null,
+          cantidad: it.cantidad != null ? Number(it.cantidad) : 1,
+          precio_unitario: it.precio_unitario != null ? Number(it.precio_unitario) : null,
+          importe: Number(it.importe),
+          descuento: it.descuento != null ? Math.abs(Number(it.descuento)) : null,
+          categoria: it.categoria || null,
+          subcategoria: it.subcategoria || null,
+          raw_json: { ...it, via: 'claude' }
+        })),
+        texto_extraido: params.texto_extraido || null,
+        notas: params.notas || 'Cargado por Claude leyendo la imagen (sin Gemini).'
+      }, { fileName: params.filename || null, mimeType: params.mimetype || null });
+      await syncPendingImportedMovementsToNotion();
+      return {
+        ok: true,
+        guardado: !result.duplicate,
+        duplicate: !!result.duplicate,
+        comprobante_id: result.comprobante?.id || null,
+        movimiento_id: result.movimiento?.id || null,
+        movimiento_vinculado_existente: !!result.movimiento?.__linked,
+        items_insertados: result.itemsInserted || 0,
+        avisos,
+        texto: formatComprobanteImportResult(result)
+      };
+    }
+
     case 'analyze_unknown_document': {
       const { file_base64, filename, mimetype, caption } = params;
       if (!file_base64 || !filename) throw new Error('Faltan file_base64 y/o filename.');
@@ -385,7 +459,7 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'resolve_queue_item',
-    description: 'Marca un ítem de la cola atascada como resuelto, para que deje de reintentar. Llamar DESPUÉS de haber cargado el dato real con import_document o add_manual_expense (o con descartado:true si no correspondía cargar nada).',
+    description: 'Marca un ítem de la cola atascada como resuelto, para que deje de reintentar. Llamar DESPUÉS de haber cargado el dato real con import_comprobante_data (tickets con productos), import_document o add_manual_expense (o con descartado:true si no correspondía cargar nada).',
     inputSchema: { type: 'object', properties: { queue_id: { type: 'string' }, descartado: { type: 'boolean' } }, required: ['queue_id'] }
   },
   {
@@ -400,6 +474,57 @@ export const AGENT_TOOLS = [
         caption: { type: 'string' }
       },
       required: ['file_base64', 'filename']
+    }
+  },
+  {
+    name: 'import_comprobante_data',
+    description: 'Carga un ticket/factura de compra que VOS ya leíste (por ejemplo una foto de get_queue_file), sin pasar por Gemini. Guarda cada producto con cantidad, precio unitario, importe y descuento (sirve para el histórico de precios) y vincula el gasto si ya existía uno compatible (mismo monto, fecha ±días) o lo crea. Usar en vez de add_manual_expense cuando hay un ticket con detalle de productos. Valida que la suma de importes = subtotal y subtotal - descuentos = total; si no cierra, no guarda (salvo forzar:true). No inventar datos: si algo no se lee, omitirlo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        comercio: { type: 'string', description: 'ej: COTO' },
+        razon_social: { type: 'string' },
+        cuit: { type: 'string' },
+        sucursal: { type: 'string' },
+        punto_venta: { type: 'string' },
+        numero_comprobante: { type: 'string' },
+        tipo_comprobante: { type: 'string', description: 'ticket | factura | recibo | otro' },
+        fecha: { type: 'string', description: 'YYYY-MM-DD' },
+        total: { type: 'number', description: 'Total pagado (después de descuentos), positivo' },
+        subtotal: { type: 'number', description: 'Subtotal sin descuentos' },
+        descuentos: { type: 'number', description: 'Total de descuentos, positivo' },
+        impuestos: { type: 'number' },
+        moneda: { type: 'string', description: 'ARS por defecto' },
+        medio_pago: { type: 'string', description: 'ej: Visa crédito' },
+        tarjeta: { type: 'string' },
+        tarjeta_ultimos_4: { type: 'string' },
+        cuotas: { type: 'number' },
+        importe_cuota: { type: 'number' },
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              codigo: { type: 'string' },
+              descripcion: { type: 'string' },
+              marca: { type: 'string' },
+              cantidad: { type: 'number' },
+              precio_unitario: { type: 'number' },
+              importe: { type: 'number', description: 'Importe de la línea antes del descuento (cantidad x precio_unitario)' },
+              descuento: { type: 'number', description: 'Descuento aplicado a la línea, positivo' },
+              categoria: { type: 'string' },
+              subcategoria: { type: 'string' }
+            },
+            required: ['descripcion', 'importe']
+          }
+        },
+        texto_extraido: { type: 'string' },
+        notas: { type: 'string' },
+        filename: { type: 'string' },
+        mimetype: { type: 'string' },
+        forzar: { type: 'boolean', description: 'Guardar aunque los totales no cierren' }
+      },
+      required: ['fecha', 'total', 'items']
     }
   },
   {

@@ -120,6 +120,21 @@ export async function importComprobanteFromFile(input: ImportComprobanteInput): 
   });
 }
 
+// Carga un comprobante que ya viene leído/estructurado (por ejemplo, cuando
+// Claude lee la foto con su propia visión porque Gemini no tenía cuota). No
+// llama a Gemini: va directo al mismo persistComprobante que usa el import
+// normal, así que respeta dedupe, guarda los items (precio por producto) y
+// vincula o crea el movimiento financiero igual que siempre.
+export async function importComprobanteFromParsedData(parsed: ParsedComprobante, context: { fileName?: string | null; mimeType?: string | null; archivoId?: string | null; chatId?: string | null } = {}): Promise<ImportComprobanteResult> {
+  return persistComprobante({ ...parsed, is_comprobante: true }, {
+    archivoId: context.archivoId || null,
+    chatId: context.chatId || '0',
+    fileName: context.fileName || null,
+    mimeType: context.mimeType || null,
+    bufferHash: null
+  });
+}
+
 export async function extractComprobante(buffer: Buffer, mimeType: string, fileName: string, caption = '', force = false): Promise<ParsedComprobante> {
   const pdfText = await tryExtractPdfText(buffer, fileName, mimeType);
   if (pdfText && (looksLikeComprobanteText(pdfText) || force || looksLikeComprobanteFile(fileName, mimeType, caption))) {
