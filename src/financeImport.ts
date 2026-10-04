@@ -117,7 +117,7 @@ export async function importFinanceFile(input: {
     const pdfText = await tryExtractPdfText(input.buffer, fileName, mimeType);
     pdfTextLength = pdfText?.length || 0;
     if (pdfText && pdfText.length > 120) {
-      parsed = parseVisaGaliciaPdfText(pdfText, fileName) || parseMercadoPagoPdfText(pdfText, fileName);
+      parsed = parseVisaGaliciaPdfText(pdfText, fileName) || parseVisaSignaturePdfText(pdfText, fileName) || parseMercadoPagoPdfText(pdfText, fileName);
       console.log(`Importador financiero PDF: texto local ${pdfText.length} chars; movimientos locales ${parsed?.movimientos?.length || 0}`);
     } else {
       console.log('Importador financiero PDF: no se pudo extraer texto local usable. Intento fallback Gemini.');
@@ -492,6 +492,7 @@ async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: str
       // (columnas pegadas o reordenadas); en ese caso seguimos probando los demás.
       const statementChecks: Array<[RegExp[], (t: string, f: string) => ParsedFinanceDocument | null]> = [
         [[/detalle\s+del\s+consumo/i, /(visa|master\s*card|mastercard|galicia)/i], parseVisaGaliciaPdfText],
+        [[/detalle\s+de\s+transacci[oó]n/i, /visa/i], parseVisaSignaturePdfText],
         [[/detalle\s+de\s+movimientos/i, /mercado\s*pago/i], parseMercadoPagoPdfText]
       ];
       for (const [patterns, parseFn] of statementChecks) {
@@ -890,6 +891,109 @@ function parseVisaDetailRows(text: string, referenceDate: string | null): Import
 
   return out;
 }
+// Resumen Visa Galicia formato "Signature / Éminent" (layout distinto al clásico):
+// encabezado "DETALLE DE TRANSACCION", fechas dd.mm.yy, comprobante tipo 747738* / 707567K,
+// cuotas como "Cuota 04/09", consumos USD como "... USD 19,99 19,99" y cargos/impuestos
+// sin comprobante al final (INTERESES, DB IVA, IIBB, IVA RG 4240, DB.RG 5617).
+// Montos en positivo como el parser clásico: el signo lo aplica el sistema según "tipo".
+function parseVisaSignaturePdfText(text: string, fileName: string): ParsedFinanceDocument | null {
+  const normalized = cleanPdfText(text);
+  const lower = norm(normalized);
+  if (!/detalle de transaccion/.test(lower) || !/visa/.test(lower)) return null;
+
+  const toNamedDate = (m: RegExpMatchArray | null) => (m ? `${m[1]}-${m[2]}-${m[3]}` : null);
+  const fechaCierre = normalizeDateFromStatement(toNamedDate(normalized.match(/CIERRE ACTUAL:\s*(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2})/i)), null);
+  const fechaVencimiento = normalizeDateFromStatement(toNamedDate(normalized.match(/VENCIMIENTO[^\n]*\n\s*(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2})/i)), fechaCierre);
+  const periodo = normalizePeriod(null, fechaCierre, fechaVencimiento);
+
+  const saldo = normalized.match(/SALDO ACTUAL\s*\$\s*([\d.]+,\d{2})(?:\s*U\$S\s*([\d.]+,\d{2}))?/i);
+  const totalPesos = saldo ? parseAmountLoose(saldo[1]) : null;
+  const totalDolares = saldo?.[2] ? parseAmountLoose(saldo[2]) : null;
+  const pagoMinimoMatch = normalized.match(/PAGO MINIMO\s*\$\s*([\d.]+,\d{2})/i);
+  const pagoMinimo = pagoMinimoMatch ? parseAmountLoose(pagoMinimoMatch[1]) : parsePagoMinimo(normalized);
+  const cuenta = clean(normalized.match(/^\s*(\d{10})\s*$/m)?.[1]) || clean(String(fileName || '').match(/^(\d{10})\./)?.[1]) || null;
+  const proveedor = /galicia/i.test(normalized) ? 'Banco Galicia' : null;
+
+  // Sólo la zona de movimientos: desde el primer encabezado hasta "SALDO ACTUAL".
+  const startIdx = lower.indexOf('detalle de transaccion');
+  const endIdx = lower.indexOf('saldo actual', startIdx);
+  const detail = normalized.slice(startIdx, endIdx > startIdx ? endIdx : undefined);
+
+  const rowRe = /^(\d{2})\.(\d{2})\.(\d{2})\s+(?:(\d{5,8}[K*]?)\s+)?(.+?)\s+(\d[\d.]*,\d{2})(-?)$/;
+  const movimientos: ImportedMovement[] = [];
+  const seen = new Set<string>();
+
+  for (const rawLine of detail.split('\n')) {
+    const line = rawLine.replace(/\s+/g, ' ').trim();
+    const m = line.match(rowRe);
+    if (!m) continue;
+    let desc = clean(m[5]);
+    const d = norm(desc);
+    if (/saldo anterior|transferencia deuda|su pago en pesos|total consumos/.test(d)) continue;
+
+    let moneda = 'ARS';
+    const usd = desc.match(/^(.*?)\s*USD\s+\d[\d.]*,\d{2}$/i);
+    if (usd) {
+      moneda = 'USD';
+      desc = clean(usd[1]);
+    }
+    const cuotaMatch = desc.match(/\s*Cuota\s+(\d{1,2}\/\d{1,2})$/i);
+    const cuota = parseInstallment(cuotaMatch?.[1] || '');
+    if (cuotaMatch) desc = clean(desc.slice(0, cuotaMatch.index));
+    desc = desc.replace(/\s*\$$/, '').replace(/\s+/g, ' ').trim();
+
+    const monto = parseAmountLoose(m[6]);
+    if (!desc || monto === null) continue;
+    const esCredito = m[7] === '-';
+    const fecha = normalizeDateFromStatement(`${m[1]}/${m[2]}/${m[3]}`, null);
+    const comprobante = clean(m[4]) || null;
+
+    const key = [fecha || '', comprobante || '', Math.round(monto * 100), moneda, normalizeMerchantText(desc)].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const base: ImportedMovement = {
+      fecha,
+      descripcion_original: desc,
+      comercio: guessCommerce(desc),
+      comprobante,
+      monto,
+      moneda,
+      tipo: esCredito ? 'devolucion' : normalizeMovementType('', desc),
+      cuota_actual: cuota.current,
+      cuotas_totales: cuota.total,
+      categoria_sugerida: null,
+      subcategoria_sugerida: null,
+      confianza: 0.55,
+      raw: { line, parser: 'visa_signature_line' }
+    };
+    const rule = builtInRuleFor(base);
+    movimientos.push({
+      ...base,
+      comercio: rule?.comercio || base.comercio,
+      categoria_sugerida: rule?.categoria || null,
+      subcategoria_sugerida: rule?.subcategoria || null,
+      confianza: rule?.confianza || base.confianza
+    });
+  }
+
+  if (movimientos.length < 3) return null;
+  return normalizeParsedDocument({
+    es_resumen_financiero: true,
+    tipo_fuente: 'resumen_tarjeta_pdf',
+    proveedor,
+    cuenta,
+    tarjeta: 'Visa',
+    periodo,
+    fecha_cierre: fechaCierre,
+    fecha_vencimiento: fechaVencimiento,
+    total_pesos: totalPesos,
+    total_dolares: totalDolares,
+    pago_minimo: pagoMinimo,
+    movimientos
+  });
+}
+
 function parseMercadoPagoPdfText(text: string, fileName: string): ParsedFinanceDocument | null {
   const normalized = text.replace(/\r/g, '\n');
   const lower = norm(normalized);
