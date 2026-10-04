@@ -2110,6 +2110,140 @@ async function findExistingImport(hash: string) {
   return data || null;
 }
 
+// Trae TODAS las filas de una consulta paginando de a `pageSize`. El builder se
+// recrea en cada página (los builders de supabase-js no son reutilizables).
+// Tope de seguridad alto (200k filas) sólo para cortar un loop infinito.
+async function fetchAllPaged(make: () => any, pageSize = 1000): Promise<any[]> {
+  const out: any[] = [];
+  for (let from = 0; from < 200000; from += pageSize) {
+    const { data, error } = await make().range(from, from + pageSize - 1);
+    if (error) throw error;
+    out.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+  }
+  return out;
+}
+
+// Reporte de gasto para comparaciones históricas: totales por mes, por término
+// (comercio/palabra) y por categoría, SIN tope de filas. Los totales siempre se
+// calculan sobre todas las filas del período; sólo el detalle "movimientos" se
+// recorta (maxRows) para no inflar la respuesta, y se avisa con rows_truncated.
+// Signo: gasto/cargo suman, devolución resta, ingresos y transferencias se
+// excluyen salvo incluir_ingresos=true. Montos siempre en valor absoluto.
+export async function spendingReport(input: {
+  terms?: string[] | null;
+  categoria?: string | null;
+  startPeriod: string;
+  endPeriod: string;
+  incluirIngresos?: boolean;
+  maxRows?: number;
+}) {
+  const startPeriod = String(input.startPeriod || '').slice(0, 7);
+  const endPeriod = String(input.endPeriod || '').slice(0, 7);
+  if (!/^\d{4}-\d{2}$/.test(startPeriod) || !/^\d{4}-\d{2}$/.test(endPeriod)) {
+    throw new Error('startPeriod y endPeriod tienen que ser YYYY-MM.');
+  }
+  const terms = (input.terms || []).map(t => String(t || '').trim()).filter(Boolean);
+  const categoria = input.categoria ? norm(String(input.categoria)) : null;
+
+  const base = await summarizeFinanceAnalytics('', {
+    startPeriod,
+    endPeriod,
+    terms: terms.length ? terms : [],
+    label: terms.join(', ') || input.categoria || 'todos los gastos'
+  });
+
+  const signed = (row: any) => {
+    const t = norm(String(row.tipo || 'gasto'));
+    const abs = Math.abs(Number(row.monto || 0));
+    if (t.includes('devolucion') || t.includes('reintegro')) return -abs;
+    if (!input.incluirIngresos && (t.includes('ingreso') || t.includes('transferencia') || t.includes('pago_tarjeta'))) return null;
+    return abs;
+  };
+
+  const rows = base.rows
+    .filter((row: any) => !categoria || norm(String(row.categoria_financiera || '')) === categoria)
+    .map((row: any) => ({ row, amount: signed(row) }))
+    .filter((x): x is { row: any; amount: number } => x.amount !== null);
+
+  const termOf = (row: any) => {
+    if (!terms.length) return null;
+    const hay = norm([row.comercio, row.descripcion, row.categoria_financiera, row.subcategoria_financiera, row.medio_pago, row.tarjeta, row.banco_billetera, row.merchant_key].filter(Boolean).join(' '));
+    return terms.find(t => hay.includes(norm(t))) || null;
+  };
+
+  type Bucket = { total: number; cantidad: number };
+  const add = (map: Record<string, Record<string, Bucket>>, k1: string, k2: string, amount: number) => {
+    map[k1] ||= {};
+    const b = (map[k1][k2] ||= { total: 0, cantidad: 0 });
+    b.total = round(b.total + amount);
+    b.cantidad += 1;
+  };
+
+  const porMes: Record<string, Record<string, Bucket>> = {};
+  const porTermino: Record<string, Record<string, Record<string, Bucket>>> = {};
+  const porCategoria: Record<string, Record<string, Bucket>> = {};
+  const totales: Record<string, Bucket> = {};
+
+  for (const { row, amount } of rows) {
+    const mes = String(row.fecha_movimiento || '').slice(0, 7) || 'sin-fecha';
+    const moneda = row.moneda || 'ARS';
+    add(porMes, mes, moneda, amount);
+    add(porCategoria, row.categoria_financiera || 'Sin categoría', moneda, amount);
+    const tb = (totales[moneda] ||= { total: 0, cantidad: 0 });
+    tb.total = round(tb.total + amount);
+    tb.cantidad += 1;
+    const term = termOf(row);
+    if (term) {
+      porTermino[term] ||= {};
+      add(porTermino[term], mes, moneda, amount);
+    }
+  }
+
+  // Todos los meses del rango aparecen aunque no haya gasto (0 explícito),
+  // así una comparación mes a mes no "saltea" meses vacíos.
+  const meses: string[] = [];
+  for (let y = Number(startPeriod.slice(0, 4)), m = Number(startPeriod.slice(5, 7)); `${y}-${String(m).padStart(2, '0')}` <= endPeriod; m === 12 ? (y++, m = 1) : m++) {
+    meses.push(`${y}-${String(m).padStart(2, '0')}`);
+  }
+  for (const mes of meses) porMes[mes] ||= {};
+  for (const term of terms) {
+    porTermino[term] ||= {};
+    for (const mes of meses) porTermino[term][mes] ||= {};
+  }
+
+  const sortedObj = <T,>(o: Record<string, T>) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => a.localeCompare(b)));
+  const maxRows = Math.max(0, Math.min(Number(input.maxRows ?? 300), 2000));
+  const detalle = rows
+    .sort((a: any, b: any) => String(a.row.fecha_movimiento || '').localeCompare(String(b.row.fecha_movimiento || '')))
+    .map(({ row, amount }: any) => ({
+      fecha: row.fecha_movimiento || null,
+      monto: amount,
+      moneda: row.moneda || 'ARS',
+      comercio: row.comercio || null,
+      descripcion: row.descripcion || null,
+      categoria: row.categoria_financiera || null,
+      subcategoria: row.subcategoria_financiera || null,
+      medio_pago: row.medio_pago || null,
+      tipo: row.tipo || null,
+      origen: row.origen || 'movimiento',
+      termino: termOf(row)
+    }));
+
+  return {
+    periodo: { desde: startPeriod, hasta: endPeriod, fecha_criterio: 'fecha de consumo (fecha_movimiento), no fecha de resumen' },
+    terminos: terms,
+    categoria: input.categoria || null,
+    totales,
+    por_mes: sortedObj(porMes),
+    por_termino: Object.fromEntries(Object.entries(porTermino).map(([k, v]) => [k, sortedObj(v)])),
+    por_categoria: porCategoria,
+    cantidad_movimientos: detalle.length,
+    rows_truncated: detalle.length > maxRows,
+    movimientos: detalle.slice(0, maxRows)
+  };
+}
+
 export async function summarizeFinanceAnalytics(text: string, overrides?: { startPeriod?: string; endPeriod?: string; terms?: string[]; label?: string }) {
   // El router de intencion (Gemini) puede resolver el periodo/terminos el mismo
   // y pasarlos ya normalizados, evitando los limites de los parsers heuristicos
@@ -2125,15 +2259,16 @@ export async function summarizeFinanceAnalytics(text: string, overrides?: { star
         end: lastDayOfMonth(Number(overrides.endPeriod.slice(0, 4)), Number(overrides.endPeriod.slice(5, 7)))
       }
     : extractAnalyticsPeriod(text);
-  const { data, error } = await supabase
+  // Sin tope de filas: se pagina de a 1000 hasta traer todo el período
+  // (antes .limit(2000) cortaba en silencio las comparaciones históricas largas).
+  const data = await fetchAllPaged(() => supabase
     .from('finanzas_movimientos')
     .select('*')
     .gte('fecha_movimiento', period.start)
     .lte('fecha_movimiento', period.end)
     .order('fecha_movimiento', { ascending: true })
-    .limit(2000);
-  if (error) throw error;
-  const consolidatedRows = (data || []).filter((row: any) => matchesAnalyticsTarget(row, target));
+    .order('id', { ascending: true }));
+  const consolidatedRows = data.filter((row: any) => matchesAnalyticsTarget(row, target));
   const importedRows = await loadUnconsolidatedImportedAnalyticsRows(period, target);
   // Antes esta funcion solo miraba finanzas_movimientos / finanzas_movimientos_importados
   // (resumenes de tarjeta, gastos escritos a mano). Los comprobantes fotografiados
@@ -2152,7 +2287,7 @@ async function loadComprobanteAnalyticsRows(period: { start: string; end: string
   // suelen tener el nombre del producto, solo el comercio.
   if (!target.terms.length) return [];
 
-  const { data, error } = await supabase
+  const data = await fetchAllPaged(() => supabase
     .from('finanzas_comprobante_items')
     .select('*, finanzas_comprobantes!inner(fecha_emision,comercio,moneda,movimiento_financiero_id)')
     .gte('finanzas_comprobantes.fecha_emision', period.start)
@@ -2160,10 +2295,9 @@ async function loadComprobanteAnalyticsRows(period: { start: string; end: string
     // Si el comprobante ya quedo conciliado con un movimiento bancario, ese gasto ya esta
     // contado arriba (finanzas_movimientos) — lo excluimos de aca para no duplicarlo.
     .is('finanzas_comprobantes.movimiento_financiero_id', null)
-    .limit(2000);
-  if (error) throw error;
+    .order('id', { ascending: true }));
 
-  return (data || [])
+  return data
     .map((row: any) => {
       const comp = row.finanzas_comprobantes || {};
       return {
@@ -2178,6 +2312,7 @@ async function loadComprobanteAnalyticsRows(period: { start: string; end: string
         tarjeta: null,
         banco_billetera: null,
         merchant_key: row.marca || null,
+        tipo: 'gasto',
         origen: 'comprobante'
       };
     })
@@ -2185,16 +2320,15 @@ async function loadComprobanteAnalyticsRows(period: { start: string; end: string
 }
 
 async function loadUnconsolidatedImportedAnalyticsRows(period: { start: string; end: string }, target: { terms: string[] }) {
-  const { data, error } = await supabase
+  const data = await fetchAllPaged(() => supabase
     .from('finanzas_movimientos_importados')
     .select('*')
     .gte('fecha_movimiento', period.start)
     .lte('fecha_movimiento', period.end)
     .is('movimiento_id', null)
     .in('estado', ['clasificado', 'pendiente_revision'])
-    .limit(2000);
-  if (error) throw error;
-  return (data || [])
+    .order('id', { ascending: true }));
+  return data
     .map((row: any) => ({
       id: row.id,
       fecha_movimiento: row.fecha_movimiento,
@@ -2208,6 +2342,7 @@ async function loadUnconsolidatedImportedAnalyticsRows(period: { start: string; 
       tarjeta: row.tarjeta || null,
       banco_billetera: row.proveedor || null,
       merchant_key: row.merchant_key || null,
+      tipo: mapImportedTypeToMovementType(row.tipo || ''),
       origen: 'importacion_no_consolidada'
     }))
     .filter((row: any) => matchesAnalyticsTarget(row, target));

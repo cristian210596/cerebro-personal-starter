@@ -5,7 +5,8 @@ import {
   ignoreGroupByIndex,
   importFinanceFile,
   formatImportResult,
-  extractJsonObject
+  extractJsonObject,
+  spendingReport
 } from './financeImport.js';
 import { unifiedSearch } from './chatPro.js';
 import { summarizeSalaryFromText, importSalaryReceiptFromFile, formatSalaryImportResult, looksLikeSalaryFile } from './salary.js';
@@ -172,6 +173,20 @@ export async function runAgentAction(action: string, params: any) {
         endPeriod: String(endPeriod),
         concept: concept ? String(concept) : null,
         excludeConcept: !!excludeConcept
+      });
+    }
+
+    case 'spending_report': {
+      const { terms, categoria, startPeriod, endPeriod, incluir_ingresos, max_rows } = params;
+      if (!startPeriod || !endPeriod) throw new Error('Faltan startPeriod y endPeriod (formato YYYY-MM).');
+      const termList = Array.isArray(terms) ? terms.map(String) : (terms ? String(terms).split(',').map(t => t.trim()) : []);
+      return await spendingReport({
+        terms: termList,
+        categoria: categoria ? String(categoria) : null,
+        startPeriod: String(startPeriod),
+        endPeriod: String(endPeriod),
+        incluirIngresos: !!incluir_ingresos,
+        maxRows: max_rows != null ? Number(max_rows) : undefined
       });
     }
 
@@ -452,7 +467,7 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'search',
-    description: 'Busca en TODO lo que ya está guardado en el sistema (busca en toda la base, no solo lo reciente): notas, pendientes de tareas, movimientos financieros, deudas, presupuestos, memorias, sueldos, comprobantes, ENTIDADES (personas, empresas, equipos, productos) con los items vinculados a cada una, Y TAMBIÉN mails/correos que ya fueron procesados (llegan etiquetados desde Gmail y se guardan acá como notas). Si preguntan algo sobre "mails" o "correos", usar esta tool — no asumir que hace falta un conector de Gmail aparte, los mails ya ingeridos viven en este mismo sistema. Mandar solo 2-4 palabras clave del tema, sin relleno; si la pregunta es muy genérica (ej "mis últimos mails" sin tema), probar igual con alguna palabra razonable antes de decir que no se puede. Los items vienen ordenados por fecha real (la del mail si es un correo, campo fecha), máximo 15; totales.items dice cuántos matchearon en total. Para una persona, buscar por apellido.',
+    description: 'Busca en TODO lo que ya está guardado en el sistema (busca en toda la base, no solo lo reciente): notas, pendientes de tareas, movimientos financieros, deudas, presupuestos, memorias, sueldos, comprobantes, ENTIDADES (personas, empresas, equipos, productos) con los items vinculados a cada una, Y TAMBIÉN mails/correos que ya fueron procesados (llegan etiquetados desde Gmail y se guardan acá como notas). Si preguntan algo sobre "mails" o "correos", usar esta tool — no asumir que hace falta un conector de Gmail aparte, los mails ya ingeridos viven en este mismo sistema. Mandar solo 2-4 palabras clave del tema, sin relleno; si la pregunta es muy genérica (ej "mis últimos mails" sin tema), probar igual con alguna palabra razonable antes de decir que no se puede. Los items vienen ordenados por fecha real (la del mail si es un correo, campo fecha), máximo 15; totales.items dice cuántos matchearon en total. Los movimientos financieros vienen ordenados por fecha de consumo (más recientes primero), máximo 50, y totales.movimientos dice cuántos matchearon: para SUMAR o comparar montos usar spending_report, no esta tool. Para una persona, buscar por apellido.',
     inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }
   },
   {
@@ -465,6 +480,22 @@ export const AGENT_TOOLS = [
         endPeriod: { type: 'string', description: 'YYYY-MM' },
         concept: { type: 'string' },
         excludeConcept: { type: 'boolean' }
+      },
+      required: ['startPeriod', 'endPeriod']
+    }
+  },
+  {
+    name: 'spending_report',
+    description: 'USAR ESTA TOOL para cualquier "cuánto gasté en X", totales y comparaciones históricas (por mes, entre meses, por comercio o por categoría). Suma TODOS los movimientos del rango, sin tope de cantidad (tarjeta/cuenta consolidados + importados aún no consolidados + tickets no conciliados). Devuelve totales por moneda, por_mes (todos los meses del rango, incluso en 0), por_termino (cada comercio/palabra por separado, por mes), por_categoria, y el detalle. Criterio de fecha: fecha de consumo. Gastos y cargos suman, devoluciones restan; ingresos/transferencias/pagos de tarjeta se excluyen salvo incluir_ingresos=true. NO usar "search" para sumar montos: search devuelve una muestra limitada.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        terms: { type: 'array', items: { type: 'string' }, description: 'Comercios o palabras a buscar, cada uno se reporta por separado (ej ["cabify","uber"]). Vacío = todos los gastos.' },
+        categoria: { type: 'string', description: 'Filtrar por categoría financiera exacta (ej "Transporte", "Comida afuera").' },
+        startPeriod: { type: 'string', description: 'YYYY-MM, primer mes incluido' },
+        endPeriod: { type: 'string', description: 'YYYY-MM, último mes incluido' },
+        incluir_ingresos: { type: 'boolean' },
+        max_rows: { type: 'number', description: 'Máximo de filas de detalle a devolver (default 300). Los totales siempre usan todas.' }
       },
       required: ['startPeriod', 'endPeriod']
     }

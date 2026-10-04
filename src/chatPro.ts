@@ -144,7 +144,7 @@ const SEARCH_TABLES: Record<string, { cols: string[]; select?: string; limit: nu
   items: { cols: ['titulo', 'resumen', 'texto_original', 'categoria_principal', 'tipo_item'], select: 'id,created_at,fecha_evento,fuente,titulo,resumen,texto_original,categoria_principal,subcategorias,tipo_item,estado,importancia,accion_futura,tags,url,notion_page_id', limit: 300 },
   archivos: { cols: ['nombre_archivo', 'transcripcion', 'descripcion_ia'], select: '*, items(titulo,categoria_principal,resumen,tags)', limit: 100 },
   pendientes: { cols: ['titulo', 'descripcion', 'categoria'], limit: 100 },
-  finanzas_movimientos: { cols: ['descripcion', 'comercio', 'categoria_financiera', 'subcategoria_financiera', 'medio_pago'], limit: 200 },
+  finanzas_movimientos: { cols: ['descripcion', 'comercio', 'categoria_financiera', 'subcategoria_financiera', 'medio_pago'], limit: 2000 },
   finanzas_deudas: { cols: ['persona', 'concepto'], limit: 100 },
   finanzas_presupuestos: { cols: ['categoria_financiera', 'notas'], limit: 100 },
   memorias: { cols: ['afirmacion', 'categoria'], limit: 100 },
@@ -247,14 +247,19 @@ export async function unifiedSearch(query: string) {
     .filter(r => (seen.has(r.id) ? false : (seen.add(r.id), true)))
     .sort((a, b) => itemDate(b).localeCompare(itemDate(a)));
 
+  // Movimientos: ordenados por fecha de consumo (no por fecha de carga), así un
+  // resumen viejo cargado hoy no tapa a los movimientos recientes.
+  const movimientosMatch = filterRows(movimientos, tokens, r => [r.descripcion, r.comercio, r.categoria_financiera, r.subcategoria_financiera, r.medio_pago, r.tarjeta, r.tipo, r.estado, r.fecha_movimiento])
+    .sort((a: any, b: any) => String(b.fecha_movimiento || '').localeCompare(String(a.fecha_movimiento || '')));
+
   return {
     query,
-    totales: { items: mergedItems.length, entidades: entidades.length },
+    totales: { items: mergedItems.length, entidades: entidades.length, movimientos: movimientosMatch.length },
     entidades,
     items: mergedItems.slice(0, 15).map(slimItem),
     archivos: filterRows(archivos, tokens, r => [r.nombre_archivo, r.tipo_archivo, r.mime_type, r.transcripcion, r.descripcion_ia, r.items?.titulo, r.items?.resumen, ...(r.items?.tags || [])]).slice(0, 6),
     pendientes: filterRows(pendientes, tokens, r => [r.titulo, r.descripcion, r.categoria, r.estado, r.prioridad, ...(r.tags || [])]).slice(0, 10),
-    movimientos: filterRows(movimientos, tokens, r => [r.descripcion, r.comercio, r.categoria_financiera, r.subcategoria_financiera, r.medio_pago, r.tarjeta, r.tipo, r.estado, r.fecha_movimiento]).slice(0, 10),
+    movimientos: movimientosMatch.slice(0, 50),
     deudas: filterRows(deudas, tokens, r => [r.persona, r.concepto, r.tipo, r.estado]).slice(0, 5),
     presupuestos: filterRows(presupuestos, tokens, r => [r.categoria_financiera, r.periodo, r.frecuencia, r.notas]).slice(0, 5),
     memorias: filterRows(memorias, tokens, r => [r.afirmacion, r.categoria, r.confianza]).slice(0, 10),
