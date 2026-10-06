@@ -2949,18 +2949,37 @@ const GROUP_KEY_ALIASES: [RegExp, string][] = [
 ];
 
 export function merchantGroupKey(value: string | null | undefined): string {
-  let t = norm(value).replace(/usd\s*[\d.,]+/g, ' ').replace(/^\*\s*/, '').replace(/^(k|f)\s+/, '');
+  let t = norm(value)
+    .replace(/usd\s*[\d.,]+/g, ' ')
+    .replace(/\b\d{1,2}\s*\/\s*\d{1,2}\b/g, ' ') // cuotas 01/03
+    .replace(/^\*\s*/, '')
+    .replace(/^(k|f)\s+/, '');
+  // Movimientos de billetera: "Transferencia enviada X", "Pago con QR X" y "Pago X"
+  // son la misma salida de plata hacia X -> misma clave que el comercio de tarjeta.
+  // Lo recibido queda separado con prefijo propio (no se mezcla con lo pagado).
+  let direction = '';
+  const incoming = t.match(/^(transferencia recibida|dinero recibido|devolucion de transferencia enviada)\s+/);
+  if (incoming) {
+    direction = 'recibido';
+    t = t.slice(incoming[0].length);
+  } else {
+    t = t.replace(/^(transferencia enviada|pago con qr|pago)\s+/, '');
+  }
   let prev: string;
   do { prev = t; t = t.replace(GROUP_KEY_PREFIXES, ' ').trim(); } while (t !== prev);
   const tokens = t.replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(Boolean);
   const words = tokens.filter(w => !GROUP_KEY_STOPWORDS.has(w));
-  const noIds = words.filter(w => !/\d/.test(w));
+  // Solo se descartan tokens con pinta de ID: números de 3+ dígitos o
+  // alfanuméricos largos (MTZ4WB4WS, in1TaL88B). "OPEN25" o "Open 25" se conservan.
+  const isIdToken = (w: string) => /^\d{3,}$/.test(w) || (/\d/.test(w) && /[a-z]/.test(w) && (w.length >= 7 || /\d[a-z]/.test(w)));
+  const noIds = words.filter(w => !isIdToken(w));
   let key = (noIds.length ? noIds : words).join('');
   key = key.replace(/(srl|sas|saci)$/, '').replace(/y(cia|compania)$/, 'y');
   for (const [re, alias] of GROUP_KEY_ALIASES) {
     if (re.test(key)) { key = alias; break; }
   }
-  return key.length >= 3 ? key.slice(0, 80) : '';
+  if (key.length < 3) return '';
+  return `${direction}${key}`.slice(0, 80);
 }
 
 function groupKeyForRow(row: any): string {
@@ -2970,7 +2989,7 @@ function groupKeyForRow(row: any): string {
 
 function isUselessCategory(value: any) {
   const v = norm(value);
-  return !v || /^sin categor/.test(v);
+  return !v || /^sin categor/.test(v) || /^otros?(\s*\/\s*sin identificar)?$/.test(v);
 }
 
 function merchantKeyFrom(value: string) {

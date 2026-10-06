@@ -133,9 +133,17 @@ export async function runAgentAction(action: string, params: any) {
   switch (action) {
     case 'list_pending': {
       const groups = await getGroupedPendingImportedMovements();
+      // Paginado: con cientos de pendientes la respuesta completa superaba el
+      // límite del conector y no se podía leer. El index sigue siendo global.
+      const offset = Math.max(0, Number(params?.offset) || 0);
+      const limit = Math.min(80, Math.max(1, Number(params?.limit) || 40));
+      const shorten = (v: any) => { const t = String(v ?? ''); return t.length > 90 ? `${t.slice(0, 87)}...` : t; };
       return {
         total_grupos: groups.length,
         total_movimientos: groups.reduce((acc, g) => acc + g.count, 0),
+        offset,
+        limit,
+        hay_mas: offset + limit < groups.length,
         groups: groups.map((g, i) => ({
           index: i + 1,
           label: g.label,
@@ -144,8 +152,8 @@ export async function runAgentAction(action: string, params: any) {
           categoria_sugerida: g.categoria_sugerida,
           subcategoria_sugerida: g.subcategoria_sugerida,
           fuente_sugerencia: g.fuente_sugerencia,
-          ejemplos: g.rows.slice(0, 3).map((r: any) => ({ fecha: r.fecha_movimiento, monto: r.monto, moneda: r.moneda || 'ARS', descripcion: r.descripcion_original }))
-        }))
+          ejemplos: g.rows.slice(0, 2).map((r: any) => ({ fecha: r.fecha_movimiento, monto: r.monto, moneda: r.moneda || 'ARS', descripcion: shorten(r.descripcion_original) }))
+        })).slice(offset, offset + limit)
       };
     }
 
@@ -469,8 +477,14 @@ export async function runAgentAction(action: string, params: any) {
 export const AGENT_TOOLS = [
   {
     name: 'list_pending',
-    description: 'Lista los movimientos financieros pendientes de clasificar, agrupados por comercio. Devuelve {total_grupos,total_movimientos,groups:[{index,label,count,totales_por_moneda,categoria_sugerida,subcategoria_sugerida,fuente_sugerencia,ejemplos}]}. Agrupa por comercio normalizado (une MERPAGO*/PROPINA*/IDs de cobro). Los montos pueden venir en USD: mirar totales_por_moneda y nunca sumar monedas distintas. categoria_sugerida sale de reglas o de clasificaciones previas del mismo comercio: proponerla, no aplicarla sin confirmación. Usar antes de clasificar/ignorar para saber el index correcto, y cuando el usuario pregunta qué tiene pendiente.',
-    inputSchema: { type: 'object', properties: {} }
+    description: 'Lista los movimientos financieros pendientes de clasificar, agrupados por comercio. Devuelve {total_grupos,total_movimientos,groups:[{index,label,count,totales_por_moneda,categoria_sugerida,subcategoria_sugerida,fuente_sugerencia,ejemplos}]}. Agrupa por comercio normalizado (une MERPAGO*/PROPINA*/IDs de cobro). Los montos pueden venir en USD: mirar totales_por_moneda y nunca sumar monedas distintas. categoria_sugerida sale de reglas o de clasificaciones previas del mismo comercio: proponerla, no aplicarla sin confirmación. Paginado: devuelve hasta limit grupos (default 40, máx 80) desde offset; si hay_mas=true pedir la siguiente página con offset+limit. El index es global (no se reinicia por página). Usar antes de clasificar/ignorar para saber el index correcto, y cuando el usuario pregunta qué tiene pendiente.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        offset: { type: 'number', description: 'Grupos a saltear (default 0)' },
+        limit: { type: 'number', description: 'Cantidad de grupos a devolver (default 40, máx 80)' }
+      }
+    }
   },
   {
     name: 'classify_group',
