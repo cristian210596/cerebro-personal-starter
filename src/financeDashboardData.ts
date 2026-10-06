@@ -18,14 +18,21 @@ export async function buildFinanceDashboardData(): Promise<FinanceDashboardData>
   desde.setUTCDate(1);
   const desdeIso = desde.toISOString().slice(0, 10);
 
-  const { data, error } = await supabase
-    .from('finanzas_movimientos')
-    .select('fecha_movimiento, monto, categoria_financiera, tipo, comercio, descripcion')
-    .gte('fecha_movimiento', desdeIso)
-    .order('fecha_movimiento', { ascending: true })
-    .limit(5000);
-  if (error) throw error;
-  const rows = data || [];
+  // Paginado: Supabase/PostgREST devuelve como máximo 1000 filas por consulta aunque se pida
+  // .limit(5000); antes el panel se cortaba en jul-26 y "este mes" daba 0.
+  const rows: any[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from('finanzas_movimientos')
+      .select('fecha_movimiento, monto, moneda, categoria_financiera, tipo, comercio, descripcion')
+      .gte('fecha_movimiento', desdeIso)
+      .order('fecha_movimiento', { ascending: true })
+      .order('id', { ascending: true })
+      .range(from, from + 999);
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
 
   const mesActual = new Date().toISOString().slice(0, 7); // YYYY-MM
 
@@ -40,6 +47,10 @@ export async function buildFinanceDashboardData(): Promise<FinanceDashboardData>
     const tipo = String(row.tipo || '').toLowerCase();
     const mes = String(row.fecha_movimiento || '').slice(0, 7);
     if (!mes) continue;
+    // Totales en pesos: los consumos en USD no se mezclan con ARS (antes 20 USD sumaban como $20).
+    if (String(row.moneda || 'ARS').toUpperCase() !== 'ARS') continue;
+    // Movimientos entre cuentas propias no son gasto ni ingreso.
+    if (isInternalCategory(row.categoria_financiera)) continue;
     // Los pagos de tarjeta no son flujo nuevo: el consumo ya se contó al comprar.
     if (tipo === 'pago_tarjeta') continue;
 
@@ -106,7 +117,11 @@ function signedAmount(tipo: string, monto: number): number {
   return monto;
 }
 
-const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|sin categoria)/;
+const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|rendimientos?|sin (categoria|clasificar))/;
+const INTERNAL_CATEGORY_RE = /cuentas propias|pases? de la cuenta|^ignorar/;
+function isInternalCategory(categoria: string | null | undefined): boolean {
+  return INTERNAL_CATEGORY_RE.test(String(categoria || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim());
+}
 function isSpendingCategory(categoria: string | null | undefined): boolean {
   const c = String(categoria || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
   return !!c && !NON_SPENDING_CATEGORY_RE.test(c);

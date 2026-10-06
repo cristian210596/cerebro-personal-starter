@@ -2772,7 +2772,8 @@ function normalizeMovementType(type: any, desc: string) {
 
 // Categorías que NO son consumo: una transferencia enviada con estas categorías sigue
 // siendo "transferencia" (no suma como gasto en reportes ni en el panel).
-const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|sin categoria)/;
+const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|rendimientos?|sin (categoria|clasificar))/;
+const INTERNAL_CATEGORY_RE = /cuentas propias|pases? de la cuenta/;
 
 // Tipo final del movimiento creado a partir de una fila importada:
 // - Línea negativa en un resumen de TARJETA = anulación/reintegro → "devolucion" (antes quedaba
@@ -2784,6 +2785,8 @@ export function resolveMovementTypeForImported(row: any, categoria: string | nul
   const monto = Number(row?.monto || 0);
   const tipoImportado = norm(row?.tipo);
   if (row?.tarjeta && base === 'gasto' && monto < 0) return 'devolucion';
+  // Pase entre cuentas propias: nunca es gasto ni ingreso.
+  if (!row?.tarjeta && INTERNAL_CATEGORY_RE.test(norm(categoria || ''))) return 'transferencia';
   if (base === 'transferencia' && monto < 0 && !tipoImportado.includes('pago_tarjeta')) {
     const cat = norm(categoria || '');
     if (cat && !NON_SPENDING_CATEGORY_RE.test(cat)) return 'gasto';

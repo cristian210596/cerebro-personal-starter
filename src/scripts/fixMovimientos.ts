@@ -11,6 +11,7 @@ import { getNotionClient, syncNotionImportedMovements } from '../notion.js';
 //  d) "Rendimientos" positivos guardados como gasto                         -> tipo ingreso
 //  e) Basura del PDF de MP (pie "Mercado Libre S.R.L. CUIT 30-70308853…")   -> se borra el movimiento
 //     y la fila importada (también las pendientes) queda "ignorado"
+//  g) Pase entre cuentas propias (categoría) guardado como gasto       -> tipo transferencia
 //  f) Posibles duplicados (misma fecha, monto, moneda, tarjeta y descripción en importaciones
 //     distintas) -> SOLO se informan, no se borran.
 //
@@ -19,7 +20,8 @@ import { getNotionClient, syncNotionImportedMovements } from '../notion.js';
 
 const APPLY = process.argv.includes('--apply');
 const norm = (v: unknown) => String(v || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
-const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|sin categoria)/;
+const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|rendimientos?|sin (categoria|clasificar))/;
+const INTERNAL_CATEGORY_RE = /cuentas propias|pases? de la cuenta/;
 const JUNK_RE = /CUIT\s*30-?70308853|Encuentra nuestros canales|FechaDescripci/i;
 const RECIBIDO_RE = /^(transferencia recibida|dinero recibido|devolucion de transferencia)/;
 const PAGO_TARJETA_RE = /pago tarjeta|su pago|pago en pesos|payment/;
@@ -51,7 +53,11 @@ async function main() {
     const cat = norm(m.categoria_financiera);
     if (JUNK_RE.test(String(m.descripcion || '')) || JUNK_RE.test(String(m.comercio || ''))) { basura.push(m); continue; }
 
-    if (m.tipo === 'transferencia' && monto < 0 && cat && !NON_SPENDING_CATEGORY_RE.test(cat) && !PAGO_TARJETA_RE.test(desc)) {
+    if (m.tipo === 'gasto' && !m.tarjeta && INTERNAL_CATEGORY_RE.test(cat)) {
+      cambios.push({ m, nuevo: 'transferencia', regla: 'g) pase entre cuentas propias guardado como gasto' });
+    } else if (m.tipo === 'gasto' && !m.tarjeta && monto > 0 && /^rendimientos?/.test(cat)) {
+      cambios.push({ m, nuevo: 'ingreso', regla: 'd) rendimientos' });
+    } else if (m.tipo === 'transferencia' && monto < 0 && cat && !NON_SPENDING_CATEGORY_RE.test(cat) && !PAGO_TARJETA_RE.test(desc)) {
       cambios.push({ m, nuevo: 'gasto', regla: 'a) transferencia enviada con categoría de consumo' });
     } else if (m.tipo === 'gasto' && m.tarjeta && monto < 0) {
       cambios.push({ m, nuevo: 'devolucion', regla: 'b) línea negativa de tarjeta' });
