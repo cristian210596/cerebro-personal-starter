@@ -797,6 +797,13 @@ function parseVisaGaliciaPdfText(text: string, fileName: string): ParsedFinanceD
   });
 }
 
+// Consumos en moneda extranjera de los resúmenes Visa Galicia: la línea trae la moneda
+// original y su importe (ej "MXN 372,00") y el importe de la columna final ya está
+// convertido a dólares. Antes sólo se reconocía USD y el resto (MXN, EUR, BRL...) caía
+// en el parser de pesos, guardando montos en dólares como si fueran ARS.
+// USD sin \b porque Galicia pega el código al texto previo (ej "MTZ4JM526USD 2,99").
+const VISA_FX_CODES = 'USD|\\b(?:MXN|EUR|BRL|CLP|UYU|PYG|BOB|PEN|COP|GBP|CAD|AUD|NZD|CHF|JPY|CNY|DOP|CRC|GTQ)';
+
 function parseVisaDetailRows(text: string, referenceDate: string | null): ImportedMovement[] {
   const out: ImportedMovement[] = [];
   const seen = new Set<string>();
@@ -854,7 +861,7 @@ function parseVisaDetailRows(text: string, referenceDate: string | null): Import
   const lines = text.split(/\n+/).map(l => l.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
 
   const arsRowRe = /^(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(.+?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{5,8})\s+(-?[\d.]+,\d{2})$/;
-  const usdRowRe = /^(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(.+?USD)\s+(-?[\d.]+,\d{2})\s+(\d{5,8})\s+(-?[\d.]+,\d{2})$/i;
+  const usdRowRe = new RegExp(`^(\\d{1,2}[-\\/]\\d{1,2}[-\\/]\\d{2})\\s+(.+?(?:${VISA_FX_CODES}))\\s+(-?[\\d.]+,\\d{2})\\s+(\\d{5,8})\\s+(-?[\\d.]+,\\d{2})$`, 'i');
 
   for (const line of lines) {
     const usd = line.match(usdRowRe);
@@ -881,7 +888,7 @@ function parseVisaDetailRows(text: string, referenceDate: string | null): Import
   const globalRe = /(\d{1,2}[-\/]\d{1,2}[-\/]\d{2})\s+(?!SU\s+PAGO|TRANSFERENCIA|SALDO|TOTAL)(.{4,160}?)\s+(?:(\d{1,2}\/\d{1,2})\s+)?(\d{5,8})\s+(-?\d{1,3}(?:\.\d{3})*,\d{2}|-?\d+,\d{2})(?=\s+\d{1,2}[-\/]\d{1,2}[-\/]\d{2}\s+|\s+TARJETA\s+\d+\s+Total|\s+TOTAL\s+A\s+PAGAR|$)/gi;
   for (const m of compact.matchAll(globalRe)) {
     const before = m[2] || '';
-    const usd = before.match(/(.+?USD)\s+(-?[\d.]+,\d{2})\s*$/i);
+    const usd = before.match(new RegExp(`(.+?(?:${VISA_FX_CODES}))\\s+(-?[\\d.]+,\\d{2})\\s*$`, 'i'));
     if (usd) {
       build(m[1], `${usd[1]} ${usd[2]}`, m[3] || '', m[4], m[5], 'USD', { text: m[0], parser: 'visa_galicia_global_usd' });
     } else {
@@ -932,10 +939,12 @@ function parseVisaSignaturePdfText(text: string, fileName: string): ParsedFinanc
     if (/saldo anterior|transferencia deuda|su pago en pesos|total consumos/.test(d)) continue;
 
     let moneda = 'ARS';
-    const usd = desc.match(/^(.*?)\s*USD\s+\d[\d.]*,\d{2}$/i);
+    const usd = desc.match(new RegExp(`^(.*?)\\s*(${VISA_FX_CODES})\\s+\\d[\\d.]*,\\d{2}$`, 'i'));
     if (usd) {
+      // El importe final ya viene en dólares; para otras monedas conservamos el importe
+      // original en la descripción (ej "... MXN 372,00").
       moneda = 'USD';
-      desc = clean(usd[1]);
+      if (usd[2].toUpperCase() === 'USD') desc = clean(usd[1]);
     }
     const cuotaMatch = desc.match(/\s*Cuota\s+(\d{1,2}\/\d{1,2})$/i);
     const cuota = parseInstallment(cuotaMatch?.[1] || '');

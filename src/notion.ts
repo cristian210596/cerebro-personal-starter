@@ -338,6 +338,24 @@ export async function syncNotionImportedMovements(movements: any[]) {
   return { movimientos };
 }
 
+// Archiva (manda a la papelera de Notion) la página de un registro borrado en Supabase.
+// Devuelve true si quedó archivada o ya no existía; false si no se pudo (sin token, error
+// de red, etc.) — el llamador decide si avisar. Nunca lanza: borrar en Supabase es lo
+// importante y Notion es solo una vista.
+export async function archiveNotionPage(pageId: string | null | undefined): Promise<boolean> {
+  if (!pageId) return true;
+  const notion = getNotionClient();
+  if (!notion) return false;
+  try {
+    await notion.pages.update({ page_id: pageId, archived: true });
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'object_not_found' || error?.status === 404) return true;
+    console.warn(`No pude archivar la página de Notion ${pageId}:`, error?.message || error);
+    return false;
+  }
+}
+
 export async function setupFinanceNotionDatabases(options: { force?: boolean } = {}) {
   const notion = getNotionClient();
   if (!notion) throw new Error('Falta NOTION_TOKEN.');

@@ -20,7 +20,8 @@
     "cleanup:movimientos-basura": "tsx src/scripts/cleanupMovimientosBasura.ts",
     "productos:backfill": "tsx src/scripts/backfillProductos.ts",
     "productos:codes": "tsx src/scripts/productosCodes.ts",
-    "set:webhook": "tsx src/scripts/setWebhook.ts"
+    "set:webhook": "tsx src/scripts/setWebhook.ts",
+    "test:movements": "tsx src/scripts/testMovementEditor.ts"
   },
   "dependencies": {
     "@google/genai": "latest",

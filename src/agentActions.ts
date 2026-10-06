@@ -19,6 +19,7 @@ import { syncPendingImportedMovementsToNotion, createNotionItemPage, syncNotionD
 import { withGemini } from './geminiPool.js';
 import { config } from './config.js';
 import { downloadStorageRef } from './processingQueue.js';
+import { findMovements, updateMovement, deleteMovement } from './movementEditor.js';
 
 function isPdfOrSpreadsheet(filename: string, mimetype: string) {
   const f = (filename || '').toLowerCase();
@@ -409,6 +410,29 @@ export async function runAgentAction(action: string, params: any) {
       return { ok: true };
     }
 
+    case 'find_movements': {
+      return await findMovements({
+        query: params.query,
+        desde: params.desde,
+        hasta: params.hasta,
+        monto: params.monto,
+        categoria: params.categoria,
+        limit: params.limit
+      });
+    }
+
+    case 'update_movement': {
+      const { movimiento_id, categoria, subcategoria, comercio, entidad, guardar_alias, descripcion, monto, fecha, tipo } = params;
+      if (!movimiento_id) throw new Error('Falta movimiento_id (obtenerlo con find_movements).');
+      return await updateMovement(String(movimiento_id), { categoria, subcategoria, comercio, entidad, guardar_alias: !!guardar_alias, descripcion, monto, fecha, tipo });
+    }
+
+    case 'delete_movement': {
+      const { movimiento_id, confirmar, devolver_a_pendientes } = params;
+      if (!movimiento_id) throw new Error('Falta movimiento_id (obtenerlo con find_movements).');
+      return await deleteMovement(String(movimiento_id), { confirmar: confirmar === true, devolver_a_pendientes: devolver_a_pendientes === true });
+    }
+
     case 'save_note': {
       const { text } = params;
       if (!text) throw new Error('Falta text.');
@@ -618,6 +642,54 @@ export const AGENT_TOOLS = [
     name: 'add_manual_expense',
     description: 'Carga un gasto/ingreso/deuda contado en lenguaje natural, sin archivo (ej: "gasté 5000 en el kiosco", "me prestaron 10000 hasta fin de mes"). No usar para clasificar pendientes existentes (eso es classify_group).',
     inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }
+  },
+  {
+    name: 'find_movements',
+    description: 'Busca movimientos YA cargados (ya clasificados/impactados, no pendientes) para obtener su movimiento_id antes de corregirlos o borrarlos. Filtros combinables (al menos uno): query (texto del comercio o descripción), monto (magnitud, ±1 peso, sin importar el signo), categoria, desde/hasta (YYYY-MM-DD). Devuelve hasta 50 movimientos, más recientes primero, con id, fecha, tipo, monto, comercio, categoría, origen y si está vinculado a un importado y a Notion. Si hay más de un candidato, mostrárselos al usuario y confirmar cuál antes de modificar.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Texto a buscar en comercio/descripción (ej: "Schill")' },
+        monto: { type: 'number', description: 'Monto aproximado (magnitud)' },
+        categoria: { type: 'string' },
+        desde: { type: 'string', description: 'YYYY-MM-DD' },
+        hasta: { type: 'string', description: 'YYYY-MM-DD' },
+        limit: { type: 'number', description: 'Máximo de resultados (default 20, tope 50)' }
+      }
+    }
+  },
+  {
+    name: 'update_movement',
+    description: 'Corrige un movimiento YA cargado (no sirve para pendientes: eso es classify_group). Usar el movimiento_id de find_movements. Se pasa SOLO lo que cambia: categoria (+ subcategoria; al cambiar la categoría la subcategoría vieja se reemplaza o se limpia), comercio, entidad (nombre canónico de la persona/comercio; NO aprende alias salvo guardar_alias:true), descripcion (reemplaza), monto (magnitud: el signo se conserva), fecha (YYYY-MM-DD), tipo (gasto|ingreso|devolucion|transferencia|ajuste). Guarda en Supabase, refleja el cambio en la fila importada vinculada y sincroniza a Notion. Devuelve antes/después. Verificar con el usuario cuál es el movimiento antes de llamar.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        movimiento_id: { type: 'string', description: 'uuid de find_movements' },
+        categoria: { type: 'string' },
+        subcategoria: { type: 'string' },
+        comercio: { type: 'string' },
+        entidad: { type: 'string' },
+        guardar_alias: { type: 'boolean', description: 'Solo con entidad: recordar el texto crudo actual como alias de esa entidad' },
+        descripcion: { type: 'string' },
+        monto: { type: 'number', description: 'Magnitud positiva; el signo (gasto/ingreso) se conserva' },
+        fecha: { type: 'string', description: 'YYYY-MM-DD' },
+        tipo: { type: 'string' }
+      },
+      required: ['movimiento_id']
+    }
+  },
+  {
+    name: 'delete_movement',
+    description: 'Borra un movimiento YA cargado. Es destructivo: la primera llamada SIN confirmar:true no borra nada y devuelve una vista previa de los efectos; mostrarla al usuario y repetir con confirmar:true solo si él confirma. Archiva la página de Notion y desvincula (sin borrar) las filas importadas, comprobantes y recibos de sueldo asociados; las filas importadas quedan ignoradas, o vuelven a pendientes con devolver_a_pendientes:true (útil si el movimiento estaba mal clasificado y se quiere clasificar de nuevo). Se bloquea si el movimiento tiene deudas o particiones de gasto compartido vinculadas.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        movimiento_id: { type: 'string', description: 'uuid de find_movements' },
+        confirmar: { type: 'boolean', description: 'true solo después de que el usuario confirmó el borrado' },
+        devolver_a_pendientes: { type: 'boolean' }
+      },
+      required: ['movimiento_id']
+    }
   },
   {
     name: 'save_note',
