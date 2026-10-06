@@ -132,15 +132,19 @@ async function tryGenericFallback(buffer: Buffer, mimeType: string, filename: st
 export async function runAgentAction(action: string, params: any) {
   switch (action) {
     case 'list_pending': {
-      const groups = await getGroupedPendingImportedMovements(60);
+      const groups = await getGroupedPendingImportedMovements();
       return {
+        total_grupos: groups.length,
+        total_movimientos: groups.reduce((acc, g) => acc + g.count, 0),
         groups: groups.map((g, i) => ({
           index: i + 1,
           label: g.label,
           count: g.count,
-          total: g.total,
+          totales_por_moneda: g.totales_por_moneda,
           categoria_sugerida: g.categoria_sugerida,
-          ejemplos: g.rows.slice(0, 3).map((r: any) => ({ fecha: r.fecha_movimiento, monto: r.monto, descripcion: r.descripcion_original }))
+          subcategoria_sugerida: g.subcategoria_sugerida,
+          fuente_sugerencia: g.fuente_sugerencia,
+          ejemplos: g.rows.slice(0, 3).map((r: any) => ({ fecha: r.fecha_movimiento, monto: r.monto, moneda: r.moneda || 'ARS', descripcion: r.descripcion_original }))
         }))
       };
     }
@@ -465,7 +469,7 @@ export async function runAgentAction(action: string, params: any) {
 export const AGENT_TOOLS = [
   {
     name: 'list_pending',
-    description: 'Lista los movimientos financieros pendientes de clasificar, agrupados por comercio. Devuelve {groups:[{index,label,count,total,categoria_sugerida,ejemplos}]}. Usar antes de clasificar/ignorar para saber el index correcto, y cuando el usuario pregunta qué tiene pendiente.',
+    description: 'Lista los movimientos financieros pendientes de clasificar, agrupados por comercio. Devuelve {total_grupos,total_movimientos,groups:[{index,label,count,totales_por_moneda,categoria_sugerida,subcategoria_sugerida,fuente_sugerencia,ejemplos}]}. Agrupa por comercio normalizado (une MERPAGO*/PROPINA*/IDs de cobro). Los montos pueden venir en USD: mirar totales_por_moneda y nunca sumar monedas distintas. categoria_sugerida sale de reglas o de clasificaciones previas del mismo comercio: proponerla, no aplicarla sin confirmación. Usar antes de clasificar/ignorar para saber el index correcto, y cuando el usuario pregunta qué tiene pendiente.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
@@ -479,7 +483,7 @@ export const AGENT_TOOLS = [
         subcategoria: { type: 'string' },
         entidad: { type: 'string', description: 'Si el usuario aclaró quién/qué es el comercio, ponerlo acá' },
         detalle: { type: 'string', description: 'Detalle extra que haya dado el usuario (qué compró, para qué fue)' },
-        guardar_regla: { type: 'boolean', description: 'true si el usuario pidió recordar/guardar esta regla para el futuro' }
+        guardar_regla: { type: 'boolean', description: 'true si el usuario pidió que este comercio se clasifique SOLO en el futuro (regla automática). Sin esto igual se recuerda como sugerencia, pero no se aplica sola.' }
       },
       required: ['index', 'categoria']
     }

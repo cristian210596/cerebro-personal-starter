@@ -1780,7 +1780,17 @@ async function applyClassificationToRow(row: any, categoryText: string, saveRule
   if (error) throw error;
 
   let rule = null;
-  if (saveRule) rule = await saveCommerceRuleFromImported(updated, parsed.category, parsed.subcategory);
+  if (saveRule) {
+    rule = await saveCommerceRuleFromImported(updated, parsed.category, parsed.subcategory, true);
+  } else if (!isUselessCategory(parsed.category)) {
+    // Aprende como sugerencia (aplicar_auto=false): la próxima vez el grupo viene
+    // con categoria_sugerida, pero no se clasifica solo sin confirmación.
+    try {
+      await saveCommerceRuleFromImported(updated, parsed.category, parsed.subcategory, false);
+    } catch (suggestionError) {
+      console.error('No pude guardar la sugerencia de categoría del comercio:', suggestionError);
+    }
+  }
 
   // Si el usuario nos dijo explícitamente qué entidad es (ej: "es mercado pago"), la
   // registramos como entidad maestra y guardamos el texto crudo del resumen como alias,
@@ -1824,14 +1834,65 @@ async function applyClassificationToRow(row: any, categoryText: string, saveRule
 // clave de agrupación son deterministas (mismo criterio que merchant_key/comercio),
 // así que el mismo índice de grupo resuelve a lo mismo entre el listado y la
 // clasificación, mientras no se clasifique nada en el medio.
-export async function getGroupedPendingImportedMovements(limit = 60) {
-  const rows = await getPendingImportedMovements(limit);
-  const groups: { key: string; label: string; rows: any[]; count: number; total: number; categoria_sugerida: string | null }[] = [];
-  const byKey = new Map<string, typeof groups[number]>();
+// Se traen todos los pendientes (no solo los primeros 60): antes los más nuevos
+// quedaban fuera del listado. Todos los callers usan la misma cantidad para que
+// el índice de grupo sea estable entre listar y clasificar.
+const PENDING_GROUP_FETCH_LIMIT = 500;
+
+type PendingGroup = {
+  key: string;
+  label: string;
+  rows: any[];
+  count: number;
+  total: number;
+  totales_por_moneda: Record<string, number>;
+  categoria_sugerida: string | null;
+  subcategoria_sugerida: string | null;
+  fuente_sugerencia: 'regla' | 'historial' | 'importacion' | null;
+};
+
+// Sugerencias aprendidas: reglas de comercio (auto o solo-sugerencia) y lo que
+// el usuario ya confirmó antes para ese mismo comercio. Una consulta de cada una.
+async function loadCategorySuggestionsByGroupKey() {
+  const byRule = new Map<string, { categoria: string; subcategoria: string | null }>();
+  const byHistory = new Map<string, { categoria: string; subcategoria: string | null }>();
+
+  const { data: rules, error: rulesError } = await supabase
+    .from('finanzas_reglas_comercios')
+    .select('patron, comercio_normalizado, categoria_financiera, subcategoria_financiera, aplicar_auto, updated_at')
+    .order('updated_at', { ascending: false })
+    .limit(1000);
+  if (rulesError) console.error('No pude leer reglas para sugerencias:', rulesError);
+  for (const r of rules || []) {
+    if (isUselessCategory(r.categoria_financiera)) continue;
+    for (const k of [merchantGroupKey(r.patron), merchantGroupKey(r.comercio_normalizado)]) {
+      if (k && !byRule.has(k)) byRule.set(k, { categoria: r.categoria_financiera, subcategoria: r.subcategoria_financiera || null });
+    }
+  }
+
+  const { data: hist, error: histError } = await supabase
+    .from('finanzas_movimientos_importados')
+    .select('comercio_detectado, descripcion_original, categoria_confirmada, subcategoria_confirmada, updated_at')
+    .not('categoria_confirmada', 'is', null)
+    .order('updated_at', { ascending: false })
+    .limit(3000);
+  if (histError) console.error('No pude leer historial para sugerencias:', histError);
+  for (const h of hist || []) {
+    if (isUselessCategory(h.categoria_confirmada)) continue;
+    const k = groupKeyForRow(h);
+    if (k && !byHistory.has(k)) byHistory.set(k, { categoria: h.categoria_confirmada, subcategoria: h.subcategoria_confirmada || null });
+  }
+  return { byRule, byHistory };
+}
+
+export async function getGroupedPendingImportedMovements(limit = PENDING_GROUP_FETCH_LIMIT) {
+  const rows = await getPendingImportedMovements(Math.max(limit, PENDING_GROUP_FETCH_LIMIT));
+  const groups: PendingGroup[] = [];
+  const byKey = new Map<string, PendingGroup>();
 
   for (const row of rows) {
-    const rawKey = row.merchant_key || merchantKeyFrom(row.comercio_detectado || row.descripcion_original || '');
-    const key = rawKey && rawKey.trim().length >= 3 ? rawKey : `__row_${row.id}`;
+    const gk = groupKeyForRow(row);
+    const key = gk || `__row_${row.id}`;
     let group = byKey.get(key);
     if (!group) {
       group = {
@@ -1840,14 +1901,42 @@ export async function getGroupedPendingImportedMovements(limit = 60) {
         rows: [],
         count: 0,
         total: 0,
-        categoria_sugerida: row.categoria_sugerida || null
+        totales_por_moneda: {},
+        categoria_sugerida: isUselessCategory(row.categoria_sugerida) ? null : row.categoria_sugerida,
+        subcategoria_sugerida: isUselessCategory(row.categoria_sugerida) ? null : (row.subcategoria_sugerida || null),
+        fuente_sugerencia: isUselessCategory(row.categoria_sugerida) ? null : 'importacion'
       };
       byKey.set(key, group);
       groups.push(group);
     }
+    const monto = Number(row.monto || 0);
+    const moneda = String(row.moneda || 'ARS').toUpperCase();
     group.rows.push(row);
     group.count += 1;
-    group.total += Number(row.monto || 0);
+    group.total += monto;
+    group.totales_por_moneda[moneda] = round((group.totales_por_moneda[moneda] || 0) + monto);
+  }
+
+  if (groups.length) {
+    try {
+      const { byRule, byHistory } = await loadCategorySuggestionsByGroupKey();
+      for (const g of groups) {
+        if (g.key.startsWith('__row_')) continue;
+        const fromRule = byRule.get(g.key);
+        const fromHistory = byHistory.get(g.key);
+        if (fromRule) {
+          g.categoria_sugerida = fromRule.categoria;
+          g.subcategoria_sugerida = fromRule.subcategoria;
+          g.fuente_sugerencia = 'regla';
+        } else if (fromHistory && !g.categoria_sugerida) {
+          g.categoria_sugerida = fromHistory.categoria;
+          g.subcategoria_sugerida = fromHistory.subcategoria;
+          g.fuente_sugerencia = 'historial';
+        }
+      }
+    } catch (error) {
+      console.error('No pude calcular sugerencias de categoría para pendientes:', error);
+    }
   }
 
   return groups;
@@ -1857,7 +1946,7 @@ export function formatPendingImportedGrouped(groups: Awaited<ReturnType<typeof g
   if (!groups.length) return 'Importación financiera\n\nNo hay movimientos pendientes de clasificar.';
   const lines = ['Pendientes por clasificar (agrupados por comercio)', ''];
   groups.forEach((g, i) => {
-    const montoTxt = formatMoney(g.total, 'ARS');
+    const montoTxt = Object.entries(g.totales_por_moneda).map(([cur, val]) => formatMoney(val, cur)).join(' + ') || formatMoney(g.total, 'ARS');
     lines.push(`#${i + 1} — ${g.label} (${g.count} mov., ${montoTxt})`);
     if (g.count === 1) {
       const r = g.rows[0];
@@ -2061,11 +2150,18 @@ export async function correctLastFinanceMovementFromText(answerText: string) {
   return updated;
 }
 
-async function saveCommerceRuleFromImported(row: any, category: string, subcategory: string | null) {
-  const patron = row.merchant_key || merchantKeyFrom(row.comercio_detectado || row.descripcion_original);
+async function saveCommerceRuleFromImported(row: any, category: string, subcategory: string | null, autoApply = true) {
+  const patron = groupKeyForRow(row) || row.merchant_key || merchantKeyFrom(row.comercio_detectado || row.descripcion_original);
   if (!patron || patron.trim().length < 3) {
     console.error('No guardo regla de comercio: patrón vacío o demasiado corto.', { row_id: row?.id, comercio_detectado: row?.comercio_detectado, descripcion_original: row?.descripcion_original });
     return null;
+  }
+  if (!autoApply) {
+    // Nunca degradar una regla automática existente a solo-sugerencia.
+    const { data: existing, error: existingError } = await supabase
+      .from('finanzas_reglas_comercios').select('*').eq('patron', patron).maybeSingle();
+    if (existingError) throw existingError;
+    if (existing?.aplicar_auto) return existing;
   }
   const { data, error } = await supabase
     .from('finanzas_reglas_comercios')
@@ -2075,8 +2171,8 @@ async function saveCommerceRuleFromImported(row: any, category: string, subcateg
       categoria_financiera: category,
       subcategoria_financiera: subcategory,
       medio_pago: row.tarjeta ? `${row.tarjeta} crédito` : row.proveedor || null,
-      aplicar_auto: true,
-      confianza: 1,
+      aplicar_auto: autoApply,
+      confianza: autoApply ? 1 : 0.7,
       ejemplos: [row.descripcion_original],
       updated_at: new Date().toISOString()
     }, { onConflict: 'patron' })
@@ -2525,6 +2621,9 @@ async function loadSavedRule(row: any) {
   if (!key || key.trim().length < 3) return null;
   const { data, error } = await supabase.from('finanzas_reglas_comercios').select('*').eq('aplicar_auto', true).limit(500);
   if (error) throw error;
+  const gk = groupKeyForRow(row);
+  const exact = gk ? (data || []).find((r: any) => r.patron && merchantGroupKey(r.patron) === gk) : null;
+  if (exact) return exact;
   return (data || []).find((r: any) => r.patron && r.patron.trim().length >= 3 && (key.includes(r.patron) || r.patron.includes(key))) || null;
 }
 
@@ -2835,6 +2934,43 @@ function norm(value: any) {
 
 function normalizeMerchantText(value: string) {
   return norm(value).replace(/[^a-z0-9\s*]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Clave de agrupación/reglas más robusta que merchantKeyFrom: saca prefijos de
+// procesadores (MERPAGO*, PROPINA*, DLO*, PAYPAL*), el "K "/"F " del resumen,
+// montos "USD 20,00", IDs de cobro con dígitos (MTZ4WB4WS, in1TaL88B, cuotas) y
+// sufijos societarios, y compacta sin espacios. Así "K MACKITO SRL" y
+// "K MERPAGO*MACKITOSRL" caen en el mismo grupo, igual que cada cobro mensual
+// de Apple/Google/Anthropic aunque cambie el ID.
+const GROUP_KEY_PREFIXES = /\b(merpago|mercadopago|mercado pago|propina|dlo|paypal|payu|www)\s*\*\s*/g;
+const GROUP_KEY_STOPWORDS = new Set(['www', 'com', 'ar', 'net', 'sa', 's', 'a', 'srl', 'sas', 'saci', 'arg', 'argentina', 'subscr', 'bill', 'usd']);
+const GROUP_KEY_ALIASES: [RegExp, string][] = [
+  [/^(anthropic|claudeai)/, 'anthropic']
+];
+
+export function merchantGroupKey(value: string | null | undefined): string {
+  let t = norm(value).replace(/usd\s*[\d.,]+/g, ' ').replace(/^\*\s*/, '').replace(/^(k|f)\s+/, '');
+  let prev: string;
+  do { prev = t; t = t.replace(GROUP_KEY_PREFIXES, ' ').trim(); } while (t !== prev);
+  const tokens = t.replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(Boolean);
+  const words = tokens.filter(w => !GROUP_KEY_STOPWORDS.has(w));
+  const noIds = words.filter(w => !/\d/.test(w));
+  let key = (noIds.length ? noIds : words).join('');
+  key = key.replace(/(srl|sas|saci)$/, '').replace(/y(cia|compania)$/, 'y');
+  for (const [re, alias] of GROUP_KEY_ALIASES) {
+    if (re.test(key)) { key = alias; break; }
+  }
+  return key.length >= 3 ? key.slice(0, 80) : '';
+}
+
+function groupKeyForRow(row: any): string {
+  return merchantGroupKey(usableComercio(row?.comercio_detectado) || row?.descripcion_original || '')
+    || merchantGroupKey(row?.descripcion_original || '');
+}
+
+function isUselessCategory(value: any) {
+  const v = norm(value);
+  return !v || /^sin categor/.test(v);
 }
 
 function merchantKeyFrom(value: string) {
