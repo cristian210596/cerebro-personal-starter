@@ -450,9 +450,9 @@ export async function runAgentAction(action: string, params: any) {
     }
 
     case 'update_movement': {
-      const { movimiento_id, categoria, subcategoria, comercio, entidad, guardar_alias, descripcion, monto, fecha, tipo } = params;
+      const { movimiento_id, categoria, subcategoria, comercio, entidad, guardar_alias, descripcion, monto, fecha, tipo, moneda } = params;
       if (!movimiento_id) throw new Error('Falta movimiento_id (obtenerlo con find_movements).');
-      return await updateMovement(String(movimiento_id), { categoria, subcategoria, comercio, entidad, guardar_alias: !!guardar_alias, descripcion, monto, fecha, tipo });
+      return await updateMovement(String(movimiento_id), { categoria, subcategoria, comercio, entidad, guardar_alias: !!guardar_alias, descripcion, monto, fecha, tipo, moneda });
     }
 
     case 'delete_movement': {
@@ -694,7 +694,7 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'update_movement',
-    description: 'Corrige un movimiento YA cargado (no sirve para pendientes: eso es classify_group). Usar el movimiento_id de find_movements. Se pasa SOLO lo que cambia: categoria (+ subcategoria; al cambiar la categoría la subcategoría vieja se reemplaza o se limpia), comercio, entidad (nombre canónico de la persona/comercio; NO aprende alias salvo guardar_alias:true), descripcion (reemplaza), monto (magnitud: el signo se conserva), fecha (YYYY-MM-DD), tipo (gasto|ingreso|devolucion|transferencia|ajuste). Guarda en Supabase, refleja el cambio en la fila importada vinculada y sincroniza a Notion. Devuelve antes/después. Verificar con el usuario cuál es el movimiento antes de llamar.',
+    description: 'Corrige un movimiento YA cargado (no sirve para pendientes: eso es classify_group). Usar el movimiento_id de find_movements. Se pasa SOLO lo que cambia: categoria (+ subcategoria; al cambiar la categoría la subcategoría vieja se reemplaza o se limpia), comercio, entidad (nombre canónico de la persona/comercio; NO aprende alias salvo guardar_alias:true), descripcion (reemplaza), monto (magnitud: el signo se conserva), fecha (YYYY-MM-DD), tipo (gasto|ingreso|devolucion|transferencia|ajuste), moneda (ARS|USD|…). Guarda en Supabase, refleja el cambio en la fila importada vinculada y sincroniza a Notion. Devuelve antes/después. Verificar con el usuario cuál es el movimiento antes de llamar.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -707,7 +707,8 @@ export const AGENT_TOOLS = [
         descripcion: { type: 'string' },
         monto: { type: 'number', description: 'Magnitud positiva; el signo (gasto/ingreso) se conserva' },
         fecha: { type: 'string', description: 'YYYY-MM-DD' },
-        tipo: { type: 'string' }
+        tipo: { type: 'string' },
+        moneda: { type: 'string', description: 'Código ISO (ARS, USD, EUR)' }
       },
       required: ['movimiento_id']
     }

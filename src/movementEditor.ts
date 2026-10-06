@@ -24,6 +24,8 @@ export type MovementEditInput = {
   monto?: number | string | null;
   fecha?: string | null;
   tipo?: string | null;
+  // Código ISO de moneda (ARS, USD, EUR…). Corrige consumos en dólares cargados como pesos.
+  moneda?: string | null;
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -120,6 +122,12 @@ export function buildMovementPatch(current: any, input: MovementEditInput) {
     const tipo = String(input.tipo).trim().toLowerCase();
     if (!(MOVEMENT_TYPES as readonly string[]).includes(tipo)) throw new Error(`tipo inválido. Valores aceptados: ${MOVEMENT_TYPES.join(', ')}.`);
     setField('tipo', tipo, 'tipo');
+  }
+
+  if (input.moneda != null) {
+    const moneda = String(input.moneda).trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(moneda)) throw new Error('moneda inválida: usar código de 3 letras (ARS, USD, EUR…).');
+    if (setField('moneda', moneda, 'moneda')) imported.moneda = moneda;
   }
 
   if (input.monto != null) {
