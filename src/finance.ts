@@ -508,8 +508,9 @@ export async function getFinanceSummary() {
   if (debtError) throw debtError;
 
   const rows = movements || [];
-  const gastos = rows.filter((m: any) => m.tipo === 'gasto').reduce((a: number, m: any) => a + Number(m.monto || 0), 0);
-  const ingresos = rows.filter((m: any) => ['ingreso','devolucion'].includes(m.tipo)).reduce((a: number, m: any) => a + Number(m.monto || 0), 0);
+  // Signos históricos mixtos (tarjeta/manual en positivo, Mercado Pago en negativo): se suma por tipo en valor absoluto.
+  const gastos = rows.filter((m: any) => m.tipo === 'gasto').reduce((a: number, m: any) => a + Math.abs(Number(m.monto || 0)), 0);
+  const ingresos = rows.filter((m: any) => ['ingreso','devolucion'].includes(m.tipo)).reduce((a: number, m: any) => a + Math.abs(Number(m.monto || 0)), 0);
   const byCategory = groupMoney(rows.filter((m: any) => m.tipo === 'gasto'), 'categoria_financiera');
   const byPayment = groupMoney(rows.filter((m: any) => m.tipo === 'gasto'), 'medio_pago');
   const meDeben = (debts || []).filter((d: any) => d.tipo === 'me_debe').reduce((a: number, d: any) => a + Number(d.saldo_pendiente || 0), 0);
@@ -761,7 +762,7 @@ function groupMoney(rows: any[], key: string) {
   const map = new Map<string, number>();
   for (const row of rows) {
     const label = row[key] || 'Sin clasificar';
-    map.set(label, (map.get(label) || 0) + Number(row.monto || 0));
+    map.set(label, (map.get(label) || 0) + Math.abs(Number(row.monto || 0)));
   }
   return [...map.entries()]
     .map(([label, amount]) => ({ label, amount }))

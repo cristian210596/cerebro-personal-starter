@@ -161,9 +161,25 @@ export async function runAgentAction(action: string, params: any) {
       const { index, categoria, subcategoria, entidad, detalle, guardar_regla } = params;
       if (!index || !categoria) throw new Error('Faltan index y/o categoria.');
       const categoryText = subcategoria ? `${categoria} / ${subcategoria}` : String(categoria);
-      const result = await classifyGroupByIndex(Number(index), categoryText, !!guardar_regla, entidad || null, detalle || null);
-      const notion = await syncPendingImportedMovementsToNotion();
-      return { ...result, notion };
+      // Vercel corta a 60s: clasificamos hasta ~35s y sincronizamos Notion hasta ~52s. Si quedan
+      // filas (grupos grandes), el grupo sigue pendiente y se vuelve a llamar con list_pending + classify_group.
+      const startedAt = Date.now();
+      const result: any = await classifyGroupByIndex(Number(index), categoryText, !!guardar_regla, entidad || null, detalle || null, { deadlineMs: startedAt + 35_000 });
+      const notion = await syncPendingImportedMovementsToNotion({ deadlineMs: startedAt + 52_000 });
+      const results: any[] = Array.isArray(result?.results) ? result.results : [];
+      const fallidos = results.filter((r: any) => r && r.ok === false).slice(0, 5).map((r: any) => r.error || r.message || 'error');
+      const restantes = Number(result?.restantes || 0);
+      return {
+        ok: result?.ok,
+        message: result?.message,
+        label: result?.label,
+        categoria: categoryText,
+        procesados: result?.procesados ?? results.length,
+        restantes,
+        fallidos,
+        notion,
+        aviso: restantes > 0 ? `Quedaron ${restantes} movimientos del grupo sin procesar por límite de tiempo. Llamar list_pending y volver a clasificar el mismo grupo (los índices pueden cambiar).` : undefined
+      };
     }
 
     case 'ignore_group': {

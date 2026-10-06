@@ -307,26 +307,31 @@ export async function syncNotionFinanceResult(result: any) {
   return { movimientos, deudas, particiones };
 }
 
-export async function syncPendingImportedMovementsToNotion(): Promise<{ ok: boolean; synced: number; total: number; error?: string }> {
+// opts.deadlineMs: corte duro (epoch ms). En requests HTTP (MCP/agente) se pasa para no pasar el
+// límite de Vercel; lo que quede sin sincronizar se toma en la próxima corrida (sigue sin notion_page_id).
+export async function syncPendingImportedMovementsToNotion(opts: { deadlineMs?: number } = {}): Promise<{ ok: boolean; synced: number; total: number; restantes?: number; error?: string }> {
   try {
     const pending = await getUnsyncedImportedMovements();
     if (!pending.length) return { ok: true, synced: 0, total: 0 };
     if (!getNotionClient()) return { ok: false, synced: 0, total: pending.length, error: 'NOTION_TOKEN no configurado' };
-    const result = await syncNotionImportedMovements(pending);
-    return { ok: true, synced: result.movimientos, total: pending.length };
+    const result = await syncNotionImportedMovements(pending, opts);
+    return { ok: true, synced: result.movimientos, total: pending.length, restantes: Math.max(0, pending.length - result.procesados) };
   } catch (error: any) {
     console.error('No se pudo sincronizar movimientos importados pendientes a Notion:', error);
     return { ok: false, synced: 0, total: 0, error: error?.message || 'error desconocido' };
   }
 }
 
-export async function syncNotionImportedMovements(movements: any[]) {
+export async function syncNotionImportedMovements(movements: any[], opts: { deadlineMs?: number } = {}) {
   const notion = getNotionClient();
-  if (!notion || !Array.isArray(movements) || !movements.length) return { movimientos: 0 };
+  if (!notion || !Array.isArray(movements) || !movements.length) return { movimientos: 0, procesados: 0 };
 
   const dbs = await ensureFinanceDatabases(notion);
   let movimientos = 0;
+  let procesados = 0;
   for (const row of movements) {
+    if (opts.deadlineMs && Date.now() > opts.deadlineMs) break;
+    procesados += 1;
     if (!row?.id) continue;
     try {
       const pageId = await createOrUpdateNotionMovimiento(notion, dbs.finanzasMovimientosDatabaseId, row);
@@ -335,7 +340,7 @@ export async function syncNotionImportedMovements(movements: any[]) {
       console.error('No se pudo sincronizar movimiento importado a Notion:', error);
     }
   }
-  return { movimientos };
+  return { movimientos, procesados };
 }
 
 // Archiva (manda a la papelera de Notion) la página de un registro borrado en Supabase.

@@ -36,23 +36,33 @@ export async function buildFinanceDashboardData(): Promise<FinanceDashboardData>
   const porMes = new Map<string, { entradas: number; salidas: number }>();
 
   for (const row of rows) {
-    const monto = Number(row.monto || 0);
+    const montoRaw = Number(row.monto || 0);
+    const tipo = String(row.tipo || '').toLowerCase();
     const mes = String(row.fecha_movimiento || '').slice(0, 7);
     if (!mes) continue;
+    // Los pagos de tarjeta no son flujo nuevo: el consumo ya se contó al comprar.
+    if (tipo === 'pago_tarjeta') continue;
 
+    const monto = signedAmount(tipo, montoRaw);
     if (!porMes.has(mes)) porMes.set(mes, { entradas: 0, salidas: 0 });
     const bucket = porMes.get(mes)!;
     if (monto >= 0) bucket.entradas += monto; else bucket.salidas += monto;
 
-    if (row.tipo === 'gasto') {
-      const cat = row.categoria_financiera || 'Otros';
-      catHistorico.set(cat, (catHistorico.get(cat) || 0) + Math.abs(monto));
+    // Gasto por categoría: gastos (cualquier signo guardado), transferencias enviadas con categoría
+    // de consumo (ej. pagar el kiosco por transferencia) y devoluciones restando.
+    const cat = row.categoria_financiera || 'Otros';
+    let gasto = 0;
+    if (tipo === 'gasto') gasto = Math.abs(montoRaw);
+    else if (tipo === 'devolucion') gasto = -Math.abs(montoRaw);
+    else if (tipo === 'transferencia' && montoRaw < 0 && isSpendingCategory(row.categoria_financiera)) gasto = Math.abs(montoRaw);
+    if (gasto !== 0) {
+      catHistorico.set(cat, (catHistorico.get(cat) || 0) + gasto);
       if (mes === mesActual) {
-        catEsteMes.set(cat, (catEsteMes.get(cat) || 0) + Math.abs(monto));
-        gastadoEsteMes += Math.abs(monto);
+        catEsteMes.set(cat, (catEsteMes.get(cat) || 0) + gasto);
+        gastadoEsteMes += gasto;
       }
     }
-    if (mes === mesActual && monto > 0) ingresosEsteMes += monto;
+    if (mes === mesActual && monto > 0 && tipo !== 'devolucion') ingresosEsteMes += monto;
   }
 
   const meses = [...porMes.keys()].sort();
@@ -65,7 +75,7 @@ export async function buildFinanceDashboardData(): Promise<FinanceDashboardData>
   });
 
   const toSortedArray = (m: Map<string, number>) =>
-    [...m.entries()].map(([categoria, total]) => ({ categoria, total })).sort((a, b) => b.total - a.total);
+    [...m.entries()].filter(([, total]) => total > 0).map(([categoria, total]) => ({ categoria, total })).sort((a, b) => b.total - a.total);
 
   const ultimosMovimientos = rows.slice(-15).reverse().map(r => ({
     fecha: r.fecha_movimiento,
@@ -86,4 +96,18 @@ export async function buildFinanceDashboardData(): Promise<FinanceDashboardData>
     serieMensual,
     ultimosMovimientos
   };
+}
+
+// Convención histórica mixta: tarjetas y gastos manuales se guardan en positivo, Mercado Pago en
+// negativo. Para el flujo de caja se normaliza por tipo; transferencias/ajustes respetan el signo.
+function signedAmount(tipo: string, monto: number): number {
+  if (tipo === 'gasto') return -Math.abs(monto);
+  if (tipo === 'ingreso' || tipo === 'devolucion') return Math.abs(monto);
+  return monto;
+}
+
+const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|sin categoria)/;
+function isSpendingCategory(categoria: string | null | undefined): boolean {
+  const c = String(categoria || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+  return !!c && !NON_SPENDING_CATEGORY_RE.test(c);
 }

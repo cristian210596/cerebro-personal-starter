@@ -1040,11 +1040,16 @@ function parseMercadoPagoDetailRows(text: string): ImportedMovement[] {
   // Cada fila, tal como la deja pdf-parse, queda como:
   // "DD-MM-YYYY\n<descripción, 1 o 2 líneas>\n<id operación>$ <valor>$ <saldo>"
   // Sin espacio entre el id y el primer "$", ni entre el valor y el segundo "$".
-  const re = /(\d{2}-\d{2}-\d{4})\n([\s\S]+?)\n(\d{6,15})\$\s*(-?[\d.]+,\d{2})\$\s*([\d.]+,\d{2})/g;
+  // La descripción no puede contener otra fecha DD-MM-YYYY: si no, una fecha del encabezado
+  // de página ("generado el ...") arrancaba el match y se tragaba todo el encabezado hasta la
+  // fila real (filas basura "Mercado Libre S.R.L. CUIT ..." con fecha equivocada).
+  const re = /(\d{2}-\d{2}-\d{4})\n((?:(?!\d{2}-\d{2}-\d{4})[\s\S])+?)\n(\d{6,15})\$\s*(-?[\d.]+,\d{2})\$\s*([\d.]+,\d{2})/g;
 
   for (const m of text.matchAll(re)) {
     const desc = clean(m[2].replace(/\s+/g, ' '));
     if (!desc) continue;
+    // Defensa extra: una fila real nunca trae el pie/encabezado legal de Mercado Libre.
+    if (/CUIT\s*30-?70308853|Encuentra nuestros canales|FechaDescripci/i.test(desc)) continue;
     const fecha = normalizeDate(m[1]);
     const comprobante = clean(m[3]) || null;
     const monto = parseAmountLoose(m[4]);
@@ -1533,7 +1538,7 @@ async function createMovementFromImported(row: any) {
     .from('finanzas_movimientos')
     .insert({
       fecha_movimiento: row.fecha_movimiento || new Date().toISOString().slice(0, 10),
-      tipo: mapImportedTypeToMovementType(row.tipo),
+      tipo: resolveMovementTypeForImported(row, categoria),
       monto: Number(row.monto || 0),
       moneda: row.moneda || 'ARS',
       descripcion: row.descripcion_original,
@@ -1959,17 +1964,22 @@ export function formatPendingImportedGrouped(groups: Awaited<ReturnType<typeof g
   return lines.join('\n');
 }
 
-export async function classifyGroupByIndex(groupIndex: number, categoryText: string, saveRule: boolean, entidadNombre?: string | null, detalle?: string | null) {
+// deadlineMs (timestamp absoluto, opcional): si se alcanza, se corta antes de terminar el
+// grupo y se informa cuántos quedaron (siguen pendientes en el mismo grupo). Evita que un
+// grupo grande (ej 100 transferencias) supere el límite de Vercel y devuelva 502 a mitad.
+export async function classifyGroupByIndex(groupIndex: number, categoryText: string, saveRule: boolean, entidadNombre?: string | null, detalle?: string | null, opts?: { deadlineMs?: number }) {
   const groups = await getGroupedPendingImportedMovements(60);
   const group = groups[groupIndex - 1];
   if (!group) return { ok: false as const, message: `No encontré el grupo #${groupIndex}. Usá /importacion revisar.` };
 
   const results: Awaited<ReturnType<typeof applyClassificationToRow>>[] = [];
   for (const row of group.rows) {
+    if (opts?.deadlineMs && Date.now() > opts.deadlineMs) break;
     results.push(await applyClassificationToRow(row, categoryText, saveRule, entidadNombre, detalle));
   }
   const ok = results.every(r => r.ok);
-  return { ok, label: group.label, count: group.count, results };
+  const restantes = group.rows.length - results.length;
+  return { ok, label: group.label, count: group.count, results, procesados: results.length, restantes };
 }
 
 // Igual que classifyGroupByIndex pero interpretando la respuesta en lenguaje natural
@@ -1991,7 +2001,7 @@ export async function classifyGroupFromAnswer(groupIndex: number, answerText: st
     results.push(await applyClassificationToRow(row, categoryText, false, interpreted?.entidad_nombre || null, interpreted?.detalle || null));
   }
   const ok = results.every(r => r.ok);
-  return { ok, label: group.label, count: group.count, results };
+  return { ok, label: group.label, count: group.count, results, procesados: results.length, restantes: group.rows.length - results.length };
 }
 
 export function formatClassifyGroupResult(result: Awaited<ReturnType<typeof classifyGroupByIndex>>) {
@@ -2001,7 +2011,7 @@ export function formatClassifyGroupResult(result: Awaited<ReturnType<typeof clas
   const lines = [
     `Grupo clasificado: ${result.label}`,
     '',
-    `Movimientos actualizados: ${result.count}`,
+    `Movimientos actualizados: ${result.procesados}${result.restantes ? ` de ${result.count} (faltan ${result.restantes}, repetí el comando)` : ''}`,
     `Categoría: ${categoria}`
   ];
   const failed = result.results.filter(r => !r.ok);
@@ -2750,10 +2760,35 @@ function isPdfLike(fileName: string, mimeType: string) {
 function normalizeMovementType(type: any, desc: string) {
   const t = norm([type, desc].join(' '));
   if (/pago tarjeta|su pago|pago en pesos|payment/.test(t)) return 'pago_tarjeta';
-  if (/interes|interés|iva|iibb|sellos|rg\s*5617|cargo|comision|comisión|impuesto/.test(t)) return 'cargo_financiero';
+  // Con límites de palabra: antes "Transferencia recibida Luis Ivan Rios" matcheaba "iva"
+  // y la plata recibida se cargaba como cargo financiero (gasto).
+  if (/\b(interes(es)?|iva|iibb|sellos|rg\s*5617|cargos?|comision(es)?|impuestos?)\b/.test(t)) return 'cargo_financiero';
   if (/devolucion|devolución|reintegro/.test(t)) return 'devolucion';
-  if (/transferencia/.test(t)) return 'transferencia';
+  if (/transferencia|dinero recibido/.test(t)) return 'transferencia';
+  // Antes un tipo "ingreso" (Gemini) o "Rendimientos" caía en "gasto".
+  if (/^ingreso\b/.test(norm(type)) || /\brendimientos?\b/.test(t)) return 'ingreso';
   return 'gasto';
+}
+
+// Categorías que NO son consumo: una transferencia enviada con estas categorías sigue
+// siendo "transferencia" (no suma como gasto en reportes ni en el panel).
+const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|sin categoria)/;
+
+// Tipo final del movimiento creado a partir de una fila importada:
+// - Línea negativa en un resumen de TARJETA = anulación/reintegro → "devolucion" (antes quedaba
+//   "gasto" y el panel, que usa valor absoluto, la sumaba como un gasto más).
+// - Transferencia ENVIADA que el usuario clasificó como consumo (kiosco, carnicería, regalo…)
+//   → "gasto". Antes quedaba "transferencia" y no aparecía en gastos por categoría.
+export function resolveMovementTypeForImported(row: any, categoria: string | null | undefined) {
+  const base = mapImportedTypeToMovementType(row?.tipo);
+  const monto = Number(row?.monto || 0);
+  const tipoImportado = norm(row?.tipo);
+  if (row?.tarjeta && base === 'gasto' && monto < 0) return 'devolucion';
+  if (base === 'transferencia' && monto < 0 && !tipoImportado.includes('pago_tarjeta')) {
+    const cat = norm(categoria || '');
+    if (cat && !NON_SPENDING_CATEGORY_RE.test(cat)) return 'gasto';
+  }
+  return base;
 }
 
 function mapImportedTypeToMovementType(type: string) {
@@ -2761,6 +2796,7 @@ function mapImportedTypeToMovementType(type: string) {
   if (t.includes('pago_tarjeta')) return 'transferencia';
   if (t.includes('devolucion')) return 'devolucion';
   if (t.includes('transferencia')) return 'transferencia';
+  if (t.includes('ingreso')) return 'ingreso';
   return 'gasto';
 }
 
@@ -2838,9 +2874,22 @@ function parseInstallment(value: string) {
   return { current: m ? Number(m[1]) : null, total: m ? Number(m[2]) : null };
 }
 
+const COMPOUND_CATEGORIES = ['Deudas / compartidos'];
+
 function parseCategoryAndSubcategory(text: string) {
   let s = text.replace(/guardar regla|siempre|recordar/gi, '').trim();
   s = s.replace(/^como\s+/i, '').trim();
+  // Categorías cuyo nombre ya trae "/" (ej "Deudas / compartidos"): antes se cortaba en la
+  // primera barra y la subcategoría real se perdía ("Deudas / compartidos / Crédito MP"
+  // quedaba con subcategoría "compartidos").
+  const ns = norm(s);
+  for (const compound of COMPOUND_CATEGORIES) {
+    const nc = norm(compound);
+    if (ns === nc || ns.startsWith(`${nc} `) || ns.startsWith(`${nc}/`) || ns.startsWith(`${nc}>`) || ns.startsWith(`${nc}|`)) {
+      const rest = clean(s.slice(compound.length).replace(/^\s*[/>|]\s*/, ''));
+      return { category: compound, subcategory: rest || null };
+    }
+  }
   const parts = s.split(/[/>|]/).map(x => clean(x)).filter(Boolean);
   return { category: normalizeCategory(parts[0]), subcategory: parts[1] || null };
 }
