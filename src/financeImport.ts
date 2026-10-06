@@ -1456,10 +1456,46 @@ function fixStatementYear(fecha: string | null, ref: string | null): string | nu
   return fecha;
 }
 
+// El mismo resumen de tarjeta puede entrar dos veces por caminos distintos (PDF subido a mano,
+// adjunto de Gmail, texto) con distinto archivo_hash: como el external_hash incluye la
+// importación, no chocaba y se duplicaban todos los consumos (pasó con mayo y julio 2026).
+// Un consumo de tarjeta es el mismo si coincide tarjeta + fecha + monto + moneda + cuota y
+// además el comprobante (si ambos lo tienen) o el comercio normalizado.
+export async function findCrossImportDuplicate(row: any): Promise<any | null> {
+  if (!row?.tarjeta || !row?.fecha_movimiento || row?.monto == null) return null;
+  const { data, error } = await supabase
+    .from('finanzas_movimientos_importados')
+    .select('id, importacion_id, descripcion_original, comercio_detectado, comprobante, cuota_actual, estado, movimiento_id')
+    .eq('tarjeta', row.tarjeta)
+    .eq('fecha_movimiento', row.fecha_movimiento)
+    .eq('monto', row.monto)
+    .eq('moneda', row.moneda || 'ARS')
+    .neq('importacion_id', row.importacion_id)
+    .neq('estado', 'ignorado')
+    .limit(20);
+  if (error) { console.warn('No pude chequear duplicados entre importaciones:', error.message); return null; }
+  const key = groupKeyForRow(row);
+  const comp = clean(row.comprobante);
+  return (data || []).find((other: any) => {
+    if ((other.cuota_actual ?? null) !== (row.cuota_actual ?? null)) return false;
+    const otherComp = clean(other.comprobante);
+    if (comp && otherComp) return comp === otherComp;
+    return !!key && groupKeyForRow(other) === key;
+  }) || null;
+}
+
 async function insertImportedRows(rows: any[]) {
   if (!rows.length) return [];
   const inserted: any[] = [];
   for (const row of rows) {
+    const { data: sameHash } = await supabase.from('finanzas_movimientos_importados').select('id').eq('external_hash', row.external_hash).limit(1).maybeSingle();
+    if (!sameHash) {
+      const dup = await findCrossImportDuplicate(row);
+      if (dup) {
+        row.estado = 'ignorado';
+        row.raw_json = { ...(row.raw_json || {}), duplicado_de: dup.id, motivo: 'mismo consumo ya importado en otra importación' };
+      }
+    }
     const { data, error } = await supabase
       .from('finanzas_movimientos_importados')
       .upsert(row, { onConflict: 'external_hash' })
@@ -2655,6 +2691,8 @@ async function applySavedRule(row: any) {
 async function applyRulesToInsertedRows(rows: any[]) {
   const out: any[] = [];
   for (const row of rows) {
+    // Duplicados detectados al insertar: no se reclasifican (la regla los pasaría a "clasificado").
+    if (row?.estado === 'ignorado') { out.push(row); continue; }
     const patched = await applySavedRule(row);
     if (patched !== row || patched.regla_id) {
       const { data, error } = await supabase.from('finanzas_movimientos_importados').update({
@@ -3034,7 +3072,7 @@ export function merchantGroupKey(value: string | null | undefined): string {
   return `${direction}${key}`.slice(0, 80);
 }
 
-function groupKeyForRow(row: any): string {
+export function groupKeyForRow(row: any): string {
   return merchantGroupKey(usableComercio(row?.comercio_detectado) || row?.descripcion_original || '')
     || merchantGroupKey(row?.descripcion_original || '');
 }

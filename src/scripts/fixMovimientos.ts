@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import { supabase } from '../supabaseClient.js';
 import { getNotionClient, syncNotionImportedMovements } from '../notion.js';
+import { deleteMovement } from '../movementEditor.js';
+import { groupKeyForRow } from '../financeImport.js';
 
 // V00 — Corrige el "tipo" de movimientos ya cargados con la lógica nueva y limpia basura del
 // parser de PDFs de Mercado Pago. NO toca montos ni signos (el hash de importación usa el monto).
@@ -12,13 +14,17 @@ import { getNotionClient, syncNotionImportedMovements } from '../notion.js';
 //  e) Basura del PDF de MP (pie "Mercado Libre S.R.L. CUIT 30-70308853…")   -> se borra el movimiento
 //     y la fila importada (también las pendientes) queda "ignorado"
 //  g) Pase entre cuentas propias (categoría) guardado como gasto       -> tipo transferencia
-//  f) Posibles duplicados (misma fecha, monto, moneda, tarjeta y descripción en importaciones
-//     distintas) -> SOLO se informan, no se borran.
+//  f) Duplicados de TARJETA entre importaciones distintas (mismo resumen importado dos veces):
+//     misma tarjeta + fecha + monto + moneda + cuota y mismo comprobante (o mismo comercio
+//     normalizado si falta comprobante). Se informan; con --dedupe se borra la copia más nueva
+//     (las filas importadas quedan ignoradas; se saltean las que tienen deudas/particiones).
 //
 // Uso:  npm run fix:movimientos              -> muestra qué haría (no escribe)
 //       npm run fix:movimientos -- --apply   -> aplica y re-sincroniza Notion
+//       npm run fix:movimientos -- --apply --dedupe   -> además borra los duplicados f)
 
 const APPLY = process.argv.includes('--apply');
+const DEDUPE = process.argv.includes('--dedupe');
 const norm = (v: unknown) => String(v || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
 const NON_SPENDING_CATEGORY_RE = /^(transferencias?|deudas \/ compartidos|ingresos?|ingreso laboral|inversion(es)?|ahorro|rendimientos?|sin (categoria|clasificar))/;
 const INTERNAL_CATEGORY_RE = /cuentas propias|pases? de la cuenta/;
@@ -81,16 +87,34 @@ async function main() {
     .filter(r => JUNK_RE.test(String(r.descripcion_original || '')) || JUNK_RE.test(String(r.comercio_detectado || '')));
   console.log(`   Filas importadas pendientes con esa basura (pasan a ignorado): ${pendientesBasura.length}`);
 
-  // f) duplicados
+  // f) duplicados de tarjeta entre importaciones
   const byKey = new Map<string, any[]>();
   for (const m of movs) {
-    if (m.origen !== 'importacion' || !m.importacion_id) continue;
-    const k = [m.fecha_movimiento, Number(m.monto).toFixed(2), m.moneda || 'ARS', m.tarjeta || '', norm(String(m.descripcion || '').split(' [importado:')[0])].join('|');
+    if (!m.tarjeta || !m.importacion_id) continue;
+    const k = [m.tarjeta, m.fecha_movimiento, Number(m.monto).toFixed(2), m.moneda || 'ARS', m.cuota_actual ?? ''].join('|');
     byKey.set(k, [...(byKey.get(k) || []), m]);
   }
-  const dups = [...byKey.values()].filter(g => new Set(g.map(m => m.importacion_id)).size > 1);
-  console.log(`\nf) Posibles duplicados entre importaciones distintas (solo informe): ${dups.length}`);
-  for (const g of dups) { console.log('  *'); for (const m of g) console.log(`    - ${fmt(m)} | importacion ${m.importacion_id}`); }
+  const borrarDup: any[] = [];
+  let gruposDup = 0;
+  for (const g of byKey.values()) {
+    if (new Set(g.map(m => m.importacion_id)).size < 2) continue;
+    const sorted = [...g].sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    const keep: any[] = [];
+    const dupsHere: any[] = [];
+    for (const m of sorted) {
+      const twin = keep.find(k => k.importacion_id !== m.importacion_id && (
+        (k.comprobante && m.comprobante) ? String(k.comprobante).trim() === String(m.comprobante).trim()
+          : groupKeyForRow({ comercio_detectado: k.comercio, descripcion_original: k.descripcion }) === groupKeyForRow({ comercio_detectado: m.comercio, descripcion_original: m.descripcion })));
+      if (twin) dupsHere.push({ m, twin }); else keep.push(m);
+    }
+    if (!dupsHere.length) continue;
+    gruposDup += 1;
+    for (const d of dupsHere) {
+      console.log(`  - DUP ${fmt(d.m)} | comp ${d.m.comprobante || '-'}  == ${d.twin.id} (comp ${d.twin.comprobante || '-'})`);
+      borrarDup.push(d.m);
+    }
+  }
+  console.log(`\nf) Duplicados de tarjeta entre importaciones: ${borrarDup.length} copias en ${gruposDup} grupos${DEDUPE ? ' (se borran con --apply --dedupe)' : ' (solo informe; usar --apply --dedupe para borrar)'}`);
 
   if (!APPLY) { console.log('\nNada se escribió. Para aplicar: npm run fix:movimientos -- --apply'); return; }
 
@@ -117,7 +141,16 @@ async function main() {
   for (const r of pendientesBasura) {
     await supabase.from('finanzas_movimientos_importados').update({ estado: 'ignorado', updated_at: now() }).eq('id', r.id);
   }
-  console.log(`\nListo: ${okTipos}/${cambios.length} tipos corregidos, ${okBasura}/${basura.length} movimientos basura borrados, ${pendientesBasura.length} pendientes basura ignorados.`);
+  let okDup = 0;
+  if (DEDUPE) {
+    for (const m of borrarDup) {
+      try {
+        const r: any = await deleteMovement(m.id, { confirmar: true, devolver_a_pendientes: false });
+        if (r?.ok) okDup += 1; else console.warn(`No borré ${m.id}:`, r?.texto || r?.message || 'bloqueado');
+      } catch (e) { console.warn(`No pude borrar ${m.id}:`, (e as any)?.message); }
+    }
+  }
+  console.log(`\nListo: ${okTipos}/${cambios.length} tipos corregidos, ${okBasura}/${basura.length} movimientos basura borrados, ${pendientesBasura.length} pendientes basura ignorados, ${okDup} duplicados borrados.`);
 }
 
 main().catch(err => { console.error('Error:', err); process.exit(1); });
