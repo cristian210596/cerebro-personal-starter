@@ -9,7 +9,7 @@ import {
   spendingReport
 } from './financeImport.js';
 import { unifiedSearch } from './chatPro.js';
-import { summarizeSalaryFromText, importSalaryReceiptFromFile, formatSalaryImportResult, looksLikeSalaryFile } from './salary.js';
+import { summarizeSalaryFromText, importSalaryReceiptFromFile, formatSalaryImportResult, looksLikeSalaryFile, importSalaryReceiptFromData } from './salary.js';
 import { buildFinanceDashboardData } from './financeDashboardData.js';
 import { importComprobanteFromFile, importComprobanteFromParsedData, formatComprobanteImportResult, looksLikeComprobanteFile } from './comprobantes.js';
 import { saveFinanceFromText, formatFinanceSaved } from './finance.js';
@@ -351,6 +351,12 @@ export async function runAgentAction(action: string, params: any) {
       };
     }
 
+    case 'import_salary_data': {
+      // Recibo de sueldo ya leído por Claude: sin Gemini y sin base64 (los archivos grandes
+      // por base64 llegaban corruptos). Guarda en Supabase y sincroniza a Notion.
+      return await importSalaryReceiptFromData(params as any);
+    }
+
     case 'analyze_unknown_document': {
       const { file_base64, filename, mimetype, caption } = params;
       if (!file_base64 || !filename) throw new Error('Faltan file_base64 y/o filename.');
@@ -605,6 +611,50 @@ export const AGENT_TOOLS = [
         caption: { type: 'string' }
       },
       required: ['file_base64', 'filename']
+    }
+  },
+  {
+    name: 'import_salary_data',
+    description: 'Carga un recibo de sueldo que VOS ya leíste (PDF, foto o captura), sin pasar el archivo. Usar SIEMPRE para recibos de sueldo en vez de import_document: es más confiable. Guarda el recibo con todos sus conceptos, crea el ingreso (neto) en finanzas y lo sincroniza a Notion. Valida haberes - retenciones + no remunerativo = neto (si no cierra no guarda, salvo forzar:true). Si ya hay un recibo del mismo período y empresa (por ejemplo uno mal leído), usar reemplazar:true. No inventar datos: si algo no se lee, omitirlo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        empresa: { type: 'string' },
+        empleado: { type: 'string' },
+        legajo: { type: 'string' },
+        cuil: { type: 'string' },
+        periodo: { type: 'string', description: 'Período abonado YYYY-MM' },
+        fecha_pago: { type: 'string', description: 'YYYY-MM-DD' },
+        fecha_ingreso: { type: 'string', description: 'YYYY-MM-DD' },
+        categoria: { type: 'string' },
+        contratacion: { type: 'string' },
+        total_bruto: { type: 'number' },
+        total_neto: { type: 'number' },
+        total_haberes: { type: 'number' },
+        total_retenciones: { type: 'number' },
+        total_no_remunerativo: { type: 'number' },
+        moneda: { type: 'string', description: 'ARS por defecto' },
+        conceptos: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              codigo: { type: 'string' },
+              concepto: { type: 'string' },
+              unidades: { type: 'string' },
+              tipo: { type: 'string', description: 'haber | retencion | asignacion | no_remunerativo | otro' },
+              importe: { type: 'number', description: 'Positivo; el tipo indica si suma o resta' }
+            },
+            required: ['concepto', 'tipo', 'importe']
+          }
+        },
+        texto_extraido: { type: 'string' },
+        notas: { type: 'string' },
+        filename: { type: 'string' },
+        reemplazar: { type: 'boolean', description: 'Borra recibos previos del mismo período y empresa antes de cargar' },
+        forzar: { type: 'boolean', description: 'Guardar aunque los conceptos no cierren contra el neto' }
+      },
+      required: ['empresa', 'periodo', 'total_neto', 'conceptos']
     }
   },
   {

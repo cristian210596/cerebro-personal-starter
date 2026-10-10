@@ -251,6 +251,10 @@ export async function persistSalaryReceipt(parsedInput: ParsedSalaryReceipt, con
   // Vincular con la entidad empleadora (ej: Dr. Gray) en Supabase y en el movimiento de ingreso.
   await linkSueldoEntity(recibo);
 
+  // El ingreso de sueldo tiene que verse también en Notion (antes quedaba solo en Supabase
+  // porque syncPendingImportedMovementsToNotion filtra origen='importacion').
+  if (movimiento) await syncSalaryMovementToNotion(movimiento.id);
+
   return { recognized: true, duplicate: false, recibo, movimiento, conceptsInserted, parsed };
 }
 
@@ -815,4 +819,70 @@ function clampNumber(value: any, min: number, max: number) {
 
 function norm(value: string) {
   return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
+
+// Sincroniza a Notion el movimiento de ingreso de un recibo. Import dinámico para no
+// crear un ciclo salary <-> notion. Nunca lanza: Supabase es la fuente de verdad.
+async function syncSalaryMovementToNotion(movimientoId: string) {
+  try {
+    const { data: row, error } = await supabase.from('finanzas_movimientos').select('*').eq('id', movimientoId).maybeSingle();
+    if (error || !row) return false;
+    const { syncNotionImportedMovements } = await import('./notion.js');
+    const result = await syncNotionImportedMovements([row]);
+    return result.movimientos > 0;
+  } catch (error: any) {
+    console.warn('No pude sincronizar el sueldo a Notion:', error?.message || error);
+    return false;
+  }
+}
+
+export type SalaryDataInput = ParsedSalaryReceipt & { reemplazar?: boolean; forzar?: boolean; filename?: string | null };
+
+// Carga un recibo de sueldo que Claude ya leyó (sin pasar el archivo por Gemini ni por base64).
+// Valida que haberes - retenciones (+ no remunerativo) cierre contra el neto. Con reemplazar:true
+// borra el/los recibos previos del mismo período y empresa (y su movimiento + página de Notion).
+export async function importSalaryReceiptFromData(input: SalaryDataInput) {
+  const periodo = normalizePeriod(String(input.periodo || ''));
+  if (!periodo) throw new Error('Falta periodo (YYYY-MM).');
+  const neto = Number(input.total_neto);
+  if (!Number.isFinite(neto) || neto <= 0) throw new Error('Falta total_neto (número positivo).');
+  if (!cleanText(input.empresa)) throw new Error('Falta empresa.');
+
+  const conceptos = Array.isArray(input.conceptos) ? input.conceptos : [];
+  const avisos: string[] = [];
+  const sum = (tipo: string) => conceptos.filter(c => normalizeConceptType(c.tipo) === tipo).reduce((a, c) => a + Math.abs(Number(c.importe || 0)), 0);
+  if (conceptos.length) {
+    const haberes = sum('haber');
+    const retenciones = sum('retencion');
+    const noRem = sum('no_remunerativo') + sum('asignacion');
+    const calc = Math.round((haberes - retenciones + noRem) * 100) / 100;
+    if (Math.abs(calc - neto) > 5) avisos.push(`Haberes - retenciones + no remunerativo = ${calc}, no coincide con neto ${neto}.`);
+  }
+  if (avisos.length && !input.forzar) return { ok: false, guardado: false, avisos, texto: 'No guardé: los conceptos no cierran contra el neto. Revisá los importes o repetí con forzar:true.' };
+
+  const reemplazados: string[] = [];
+  if (input.reemplazar) {
+    const empresa = cleanText(input.empresa) || '';
+    const { data: previos, error } = await supabase.from('sueldos_recibos').select('id, movimiento_financiero_id').eq('periodo', periodo).ilike('empresa', `%${empresa.slice(0, 24)}%`);
+    if (error) throw error;
+    const { archiveNotionPage } = await import('./notion.js');
+    for (const r of previos || []) {
+      if (r.movimiento_financiero_id) {
+        const { data: mov } = await supabase.from('finanzas_movimientos').select('id, notion_page_id').eq('id', r.movimiento_financiero_id).maybeSingle();
+        if (mov) {
+          await archiveNotionPage(mov.notion_page_id);
+          await supabase.from('finanzas_movimientos').delete().eq('id', mov.id);
+        }
+      }
+      await supabase.from('sueldos_conceptos').delete().eq('recibo_id', r.id);
+      const { error: delErr } = await supabase.from('sueldos_recibos').delete().eq('id', r.id);
+      if (delErr) throw delErr;
+      reemplazados.push(r.id);
+    }
+  }
+
+  const parsed: ParsedSalaryReceipt = { ...input, is_salary_receipt: true, confidence: 1, periodo };
+  const result = await persistSalaryReceipt(parsed, { fileName: input.filename || 'cargado-por-claude', mimeType: 'manual/claude', chatId: null, archivoId: null, bufferHash: null });
+  return { ok: true, guardado: !result.duplicate, duplicado: !!result.duplicate, reemplazados, avisos, recibo_id: result.recibo?.id || null, movimiento_id: result.movimiento?.id || null, conceptos: result.conceptsInserted || 0, texto: formatSalaryImportResult(result) };
 }
