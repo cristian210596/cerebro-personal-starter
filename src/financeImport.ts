@@ -424,9 +424,14 @@ export async function importStatementFromData(input: StatementDataInput, opts: {
   }
   await updateImportationState(importacionId);
 
-  // Notion: los movimientos creados/conciliados acá que todavía no tienen página.
+  // Notion: TODOS los movimientos vinculados a este resumen que todavía no tienen página (no solo
+  // los de esta llamada): si una llamada anterior se cortó antes de sincronizar, la siguiente los
+  // completa. Antes solo miraba los tocados en la llamada actual y quedaban sin página para siempre.
   let notion: { ok: boolean; sincronizados: number; restantes: number; error?: string } = { ok: true, sincronizados: 0, restantes: 0 };
-  const ids = [...new Set(touched.map(m => m?.id).filter(Boolean))];
+  const { data: linkedRows, error: linkedError } = await supabase
+    .from('finanzas_movimientos_importados').select('movimiento_id').eq('importacion_id', importacionId).not('movimiento_id', 'is', null).limit(2000);
+  if (linkedError) throw linkedError;
+  const ids = [...new Set([...touched.map(m => m?.id), ...(linkedRows || []).map((r: any) => r.movimiento_id)].filter(Boolean))];
   if (ids.length) {
     try {
       const { data: unsynced, error: unsyncedError } = await supabase.from('finanzas_movimientos').select('*').in('id', ids).is('notion_page_id', null);
