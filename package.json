@@ -22,7 +22,8 @@
     "productos:backfill": "tsx src/scripts/backfillProductos.ts",
     "productos:codes": "tsx src/scripts/productosCodes.ts",
     "set:webhook": "tsx src/scripts/setWebhook.ts",
-    "test:movements": "tsx src/scripts/testMovementEditor.ts"
+    "test:movements": "tsx src/scripts/testMovementEditor.ts",
+    "test:statements": "tsx src/scripts/testStatementImport.ts"
   },
   "dependencies": {
     "@google/genai": "latest",

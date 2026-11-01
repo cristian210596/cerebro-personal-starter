@@ -114,10 +114,11 @@ export async function importFinanceFile(input: {
   } else if (isCsvLike(fileName, mimeType)) {
     parsed = parseCsvFinance(input.buffer.toString('utf8'), fileName);
   } else if (isPdfLike(fileName, mimeType)) {
-    const pdfText = await tryExtractPdfText(input.buffer, fileName, mimeType);
+    const local = await parseFinancePdfLocally(input.buffer, fileName, mimeType);
+    const pdfText = local.pdfText;
     pdfTextLength = pdfText?.length || 0;
     if (pdfText && pdfText.length > 120) {
-      parsed = parseVisaGaliciaPdfText(pdfText, fileName) || parseVisaSignaturePdfText(pdfText, fileName) || parseMercadoPagoPdfText(pdfText, fileName);
+      parsed = local.parsed;
       console.log(`Importador financiero PDF: texto local ${pdfText.length} chars; movimientos locales ${parsed?.movimientos?.length || 0}`);
     } else {
       console.log('Importador financiero PDF: no se pudo extraer texto local usable. Intento fallback Gemini.');
@@ -188,6 +189,282 @@ export async function importFinanceFile(input: {
     stats,
     nextPending,
     pendingList
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resumen de tarjeta/cuenta YA LEÍDO por Claude (tool MCP import_statement_data), sin Gemini.
+// Sirve cuando el PDF no se puede mandar entero por el conector (base64 demasiado grande) o el
+// formato no lo reconoce ningún parser local. Entra por el MISMO pipeline que un PDF importado
+// (createImportation -> normalizeImportedMovements -> insertImportedRows -> autoProcess), así que:
+// - un consumo que después llegue por otra vía (PDF de Gmail) queda como duplicado ignorado
+//   (findCrossImportDuplicate: tarjeta + fecha + monto + moneda + cuota + comprobante);
+// - lo que ya estaba cargado a mano se concilia en vez de duplicarse (findManualMatch: monto ±1%
+//   y fecha ±1 día);
+// - lo que no tiene categoría segura queda en pendientes (list_pending / classify_group).
+// Es idempotente: mandar los mismos datos otra vez retoma lo que quedó a medias (límite de Vercel).
+// ---------------------------------------------------------------------------------------------
+
+export type StatementDataMovementInput = {
+  fecha: string;
+  descripcion: string;
+  comprobante?: string | null;
+  monto: number;
+  moneda?: string | null;
+  es_credito?: boolean;
+  tipo?: string | null;
+  cuota_actual?: number | null;
+  cuotas_totales?: number | null;
+  categoria?: string | null;
+  subcategoria?: string | null;
+};
+
+export type StatementDataInput = {
+  proveedor?: string | null;
+  tarjeta?: string | null;
+  cuenta?: string | null;
+  tipo_fuente?: string | null;
+  periodo?: string | null;
+  fecha_cierre?: string | null;
+  fecha_vencimiento?: string | null;
+  total_pesos?: number | null;
+  total_dolares?: number | null;
+  pago_minimo?: number | null;
+  total_consumos_pesos?: number | null;
+  total_consumos_dolares?: number | null;
+  movimientos: StatementDataMovementInput[];
+  forzar?: boolean;
+};
+
+const STATEMENT_KEEP_TYPES = new Set(['devolucion', 'cargo_financiero', 'pago_tarjeta', 'transferencia', 'ingreso']);
+
+// Puro (sin Supabase): valida y arma el documento igual que lo dejaría un parser de PDF.
+export function buildParsedStatementFromData(input: StatementDataInput): {
+  ok: boolean;
+  errores: string[];
+  avisos: string[];
+  parsed: ParsedFinanceDocument | null;
+  sumas_consumos: Record<string, number>;
+} {
+  const errores: string[] = [];
+  const avisos: string[] = [];
+  const isoDate = (v: any) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v));
+  const movs = Array.isArray(input?.movimientos) ? input.movimientos : [];
+  if (!movs.length) errores.push('Falta movimientos (al menos uno).');
+  if (movs.length > 400) errores.push(`Demasiados movimientos (${movs.length}); máximo 400 por llamada.`);
+  if (!clean(input?.tarjeta) && !clean(input?.proveedor)) errores.push('Falta tarjeta y/o proveedor (ej tarjeta "Visa", proveedor "Banco Galicia").');
+  for (const k of ['fecha_cierre', 'fecha_vencimiento'] as const) {
+    if (input?.[k] != null && input[k] !== '' && !isoDate(input[k])) errores.push(`${k} tiene que ser YYYY-MM-DD.`);
+  }
+
+  const movimientos: ImportedMovement[] = [];
+  movs.forEach((r, i) => {
+    const n = i + 1;
+    const desc = clean(r?.descripcion);
+    const monto = Number(r?.monto);
+    if (!isoDate(r?.fecha)) errores.push(`Movimiento ${n} (${desc || 'sin descripción'}): fecha tiene que ser YYYY-MM-DD.`);
+    if (!desc) errores.push(`Movimiento ${n}: falta descripcion.`);
+    if (!Number.isFinite(monto) || monto <= 0) errores.push(`Movimiento ${n} (${desc}): monto tiene que ser un número positivo (para créditos/devoluciones usar es_credito:true, no monto negativo).`);
+    const ca = r?.cuota_actual != null ? Number(r.cuota_actual) : null;
+    const ct = r?.cuotas_totales != null ? Number(r.cuotas_totales) : null;
+    if ((ca != null) !== (ct != null) || (ca != null && ct != null && !(Number.isInteger(ca) && Number.isInteger(ct) && ca >= 1 && ca <= ct))) {
+      errores.push(`Movimiento ${n} (${desc}): cuota_actual/cuotas_totales inválidas (van juntas y 1 <= actual <= total).`);
+    }
+    const monedaRaw = clean(r?.moneda).toUpperCase();
+    if (monedaRaw && !/^[A-Z]{3}$/.test(monedaRaw) && monedaRaw !== 'U$S') errores.push(`Movimiento ${n} (${desc}): moneda inválida "${r?.moneda}" (usar ARS, USD, ...).`);
+    if (!isoDate(r?.fecha) || !desc || !Number.isFinite(monto) || monto <= 0) return;
+
+    const moneda = monedaRaw === 'U$S' ? 'USD' : (monedaRaw || 'ARS');
+    const explicitTipo = norm(r?.tipo);
+    const tipo = STATEMENT_KEEP_TYPES.has(explicitTipo)
+      ? explicitTipo
+      : r?.es_credito ? 'devolucion' : normalizeMovementType('', desc);
+    const base: ImportedMovement = {
+      fecha: r.fecha,
+      descripcion_original: desc,
+      comercio: guessCommerce(desc),
+      comprobante: clean(r?.comprobante) || null,
+      monto: Math.round(monto * 100) / 100,
+      moneda,
+      tipo,
+      cuota_actual: ca,
+      cuotas_totales: ct,
+      categoria_sugerida: null,
+      subcategoria_sugerida: null,
+      confianza: 0.55,
+      raw: { ...r, via: 'claude_statement_data' }
+    };
+    const rule = builtInRuleFor(base);
+    const categoria = normalizeCategory(r?.categoria) || rule?.categoria || null;
+    movimientos.push({
+      ...base,
+      comercio: rule?.comercio || base.comercio,
+      categoria_sugerida: categoria,
+      subcategoria_sugerida: clean(r?.subcategoria) || (categoria === rule?.categoria ? rule?.subcategoria || null : null),
+      // Categoría explícita de Claude: 0.9 -> entra como "clasificado" (no queda pendiente).
+      confianza: normalizeCategory(r?.categoria) ? 0.9 : rule?.confianza || 0.55
+    });
+  });
+
+  // Control de totales: suma de consumos (tipo gasto) por moneda contra el total del resumen.
+  const sumas: Record<string, number> = {};
+  for (const m of movimientos) {
+    if (m.tipo !== 'gasto') continue;
+    sumas[m.moneda] = Math.round(((sumas[m.moneda] || 0) + Number(m.monto || 0)) * 100) / 100;
+  }
+  const checks: Array<[string, number | null | undefined]> = [['ARS', input?.total_consumos_pesos], ['USD', input?.total_consumos_dolares]];
+  for (const [moneda, esperado] of checks) {
+    if (esperado == null || !Number.isFinite(Number(esperado))) continue;
+    const suma = sumas[moneda] || 0;
+    if (Math.abs(suma - Number(esperado)) > 0.05) avisos.push(`La suma de consumos en ${moneda} (${suma}) no coincide con el total del resumen (${Number(esperado)}).`);
+  }
+
+  if (errores.length) return { ok: false, errores, avisos, parsed: null, sumas_consumos: sumas };
+
+  const fechaCierre = normalizeDate(input.fecha_cierre) || null;
+  const fechaVencimiento = normalizeDate(input.fecha_vencimiento) || null;
+  const parsed: ParsedFinanceDocument = {
+    es_resumen_financiero: true,
+    tipo_fuente: clean(input.tipo_fuente) || (clean(input.tarjeta) ? 'resumen_tarjeta_claude' : 'resumen_cuenta_claude'),
+    proveedor: clean(input.proveedor) || null,
+    cuenta: clean(input.cuenta) || null,
+    tarjeta: normalizeCard(input.tarjeta),
+    periodo: normalizePeriod(input.periodo, fechaCierre, fechaVencimiento),
+    fecha_cierre: fechaCierre,
+    fecha_vencimiento: fechaVencimiento,
+    total_pesos: toNumberOrNull(input.total_pesos),
+    total_dolares: toNumberOrNull(input.total_dolares),
+    pago_minimo: toNumberOrNull(input.pago_minimo),
+    movimientos
+  };
+  return { ok: true, errores, avisos, parsed, sumas_consumos: sumas };
+}
+
+export async function importStatementFromData(input: StatementDataInput, opts: { startedAt?: number } = {}) {
+  const startedAt = opts.startedAt || Date.now();
+  // Presupuesto dentro de los 60s de Vercel: insertar hasta ~25s, procesar hasta ~42s, Notion hasta ~52s.
+  const insertDeadline = startedAt + 25_000;
+  const processDeadline = startedAt + 42_000;
+  const notionDeadline = startedAt + 52_000;
+
+  const built = buildParsedStatementFromData(input);
+  if (!built.ok || !built.parsed) {
+    return { ok: false, guardado: false, errores: built.errores, avisos: built.avisos, texto: 'No guardé nada: hay datos inválidos. Corregilos y volvé a llamar.' };
+  }
+  if (built.avisos.length && !input.forzar) {
+    return { ok: false, guardado: false, errores: [], avisos: built.avisos, sumas_consumos: built.sumas_consumos, texto: 'No guardé nada: los totales no cierran. Revisá la lectura del resumen (o mandá forzar:true si el resumen realmente es así).' };
+  }
+  const parsed = built.parsed;
+
+  const hash = sha256(Buffer.from(JSON.stringify({
+    v: 1,
+    via: 'claude_statement_data',
+    proveedor: parsed.proveedor,
+    tarjeta: parsed.tarjeta,
+    cuenta: parsed.cuenta,
+    fecha_cierre: parsed.fecha_cierre,
+    movimientos: parsed.movimientos.map(m => [m.fecha, m.descripcion_original, m.comprobante, m.monto, m.moneda, m.tipo, m.cuota_actual, m.cuotas_totales])
+  })));
+
+  let importacion = await findExistingImport(hash);
+  const reanudado = !!importacion;
+  if (!importacion) {
+    const etiqueta = (parsed.tarjeta || parsed.proveedor || 'cuenta').replace(/\s+/g, '_');
+    importacion = await createImportation(parsed, {
+      fileName: `resumen-${etiqueta}-${parsed.fecha_cierre || parsed.periodo || 'sin_fecha'}-claude.json`,
+      mimeType: 'application/json',
+      hash,
+      chatId: 0,
+      itemId: null,
+      archivoId: null
+    });
+  }
+  const importacionId: string = importacion.id;
+
+  // Insertar solo las filas que falten (reanudable si una llamada anterior se cortó).
+  const rows = normalizeImportedMovements(parsed, importacionId);
+  const { data: existingRows, error: existingError } = await supabase
+    .from('finanzas_movimientos_importados').select('external_hash').eq('importacion_id', importacionId).limit(2000);
+  if (existingError) throw existingError;
+  const have = new Set((existingRows || []).map((r: any) => r.external_hash));
+  const missing = rows.filter(r => !have.has(r.external_hash));
+  let insertadas = 0;
+  for (const row of missing) {
+    if (Date.now() > insertDeadline) break;
+    await insertImportedRows([row]);
+    insertadas += 1;
+  }
+  const faltanInsertar = missing.length - insertadas;
+
+  // Procesar todo lo que quedó sin movimiento final (clasificado -> crea/concilia; pendiente -> queda).
+  const { data: allRows, error: allError } = await supabase
+    .from('finanzas_movimientos_importados').select('*').eq('importacion_id', importacionId).limit(2000);
+  if (allError) throw allError;
+  const toProcess = (allRows || []).filter((r: any) => !r.movimiento_id && (r.estado === 'clasificado' || r.estado === 'pendiente_revision'));
+  const processed = Date.now() < processDeadline
+    ? await autoProcessImportedRowsWithRules(toProcess, { deadlineMs: processDeadline })
+    : { autoInserted: 0, matchedManual: 0, pending: 0, ignored: 0, movements: [] as any[], cortadoPorTiempo: true };
+
+  // Pendientes que el usuario ya había cargado a mano: se concilian (no se duplican ni se
+  // preguntan). Mantienen la categoría que ya tenía el movimiento manual.
+  const touched: any[] = [...processed.movements];
+  let conciliadosPendientes = 0;
+  let cortadoConciliando = false;
+  const { data: pendingRows, error: pendingError } = await supabase
+    .from('finanzas_movimientos_importados').select('*').eq('importacion_id', importacionId).eq('estado', 'pendiente_revision').is('movimiento_id', null).limit(2000);
+  if (pendingError) throw pendingError;
+  for (const row of pendingRows || []) {
+    if (Date.now() > processDeadline) { cortadoConciliando = true; break; }
+    const match = await findManualMatch(row);
+    if (!match) continue;
+    const movement = await mergeImportedIntoMovement(row, match);
+    await markImportedConciliated(row, movement, match.score, `resumen cargado por Claude; ${match.reason}`);
+    touched.push(movement);
+    conciliadosPendientes += 1;
+  }
+  await updateImportationState(importacionId);
+
+  // Notion: los movimientos creados/conciliados acá que todavía no tienen página.
+  let notion: { ok: boolean; sincronizados: number; restantes: number; error?: string } = { ok: true, sincronizados: 0, restantes: 0 };
+  const ids = [...new Set(touched.map(m => m?.id).filter(Boolean))];
+  if (ids.length) {
+    try {
+      const { data: unsynced, error: unsyncedError } = await supabase.from('finanzas_movimientos').select('*').in('id', ids).is('notion_page_id', null);
+      if (unsyncedError) throw unsyncedError;
+      if (unsynced?.length) {
+        const { syncNotionImportedMovements } = await import('./notion.js');
+        const r = await syncNotionImportedMovements(unsynced, { deadlineMs: notionDeadline });
+        notion = { ok: true, sincronizados: r.movimientos, restantes: Math.max(0, unsynced.length - r.procesados) };
+      }
+    } catch (notionError: any) {
+      console.error('import_statement_data: no pude sincronizar a Notion:', notionError);
+      notion = { ok: false, sincronizados: 0, restantes: ids.length, error: notionError?.message || 'error desconocido' };
+    }
+  }
+
+  const stats = await buildImportStats(importacionId);
+  const sinMovimiento = Number(stats.clasificado || 0);
+  const completo = faltanInsertar === 0 && !processed.cortadoPorTiempo && !cortadoConciliando && sinMovimiento === 0 && notion.restantes === 0;
+  return {
+    ok: true,
+    guardado: true,
+    completo,
+    reanudado,
+    importacion_id: importacionId,
+    tarjeta: parsed.tarjeta,
+    proveedor: parsed.proveedor,
+    periodo: parsed.periodo,
+    filas_resumen: rows.length,
+    insertadas,
+    faltan_insertar: faltanInsertar,
+    creados: processed.autoInserted,
+    conciliados_con_carga_manual: processed.matchedManual + conciliadosPendientes,
+    pendientes_de_clasificar: Number(stats.pendiente_revision || 0),
+    duplicados_ignorados: Number(stats.ignorado || 0),
+    estados: stats,
+    sumas_consumos: built.sumas_consumos,
+    notion,
+    aviso: completo ? undefined : 'Quedó trabajo por el límite de tiempo: volvé a llamar import_statement_data con EXACTAMENTE los mismos datos para terminar (retoma, no duplica).'
   };
 }
 
@@ -465,6 +742,22 @@ async function extractPaymentScreenshotWithGemini(buffer: Buffer, mimeType: stri
   }
 }
 
+// Extracción + parsers locales (sin Gemini) de un PDF de resumen. Exportada para poder
+// probarla con PDFs reales sin tocar Supabase (src/scripts/testStatementImport.ts).
+export async function parseFinancePdfLocally(buffer: Buffer, fileName: string, mimeType: string): Promise<{ pdfText: string | null; parsed: ParsedFinanceDocument | null }> {
+  const pdfText = await tryExtractPdfText(buffer, fileName, mimeType);
+  if (!pdfText || pdfText.length <= 120) return { pdfText: pdfText || null, parsed: null };
+  return { pdfText, parsed: parseFinanceStatementText(pdfText, fileName) };
+}
+
+// Puro: texto ya extraído -> documento (o null). Exportado para tests con fixtures de texto.
+export function parseFinanceStatementText(pdfText: string, fileName: string): ParsedFinanceDocument | null {
+  return parseVisaGaliciaPdfText(pdfText, fileName)
+    || parseMastercardGaliciaPdfText(pdfText, fileName)
+    || parseVisaSignaturePdfText(pdfText, fileName)
+    || parseMercadoPagoPdfText(pdfText, fileName);
+}
+
 async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: string) {
   if (!isPdfLike(fileName, mimeType)) return null;
 
@@ -492,6 +785,7 @@ async function tryExtractPdfText(buffer: Buffer, fileName: string, mimeType: str
       // (columnas pegadas o reordenadas); en ese caso seguimos probando los demás.
       const statementChecks: Array<[RegExp[], (t: string, f: string) => ParsedFinanceDocument | null]> = [
         [[/detalle\s+del\s+consumo/i, /(visa|master\s*card|mastercard|galicia)/i], parseVisaGaliciaPdfText],
+        [[/detalle\s+del\s+consumo/i, /total\s+consumos\s+del\s+mes/i, /master\s*card/i], parseMastercardGaliciaPdfText],
         [[/detalle\s+de\s+transacci[oó]n/i, /visa/i], parseVisaSignaturePdfText],
         [[/detalle\s+de\s+movimientos/i, /mercado\s*pago/i], parseMercadoPagoPdfText]
       ];
@@ -931,12 +1225,16 @@ function parseVisaSignaturePdfText(text: string, fileName: string): ParsedFinanc
   const seen = new Set<string>();
 
   for (const rawLine of detail.split('\n')) {
-    const line = rawLine.replace(/\s+/g, ' ').trim();
+    // Galicia marca algunas filas con un "_" al final (ej: "DEV.IMP. RG 5617 ... 36.344,28- _"):
+    // con el "_" la fila no matcheaba y la devolución de la percepción se perdía.
+    const line = rawLine.replace(/\s+_\s*$/, '').replace(/\s+/g, ' ').trim();
     const m = line.match(rowRe);
     if (!m) continue;
     let desc = clean(m[5]);
     const d = norm(desc);
-    if (/saldo anterior|transferencia deuda|su pago en pesos|total consumos/.test(d)) continue;
+    // "SU PAGO EN USD" también es el pago del resumen (antes solo se salteaba el de pesos y el
+    // de dólares entraba como un movimiento en ARS).
+    if (/saldo anterior|transferencia deuda|\bsu pago\b|total consumos/.test(d)) continue;
 
     let moneda = 'ARS';
     const usd = desc.match(new RegExp(`^(.*?)\\s*(${VISA_FX_CODES})\\s+\\d[\\d.]*,\\d{2}$`, 'i'));
@@ -999,6 +1297,156 @@ function parseVisaSignaturePdfText(text: string, fileName: string): ParsedFinanc
     total_pesos: totalPesos,
     total_dolares: totalDolares,
     pago_minimo: pagoMinimo,
+    movimientos
+  });
+}
+
+// Resumen Mastercard Galicia, diseño "Ciclo de facturación" (desde oct-2026). Los extractores
+// pegan las columnas: "16-Oct-26UNICEF 10/18 0763718.000,00" = fecha + referencia + comprobante
+// (07637) + pesos (18.000,00). En "CUOTA DEL MES" también se pega la cuota:
+// "19-Jun-26MERPAGO*AUTOSZANET 05/0604689736.766,66". Antes ningún parser lo reconocía (y con
+// menos de 3 consumos el parser clásico lo descartaba igual) y terminaba en Gemini.
+// El corte comprobante/importe es ambiguo cuando van pegados: se elige el largo de comprobante
+// (el mismo para todas las filas) con el que la suma da exactamente "TOTAL CONSUMOS DEL MES".
+// Si no cierra, o aparece algo no verificado (consumos en dólares, una fila que no se entiende),
+// devuelve null y sigue el flujo de siempre: no adivina.
+const MC_AMOUNT_RE = /^\d{1,3}(?:\.\d{3})*,\d{2}$/;
+
+function splitMastercardCompAmount(blob: string): Array<{ comprobante: string; amount: string }> {
+  const parts = blob.trim().split(/\s+/);
+  if (parts.length === 2) {
+    return /^\d{4,8}$/.test(parts[0]) && MC_AMOUNT_RE.test(parts[1]) ? [{ comprobante: parts[0], amount: parts[1] }] : [];
+  }
+  if (parts.length !== 1) return [];
+  const s = parts[0];
+  const out: Array<{ comprobante: string; amount: string }> = [];
+  for (let len = 4; len <= 8; len++) {
+    const comprobante = s.slice(0, len);
+    const amount = s.slice(len);
+    if (/^\d+$/.test(comprobante) && comprobante.length === len && MC_AMOUNT_RE.test(amount)) out.push({ comprobante, amount });
+  }
+  return out;
+}
+
+function parseMastercardGaliciaPdfText(text: string, fileName: string): ParsedFinanceDocument | null {
+  const normalized = cleanPdfText(text);
+  const lower = norm(normalized);
+  if (!/detalle del consumo/.test(lower) || !/total consumos del mes/.test(lower) || !/master\s*card/.test(lower)) return null;
+
+  const AMT = '\\d{1,3}(?:\\.\\d{3})*,\\d{2}';
+  const totals = normalized.match(new RegExp(`TOTAL CONSUMOS DEL MES\\s*(${AMT})\\s*(${AMT})?`, 'i'));
+  const totalConsumosPesos = totals ? parseAmountLoose(totals[1]) : null;
+  const totalConsumosDolares = totals?.[2] ? parseAmountLoose(totals[2]) : 0;
+  if (totalConsumosPesos === null) return null;
+  if (totalConsumosDolares) return null;
+
+  // Fechas del encabezado, en orden: cierre anterior, vto anterior, cierre actual, vto actual, próximos.
+  // Ojo: los índices se buscan sobre `normalized` (no sobre `lower`, que colapsa saltos de línea).
+  const consolidadoIdx = normalized.search(/CONSOLIDADO/i);
+  const head = consolidadoIdx > 0 ? normalized.slice(0, consolidadoIdx) : normalized.slice(0, 1500);
+  const headDates = [...head.matchAll(/\d{1,2}-[A-Za-z]{3}-\d{2}/g)].map(m => normalizeDateFromStatement(m[0], null)).filter(Boolean) as string[];
+  if (headDates.length < 4) return null;
+  const fechaCierre = headDates[2];
+  const fechaVencimiento = headDates[3];
+  if (!(fechaCierre < fechaVencimiento)) return null;
+
+  const totalPagar = normalized.match(new RegExp(`TOTAL A PAGAR\\s*(${AMT})\\s*(${AMT})?`, 'i'));
+  const pagoMin = normalized.match(new RegExp(`PAGO M[IÍ]NIMO[\\s\\S]{0,80}?\\$\\s*(${AMT})`, 'i'));
+
+  const detailStart = normalized.search(/DETALLE DEL CONSUMO/i);
+  if (detailStart < 0) return null;
+  // Sin \b: el texto viene pegado ("SUBTOTAL754.766,66").
+  const detailEndRel = normalized.slice(detailStart).search(/SUBTOTAL|TOTAL A PAGAR/i);
+  if (detailEndRel <= 0) return null;
+  const detail = normalized.slice(detailStart, detailStart + detailEndRel);
+
+  type McRow = { fecha: string | null; desc: string; cuotaActual: number | null; cuotasTotales: number | null; options: Array<{ comprobante: string; amount: string }>; line: string };
+  const rows: McRow[] = [];
+  let section: 'compras' | 'cuotas' | 'otra' = 'otra';
+  for (const rawLine of detail.split('\n')) {
+    const line = rawLine.replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    const l = norm(line);
+    if (/^compras del mes/.test(l)) { section = 'compras'; continue; }
+    if (/^cuotas? del mes/.test(l)) { section = 'cuotas'; continue; }
+    const dated = line.match(/^(\d{1,2}-[A-Za-z]{3}-\d{2})\s*(.+)$/);
+    if (!dated) continue;
+    if (section === 'otra' || /-\s*$/.test(dated[2]) || /usd|u\$s/i.test(dated[2])) return null;
+    let desc: string;
+    let cuotaActual: number | null = null;
+    let cuotasTotales: number | null = null;
+    let blob: string;
+    if (section === 'cuotas') {
+      const m = dated[2].match(/^(.*?)\s*(\d{2})\/(\d{2})\s*(\d[\d.\s]*,\d{2})$/);
+      if (!m) return null;
+      desc = clean(m[1]);
+      cuotaActual = Number(m[2]);
+      cuotasTotales = Number(m[3]);
+      blob = m[4];
+    } else {
+      // En "COMPRAS DEL MES" un "NN/NN" es parte de la referencia (ej "UNICEF 10/18"), no una cuota.
+      const m = dated[2].match(/^(.*?)\s+(\d[\d.]*(?:\s\d[\d.]*)?,\d{2})$/);
+      if (!m) return null;
+      desc = clean(m[1]);
+      blob = m[2];
+    }
+    const options = splitMastercardCompAmount(blob);
+    if (!desc || !options.length) return null;
+    rows.push({ fecha: normalizeDateFromStatement(dated[1], null), desc, cuotaActual, cuotasTotales, options, line });
+  }
+  if (!rows.length) return null;
+
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  let chosen: Array<{ comprobante: string; amount: string }> | null = null;
+  for (const len of [5, 6, 4, 7, 8]) {
+    const pick = rows.map(r => r.options.length === 1 ? r.options[0] : r.options.find(o => o.comprobante.length === len) || null);
+    if (pick.some(p => !p)) continue;
+    const sum = round2(pick.reduce((a, p) => a + (parseAmountLoose(p!.amount) || 0), 0));
+    if (Math.abs(sum - totalConsumosPesos) <= 0.01) { chosen = pick as Array<{ comprobante: string; amount: string }>; break; }
+  }
+  if (!chosen) {
+    console.log(`Parser Mastercard Galicia: ${rows.length} filas pero ningún corte comprobante/importe cierra con el total de consumos (${totalConsumosPesos}).`);
+    return null;
+  }
+
+  const movimientos: ImportedMovement[] = rows.map((r, i) => {
+    const base: ImportedMovement = {
+      fecha: r.fecha,
+      descripcion_original: r.desc,
+      comercio: guessCommerce(r.desc),
+      comprobante: chosen![i].comprobante,
+      monto: parseAmountLoose(chosen![i].amount),
+      moneda: 'ARS',
+      tipo: normalizeMovementType('', r.desc),
+      cuota_actual: r.cuotaActual,
+      cuotas_totales: r.cuotasTotales,
+      categoria_sugerida: null,
+      subcategoria_sugerida: null,
+      confianza: 0.55,
+      raw: { line: r.line, parser: 'mastercard_galicia_ciclo' }
+    };
+    const rule = builtInRuleFor(base);
+    return {
+      ...base,
+      comercio: rule?.comercio || base.comercio,
+      categoria_sugerida: rule?.categoria || null,
+      subcategoria_sugerida: rule?.subcategoria || null,
+      confianza: rule?.confianza || base.confianza
+    };
+  });
+
+  return normalizeParsedDocument({
+    es_resumen_financiero: true,
+    tipo_fuente: 'resumen_tarjeta_pdf',
+    proveedor: /galicia|30-50000173/i.test(normalized) ? 'Banco Galicia' : null,
+    cuenta: null,
+    tarjeta: 'Mastercard',
+    periodo: normalizePeriod(null, fechaCierre, fechaVencimiento),
+    fecha_cierre: fechaCierre,
+    fecha_vencimiento: fechaVencimiento,
+    total_pesos: totalPagar ? parseAmountLoose(totalPagar[1]) : totalConsumosPesos,
+    total_dolares: totalPagar?.[2] ? parseAmountLoose(totalPagar[2]) : null,
+    pago_minimo: pagoMin ? parseAmountLoose(pagoMin[1]) : null,
     movimientos
   });
 }
@@ -1507,10 +1955,13 @@ async function insertImportedRows(rows: any[]) {
   return inserted;
 }
 
-async function autoProcessImportedRows(rows: any[]) {
-  const stats: { autoInserted: number; matchedManual: number; pending: number; ignored: number; movements: any[] } =
+// opts.deadlineMs (opcional): corte duro para requests HTTP (límite de Vercel). Las filas que no
+// llegan a procesarse quedan "clasificado" sin movimiento y se completan en la próxima llamada.
+async function autoProcessImportedRows(rows: any[], opts: { deadlineMs?: number } = {}) {
+  const stats: { autoInserted: number; matchedManual: number; pending: number; ignored: number; movements: any[]; cortadoPorTiempo?: boolean } =
     { autoInserted: 0, matchedManual: 0, pending: 0, ignored: 0, movements: [] };
   for (const row of rows) {
+    if (opts.deadlineMs && Date.now() > opts.deadlineMs) { stats.cortadoPorTiempo = true; break; }
     if (row.estado === 'ignorado' || row.movimiento_id) continue;
     if (row.estado === 'pendiente_revision') {
       stats.pending += 1;
@@ -2712,8 +3163,8 @@ async function applyRulesToInsertedRows(rows: any[]) {
 }
 
 // Patch autoProcess entry to use saved rules.
-async function autoProcessImportedRowsWithRules(rows: any[]) {
-  return autoProcessImportedRows(await applyRulesToInsertedRows(rows));
+async function autoProcessImportedRowsWithRules(rows: any[], opts: { deadlineMs?: number } = {}) {
+  return autoProcessImportedRows(await applyRulesToInsertedRows(rows), opts);
 }
 
 // Replace reference at runtime by exporting compatible helper name in code path above.
@@ -2796,6 +3247,10 @@ function isPdfLike(fileName: string, mimeType: string) {
 }
 
 function normalizeMovementType(type: any, desc: string) {
+  // Un crédito que el parser ya marcó como devolución (línea con "-" en el resumen) se respeta:
+  // antes "DEV.IMP. RG 5617 ... 36.344,28-" matcheaba "rg 5617" y se convertía en cargo
+  // (sumaba como gasto en vez de restar).
+  if (norm(type) === 'devolucion') return 'devolucion';
   const t = norm([type, desc].join(' '));
   if (/pago tarjeta|su pago|pago en pesos|payment/.test(t)) return 'pago_tarjeta';
   // Con límites de palabra: antes "Transferencia recibida Luis Ivan Rios" matcheaba "iva"

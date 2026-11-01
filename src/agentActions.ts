@@ -6,7 +6,8 @@ import {
   importFinanceFile,
   formatImportResult,
   extractJsonObject,
-  spendingReport
+  spendingReport,
+  importStatementFromData
 } from './financeImport.js';
 import { unifiedSearch } from './chatPro.js';
 import { summarizeSalaryFromText, importSalaryReceiptFromFile, formatSalaryImportResult, looksLikeSalaryFile, importSalaryReceiptFromData } from './salary.js';
@@ -15,7 +16,7 @@ import { importComprobanteFromFile, importComprobanteFromParsedData, formatCompr
 import { saveFinanceFromText, formatFinanceSaved } from './finance.js';
 import { classifyText } from './classifier.js';
 import { saveItem, supabase } from './supabaseClient.js';
-import { syncPendingImportedMovementsToNotion, createNotionItemPage, syncNotionDerivedForItem, syncProductosToNotion } from './notion.js';
+import { syncPendingImportedMovementsToNotion, createNotionItemPage, syncNotionDerivedForItem, syncProductosToNotion, syncNotionFinanceResult } from './notion.js';
 import { withGemini } from './geminiPool.js';
 import { config } from './config.js';
 import { downloadStorageRef } from './processingQueue.js';
@@ -370,7 +371,30 @@ export async function runAgentAction(action: string, params: any) {
       const { text } = params;
       if (!text) throw new Error('Falta text.');
       const result = await saveFinanceFromText({ chatId: 0, messageId: 0, text: String(text) });
-      return { ok: result.ok, texto: result.ok ? formatFinanceSaved(result) : `No lo reconocí como un gasto/finanza (${(result as any).reason || 'motivo desconocido'}).` };
+      // Antes desde el conector no se sincronizaba a Notion (Telegram sí): el movimiento quedaba
+      // solo en Supabase. Notion es una vista: si falla, se avisa pero no se pierde el gasto.
+      let notion: any = null;
+      if (result.ok) {
+        try {
+          notion = await syncNotionFinanceResult(result);
+        } catch (notionError: any) {
+          console.error('add_manual_expense: no pude sincronizar a Notion:', notionError);
+          notion = { error: notionError?.message || 'error desconocido' };
+        }
+      }
+      const mov = result.ok ? (result as any).persisted?.movimiento : null;
+      return {
+        ok: result.ok,
+        texto: result.ok ? formatFinanceSaved(result) : `No lo reconocí como un gasto/finanza (${(result as any).reason || 'motivo desconocido'}).`,
+        // Para verificar sin otra llamada: Gemini a veces pone la fecha de hoy en vez de la dicha.
+        movimiento: mov ? { id: mov.id, fecha: mov.fecha_movimiento, tipo: mov.tipo, monto: mov.monto, moneda: mov.moneda, comercio: mov.comercio, categoria: mov.categoria_financiera } : null,
+        notion
+      };
+    }
+
+    case 'import_statement_data': {
+      // Resumen de tarjeta/cuenta ya leído por Claude: sin Gemini y sin base64.
+      return await importStatementFromData(params as any, { startedAt: Date.now() });
     }
 
     // Las 3 tools siguientes son para cuando Telegram/Gemini no pudo procesar
@@ -601,7 +625,7 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'import_document',
-    description: 'Sube un comprobante/ticket, recibo de sueldo, resumen de tarjeta (PDF/CSV/Excel) o captura de pago. Recibe el archivo en base64 (sin el prefijo data:). Prueba UN solo tipo por llamada (el más probable según el nombre/caption). Si devuelve recognized:false, NO es un error — llamá a analyze_unknown_document con el mismo archivo para identificarlo de forma general (facturas de servicios, deudas, contratos, etc.) en vez de asumir que no se puede hacer nada con él.',
+    description: 'Sube un comprobante/ticket, recibo de sueldo, resumen de tarjeta (PDF/CSV/Excel) o captura de pago. Recibe el archivo ORIGINAL en base64 (sin el prefijo data:; no reconstruir ni recomprimir el PDF: los parsers locales dependen del formato original). Prueba UN solo tipo por llamada (el más probable según el nombre/caption). Para un resumen de tarjeta/cuenta que no entra por base64 (archivo grande) usar import_statement_data con los datos ya leídos. Si devuelve recognized:false, NO es un error — llamá a analyze_unknown_document con el mismo archivo para identificarlo de forma general (facturas de servicios, deudas, contratos, etc.) en vez de asumir que no se puede hacer nada con él.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -709,6 +733,47 @@ export const AGENT_TOOLS = [
     }
   },
   {
+    name: 'import_statement_data',
+    description: 'Carga un RESUMEN DE TARJETA o de cuenta que VOS ya leíste (PDF/captura), sin pasar el archivo y sin Gemini. Usar SIEMPRE para resúmenes cuando el PDF es grande o import_document no lo reconoce — nunca cargar un resumen línea por línea con add_manual_expense. Mismo circuito que un PDF importado: crea los movimientos con categoría segura (reglas y comercios conocidos), concilia lo que ya estaba cargado a mano (monto ±1% y fecha ±1 día) en vez de duplicarlo, ignora lo que ya entró por otra importación, deja el resto en pendientes (list_pending/classify_group) y sincroniza a Notion. Pasá TODAS las líneas de consumo tal cual figuran (descripcion literal, comprobante literal con su sufijo K/*, fecha de la línea, cuotas NN/MM separadas), incluidas devoluciones (es_credito:true) e impuestos/percepciones del final; NO pases saldo anterior, pagos del resumen (SU PAGO) ni totales. Montos siempre en positivo. Pasá total_consumos_pesos/dolares del resumen: si la suma no cierra no guarda nada (salvo forzar:true). categoria solo si es inequívoca (si no, que quede pendiente). Si devuelve completo:false, volver a llamar con EXACTAMENTE los mismos datos: retoma sin duplicar.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        proveedor: { type: 'string', description: 'Banco/billetera, ej "Banco Galicia"' },
+        tarjeta: { type: 'string', description: 'Visa | Mastercard | Amex ... (vacío si es resumen de cuenta)' },
+        cuenta: { type: 'string', description: 'Número de cuenta del resumen, si figura' },
+        fecha_cierre: { type: 'string', description: 'YYYY-MM-DD' },
+        fecha_vencimiento: { type: 'string', description: 'YYYY-MM-DD' },
+        periodo: { type: 'string', description: 'YYYY-MM (si no se pasa, sale del cierre)' },
+        total_pesos: { type: 'number', description: 'Total a pagar / saldo actual en pesos' },
+        total_dolares: { type: 'number', description: 'Total a pagar / saldo actual en dólares' },
+        pago_minimo: { type: 'number' },
+        total_consumos_pesos: { type: 'number', description: 'Total de consumos del período en pesos según el resumen (control de lectura)' },
+        total_consumos_dolares: { type: 'number', description: 'Total de consumos del período en dólares según el resumen (control de lectura)' },
+        movimientos: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              fecha: { type: 'string', description: 'YYYY-MM-DD de la línea (en cuotas: la fecha original de compra que muestra el resumen)' },
+              descripcion: { type: 'string', description: 'Texto literal de la línea, sin la cuota ni el monto (ej "MERPAGO*FINAER", "IVA RG 4240 21%( 15204,12)")' },
+              comprobante: { type: 'string', description: 'Literal, con sufijo si lo tiene (ej "611714K", "747738*")' },
+              monto: { type: 'number', description: 'Positivo' },
+              moneda: { type: 'string', description: 'ARS (default) | USD | ...' },
+              es_credito: { type: 'boolean', description: 'true para líneas con signo menos (devoluciones, reintegros, bonificaciones)' },
+              cuota_actual: { type: 'number' },
+              cuotas_totales: { type: 'number' },
+              categoria: { type: 'string', description: 'Solo si es inequívoca' },
+              subcategoria: { type: 'string' }
+            },
+            required: ['fecha', 'descripcion', 'monto']
+          }
+        },
+        forzar: { type: 'boolean', description: 'Guardar aunque los totales no cierren' }
+      },
+      required: ['movimientos']
+    }
+  },
+  {
     name: 'analyze_unknown_document',
     description: 'Analiza un documento financiero que import_document no pudo reconocer como ninguno de sus tipos específicos (facturas de servicios, estados de deuda, contratos, notificaciones de vencimiento, etc.). Extrae entidad/monto/vencimiento en general y lo guarda como nota — no lo descarta. Usar SIEMPRE que import_document devuelva recognized:false, con el mismo archivo.',
     inputSchema: {
@@ -724,7 +789,7 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'add_manual_expense',
-    description: 'Carga un gasto/ingreso/deuda contado en lenguaje natural, sin archivo (ej: "gasté 5000 en el kiosco", "me prestaron 10000 hasta fin de mes"). No usar para clasificar pendientes existentes (eso es classify_group).',
+    description: 'Carga UN gasto/ingreso/deuda contado en lenguaje natural, sin archivo (ej: "gasté 5000 en el kiosco", "me prestaron 10000 hasta fin de mes"). Pasa por Gemini (puede quedarse sin cuota) y a veces pone la fecha de hoy: revisar movimiento.fecha en la respuesta y corregir con update_movement si hace falta. No usar para resúmenes de tarjeta/cuenta (eso es import_statement_data) ni para clasificar pendientes existentes (eso es classify_group).',
     inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }
   },
   {
