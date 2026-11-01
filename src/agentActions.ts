@@ -207,7 +207,7 @@ export async function runAgentAction(action: string, params: any) {
     }
 
     case 'spending_report': {
-      const { terms, categoria, startPeriod, endPeriod, incluir_ingresos, max_rows } = params;
+      const { terms, categoria, startPeriod, endPeriod, incluir_ingresos, max_rows, criterio } = params;
       if (!startPeriod || !endPeriod) throw new Error('Faltan startPeriod y endPeriod (formato YYYY-MM).');
       const termList = Array.isArray(terms) ? terms.map(String) : (terms ? String(terms).split(',').map(t => t.trim()) : []);
       return await spendingReport({
@@ -216,7 +216,8 @@ export async function runAgentAction(action: string, params: any) {
         startPeriod: String(startPeriod),
         endPeriod: String(endPeriod),
         incluirIngresos: !!incluir_ingresos,
-        maxRows: max_rows != null ? Number(max_rows) : undefined
+        maxRows: max_rows != null ? Number(max_rows) : undefined,
+        criterio: criterio ? String(criterio) : 'cobro'
       });
     }
 
@@ -574,7 +575,7 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'spending_report',
-    description: 'USAR ESTA TOOL para cualquier "cuánto gasté en X", totales y comparaciones históricas (por mes, entre meses, por comercio o por categoría). Suma TODOS los movimientos del rango, sin tope de cantidad (tarjeta/cuenta consolidados + importados aún no consolidados + tickets no conciliados). Devuelve totales por moneda, por_mes (todos los meses del rango, incluso en 0), por_termino (cada comercio/palabra por separado, por mes), por_categoria, y el detalle. Criterio de fecha: fecha de consumo. Gastos y cargos suman, devoluciones restan; ingresos/transferencias/pagos de tarjeta se excluyen salvo incluir_ingresos=true. NO usar "search" para sumar montos: search devuelve una muestra limitada.',
+    description: 'USAR ESTA TOOL para cualquier "cuánto gasté en X", totales y comparaciones históricas (por mes, entre meses, por comercio o por categoría). Suma TODOS los movimientos del rango, sin tope de cantidad (tarjeta/cuenta consolidados + importados aún no consolidados + tickets no conciliados). Devuelve totales por moneda, por_mes (todos los meses del rango, incluso en 0), por_termino (cada comercio/palabra por separado, por mes), por_categoria, y el detalle. Criterio de mes (criterio): "cobro" (default) = cada consumo de tarjeta cuenta en el mes del resumen donde se cobra (cada cuota en el mes en que se paga; el resumen que cierra a fin de mes es de ese mes) y lo que no es tarjeta por su fecha — usar este para "cuánto gasté en octubre"; "consumo" = fecha de la compra original (todas las cuotas de una compra caen en el mes de la compra) — usar solo si piden "qué compré en X". Cada movimiento trae mes_cobro, mes_consumo y cuota. Gastos y cargos suman, devoluciones restan; ingresos/transferencias/pagos de tarjeta se excluyen salvo incluir_ingresos=true. NO usar "search" para sumar montos: search devuelve una muestra limitada.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -583,7 +584,8 @@ export const AGENT_TOOLS = [
         startPeriod: { type: 'string', description: 'YYYY-MM, primer mes incluido' },
         endPeriod: { type: 'string', description: 'YYYY-MM, último mes incluido' },
         incluir_ingresos: { type: 'boolean' },
-        max_rows: { type: 'number', description: 'Máximo de filas de detalle a devolver (default 300). Los totales siempre usan todas.' }
+        max_rows: { type: 'number', description: 'Máximo de filas de detalle a devolver (default 300). Los totales siempre usan todas.' },
+        criterio: { type: 'string', description: 'cobro (default) | consumo' }
       },
       required: ['startPeriod', 'endPeriod']
     }

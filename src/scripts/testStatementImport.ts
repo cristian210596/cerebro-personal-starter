@@ -229,6 +229,25 @@ await test('import_statement_data: tipos y categorías (crédito, cargos, catego
   assert.deepEqual(built.sumas_consumos, { ARS: 117000, USD: 2.99 });
 });
 
+await test('Mes de cobro: ciclo por cierre − 14 días (dos cierres en el mismo mes caen en meses distintos)', async () => {
+  const { cycleMonthFromClosing, billingMonthFor, shiftMonth } = await import('../financeImport.js');
+  assert.equal(cycleMonthFromClosing('2026-10-01'), '2026-09');
+  assert.equal(cycleMonthFromClosing('2026-10-29'), '2026-10');
+  assert.equal(cycleMonthFromClosing('2026-11-26'), '2026-11');
+  assert.equal(cycleMonthFromClosing('2027-01-07'), '2026-12');
+  assert.equal(cycleMonthFromClosing(null), null);
+  assert.equal(cycleMonthFromClosing('29/10/2026'), null);
+  const cycles = new Map([['imp-oct', '2026-10']]);
+  // Cuota 5/6 de una compra de junio cobrada en el resumen de octubre -> octubre.
+  assert.equal(billingMonthFor({ fecha_movimiento: '2026-06-19', importacion_id: 'imp-oct' }, cycles), '2026-10');
+  // Sin resumen de tarjeta (efectivo, transferencia, resumen de cuenta) -> mes de la fecha.
+  assert.equal(billingMonthFor({ fecha_movimiento: '2026-10-05', importacion_id: 'imp-cuenta-mp' }, cycles), '2026-10');
+  assert.equal(billingMonthFor({ fecha_movimiento: '2026-10-05' }, cycles), '2026-10');
+  assert.equal(shiftMonth('2026-10', -24), '2024-10');
+  assert.equal(shiftMonth('2026-12', 1), '2027-01');
+  assert.equal(shiftMonth('2026-01', -1), '2025-12');
+});
+
 // Opcional: PDFs reales pasados por argumento (no se versionan: tienen datos personales).
 const pdfs = process.argv.slice(2).filter(f => /\.pdf$/i.test(f));
 for (const file of pdfs) {

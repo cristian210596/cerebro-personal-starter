@@ -1,4 +1,5 @@
 import { supabase } from './supabaseClient.js';
+import { loadCardStatementCycleMonths, billingMonthFor } from './financeImport.js';
 
 export type FinanceDashboardData = {
   generatedAt: string;
@@ -16,7 +17,13 @@ export async function buildFinanceDashboardData(): Promise<FinanceDashboardData>
   const desde = new Date();
   desde.setUTCMonth(desde.getUTCMonth() - 12);
   desde.setUTCDate(1);
-  const desdeIso = desde.toISOString().slice(0, 10);
+  const desdeMes = desde.toISOString().slice(0, 7);
+  // Mes = mes de COBRO (ver billingMonthFor): una cuota de una compra de hace 2 años que se cobra
+  // este mes cuenta este mes, así que se traen 24 meses más de fechas de compra.
+  const desdeConsulta = new Date(desde);
+  desdeConsulta.setUTCMonth(desdeConsulta.getUTCMonth() - 24);
+  const desdeIso = desdeConsulta.toISOString().slice(0, 10);
+  const cycles = await loadCardStatementCycleMonths();
 
   // Paginado: Supabase/PostgREST devuelve como máximo 1000 filas por consulta aunque se pida
   // .limit(5000); antes el panel se cortaba en jul-26 y "este mes" daba 0.
@@ -24,7 +31,7 @@ export async function buildFinanceDashboardData(): Promise<FinanceDashboardData>
   for (let from = 0; ; from += 1000) {
     const { data, error } = await supabase
       .from('finanzas_movimientos')
-      .select('fecha_movimiento, monto, moneda, categoria_financiera, tipo, comercio, descripcion')
+      .select('fecha_movimiento, monto, moneda, categoria_financiera, tipo, comercio, descripcion, importacion_id')
       .gte('fecha_movimiento', desdeIso)
       .order('fecha_movimiento', { ascending: true })
       .order('id', { ascending: true })
@@ -45,8 +52,8 @@ export async function buildFinanceDashboardData(): Promise<FinanceDashboardData>
   for (const row of rows) {
     const montoRaw = Number(row.monto || 0);
     const tipo = String(row.tipo || '').toLowerCase();
-    const mes = String(row.fecha_movimiento || '').slice(0, 7);
-    if (!mes) continue;
+    const mes = billingMonthFor(row, cycles) || '';
+    if (!mes || mes < desdeMes) continue;
     // Totales en pesos: los consumos en USD no se mezclan con ARS (antes 20 USD sumaban como $20).
     if (String(row.moneda || 'ARS').toUpperCase() !== 'ARS') continue;
     // Movimientos entre cuentas propias no son gasto ni ingreso.

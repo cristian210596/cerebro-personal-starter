@@ -2731,6 +2731,53 @@ async function fetchAllPaged(make: () => any, pageSize = 1000): Promise<any[]> {
   return out;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Mes de cobro: en qué mes "pagás" cada movimiento.
+// - Consumo de tarjeta que vino en un resumen: el mes del ciclo de ese resumen. El ciclo se toma
+//   como el mes de (fecha de cierre − 14 días), o sea el mes donde cae la mayor parte del ciclo:
+//   Galicia cierra cada ~4 semanas y a veces cierra dos veces en el mismo mes (01/10 y 29/10/2026);
+//   con esto el cierre 01/10 cuenta como septiembre y el 29/10 como octubre.
+//   Así cada cuota cuenta en el mes en que te la cobran, no en el de la compra original (antes la
+//   cuota 5/6 de una compra de junio sumaba en junio y octubre quedaba "barato").
+// - Todo lo demás (efectivo, transferencias, cuenta de Mercado Pago, tarjeta aún sin resumen):
+//   el mes de la fecha del movimiento.
+// ---------------------------------------------------------------------------------------------
+export function cycleMonthFromClosing(fechaCierre: string | null | undefined): string | null {
+  const s = String(fechaCierre || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const t = Date.parse(`${s}T00:00:00Z`);
+  if (Number.isNaN(t)) return null;
+  return new Date(t - 14 * 86400000).toISOString().slice(0, 7);
+}
+
+// importacion_id -> mes de ciclo, solo para resúmenes de TARJETA.
+export async function loadCardStatementCycleMonths(): Promise<Map<string, string>> {
+  const rows = await fetchAllPaged(() => supabase
+    .from('finanzas_importaciones')
+    .select('id, tarjeta, fecha_cierre, periodo')
+    .not('tarjeta', 'is', null)
+    .order('id', { ascending: true }));
+  const out = new Map<string, string>();
+  for (const r of rows) {
+    const m = cycleMonthFromClosing(r.fecha_cierre) || (/^\d{4}-\d{2}$/.test(String(r.periodo || '')) ? String(r.periodo) : null);
+    if (m) out.set(r.id, m);
+  }
+  return out;
+}
+
+export function billingMonthFor(row: any, cycles: Map<string, string>): string | null {
+  const consumo = String(row?.fecha_movimiento || '').slice(0, 7) || null;
+  const imp = row?.importacion_id ? cycles.get(String(row.importacion_id)) : undefined;
+  return imp || consumo;
+}
+
+export function shiftMonth(ym: string, k: number): string {
+  const y = Number(ym.slice(0, 4));
+  const m = Number(ym.slice(5, 7)) - 1 + k;
+  const d = new Date(Date.UTC(y, m, 1));
+  return d.toISOString().slice(0, 7);
+}
+
 // Reporte de gasto para comparaciones históricas: totales por mes, por término
 // (comercio/palabra) y por categoría, SIN tope de filas. Los totales siempre se
 // calculan sobre todas las filas del período; sólo el detalle "movimientos" se
@@ -2744,21 +2791,31 @@ export async function spendingReport(input: {
   endPeriod: string;
   incluirIngresos?: boolean;
   maxRows?: number;
+  criterio?: 'cobro' | 'consumo' | string | null;
 }) {
   const startPeriod = String(input.startPeriod || '').slice(0, 7);
   const endPeriod = String(input.endPeriod || '').slice(0, 7);
   if (!/^\d{4}-\d{2}$/.test(startPeriod) || !/^\d{4}-\d{2}$/.test(endPeriod)) {
     throw new Error('startPeriod y endPeriod tienen que ser YYYY-MM.');
   }
+  const criterio: 'cobro' | 'consumo' = norm(String(input.criterio || 'cobro')) === 'consumo' ? 'consumo' : 'cobro';
   const terms = (input.terms || []).map(t => String(t || '').trim()).filter(Boolean);
   const categoria = input.categoria ? norm(String(input.categoria)) : null;
 
+  // Con criterio "cobro" una cuota que se cobra en el período puede tener fecha de compra hasta
+  // ~2 años antes, y un consumo de fin de mes puede caer en el resumen del mes siguiente: se trae
+  // un rango más amplio y después se filtra por mes de cobro.
   const base = await summarizeFinanceAnalytics('', {
-    startPeriod,
-    endPeriod,
+    startPeriod: criterio === 'cobro' ? shiftMonth(startPeriod, -24) : startPeriod,
+    endPeriod: criterio === 'cobro' ? shiftMonth(endPeriod, 1) : endPeriod,
     terms: terms.length ? terms : [],
     label: terms.join(', ') || input.categoria || 'todos los gastos'
   });
+  const cycles = await loadCardStatementCycleMonths();
+  const mesConsumoOf = (row: any) => String(row.fecha_movimiento || '').slice(0, 7) || 'sin-fecha';
+  const mesCobroOf = (row: any) => billingMonthFor(row, cycles) || 'sin-fecha';
+  const mesOf = criterio === 'cobro' ? mesCobroOf : mesConsumoOf;
+  base.rows = base.rows.filter((row: any) => { const m = mesOf(row); return m >= startPeriod && m <= endPeriod; });
 
   const signed = (row: any) => {
     const t = norm(String(row.tipo || 'gasto'));
@@ -2793,7 +2850,7 @@ export async function spendingReport(input: {
   const totales: Record<string, Bucket> = {};
 
   for (const { row, amount } of rows) {
-    const mes = String(row.fecha_movimiento || '').slice(0, 7) || 'sin-fecha';
+    const mes = mesOf(row);
     const moneda = row.moneda || 'ARS';
     add(porMes, mes, moneda, amount);
     add(porCategoria, row.categoria_financiera || 'Sin categoría', moneda, amount);
@@ -2834,11 +2891,21 @@ export async function spendingReport(input: {
       medio_pago: row.medio_pago || null,
       tipo: row.tipo || null,
       origen: row.origen || 'movimiento',
-      termino: termOf(row)
+      termino: termOf(row),
+      mes_cobro: mesCobroOf(row),
+      mes_consumo: mesConsumoOf(row),
+      cuota: row.cuota_actual && row.cuotas_totales ? `${row.cuota_actual}/${row.cuotas_totales}` : null
     }));
 
   return {
-    periodo: { desde: startPeriod, hasta: endPeriod, fecha_criterio: 'fecha de consumo (fecha_movimiento), no fecha de resumen' },
+    periodo: {
+      desde: startPeriod,
+      hasta: endPeriod,
+      criterio,
+      fecha_criterio: criterio === 'cobro'
+        ? 'mes de cobro: consumos de tarjeta en el mes del ciclo del resumen donde se cobran (cada cuota en su mes); el resto por fecha del movimiento'
+        : 'fecha de consumo (fecha_movimiento): cada cuota queda en el mes de la compra original'
+    },
     terminos: terms,
     categoria: input.categoria || null,
     totales,
@@ -2938,6 +3005,9 @@ async function loadUnconsolidatedImportedAnalyticsRows(period: { start: string; 
   return data
     .map((row: any) => ({
       id: row.id,
+      importacion_id: row.importacion_id || null,
+      cuota_actual: row.cuota_actual ?? null,
+      cuotas_totales: row.cuotas_totales ?? null,
       fecha_movimiento: row.fecha_movimiento,
       monto: Number(row.monto || 0),
       moneda: row.moneda || 'ARS',
